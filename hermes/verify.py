@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,10 +60,32 @@ class Verification:
         return ("\n\n".join(chunks) or self.report())[-limit:]
 
 
+_MISSING_TOOL = re.compile(r"([\w.+-]+): (?:not found|command not found)")
+
+
+def _install_missing(sandbox: Sandbox, result, log: Logger) -> bool:
+    """Exit 127 means a tool is absent, not that the generated code is wrong.
+
+    The architect is meant to install its tooling in the setup command and
+    routinely forgets, which otherwise fails every gate for the rest of the run.
+    """
+    found = _MISSING_TOOL.search(result.stderr + result.stdout)
+    tool = found.group(1) if found else (shlex.split(result.command or "")[:1] or [""])[0]
+    if tool in ("", "sh", "bash", "python", "python3"):
+        return False
+    if sandbox.runtime != "docker":
+        return False  # installing onto the host is not ours to do
+    log.info("verify.install_missing", tool=tool)
+    if not sandbox.install(f"pip install --quiet {shlex.quote(tool)}").ok:
+        return False
+    sandbox.installed.append(tool)
+    return True
+
+
 def run_commands(sandbox: Sandbox, commands: list[str], name: str,
                  verification: Verification, *, required: bool = True,
                  timeout: int | None = None, install: bool = False,
-                 log: Logger = NULL) -> None:
+                 autofix: bool = True, log: Logger = NULL) -> None:
     """Run a command list and fold the outcome into *verification* as one gate."""
     commands = [c for c in commands if c and c.strip() and c.strip() != "true"]
     if not commands:
@@ -71,6 +94,9 @@ def run_commands(sandbox: Sandbox, commands: list[str], name: str,
     for command in commands:
         runner = sandbox.install if install else sandbox.run
         result = runner(command, timeout=timeout)
+        if (result.exit_code == 127 and autofix
+                and _install_missing(sandbox, result, log)):
+            result = runner(command, timeout=timeout)
         verification.results.append(result)
         if not result.ok:
             verification.gates.append(
@@ -106,6 +132,21 @@ def scan_unsafe(root: Path, paths: list[str] | None = None) -> list[str]:
     return hits
 
 
+def record_installs(sandbox: Sandbox, plan: dict) -> None:
+    """Fold anything Hermes had to install into the project's own setup command.
+
+    Otherwise the clean-room check would fail on a dependency that only exists
+    because Hermes quietly installed it, and the published repo would not build.
+    """
+    commands = plan.setdefault("commands", {})
+    setup = (commands.get("setup") or "").strip()
+    pending = [t for t in sandbox.installed if t not in setup]
+    if not pending:
+        return
+    added = "pip install " + " ".join(pending)
+    commands["setup"] = added if setup in ("", "true") else f"{setup} && {added}"
+
+
 def verify_project(sandbox: Sandbox, plan: dict, *, include_benchmark: bool = False,
                    log: Logger = NULL) -> Verification:
     """The full project gate: setup, build, lint, tests, security."""
@@ -123,6 +164,7 @@ def verify_project(sandbox: Sandbox, plan: dict, *, include_benchmark: bool = Fa
     hits = scan_unsafe(sandbox.root)
     verification.gates.append(
         Gate("security", not hits, "; ".join(hits[:5]) if hits else "no unsafe patterns"))
+    record_installs(sandbox, plan)
     return verification
 
 
@@ -143,6 +185,7 @@ def verify_ticket(sandbox: Sandbox, ticket, plan: dict, changed: list[str],
     hits = scan_unsafe(sandbox.root, changed)
     verification.gates.append(
         Gate("security", not hits, "; ".join(hits[:5]) if hits else "clean"))
+    record_installs(sandbox, plan)
     return verification
 
 

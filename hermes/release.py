@@ -53,11 +53,11 @@ def validate_clean_room(sandbox: Sandbox, state, log: Logger = NULL) -> tuple[Ve
         clean = Sandbox(staging, dict(sandbox.cfg), log)
         with clean:
             run_commands(clean, [commands.get("setup", "")], "clean-room-setup",
-                         verification, required=False, install=True, log=log)
+                         verification, required=False, install=True, log=log, autofix=False)
             run_commands(clean, [commands.get("build", "")], "build",
-                         verification, log=log)
+                         verification, log=log, autofix=False)
             run_commands(clean, [commands.get("test", "")], "tests",
-                         verification, log=log)
+                         verification, log=log, autofix=False)
         missing = [name for name in ("README.md", ".gitignore")
                    if not (staging / name).is_file()]
         verification.gates.append(

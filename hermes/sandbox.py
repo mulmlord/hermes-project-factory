@@ -55,6 +55,8 @@ class Sandbox:
         self.runtime = cfg.get("runtime", "docker")
         self.workdir = cfg.get("workdir", "/workspace")
         self.container: str | None = None
+        self.installed: list[str] = []  # tools Hermes had to add for the gates to run
+        self._probe_error = ""
         if self.runtime == "docker" and not shutil.which("docker"):
             self.log.warn("sandbox.docker_missing", fallback="local")
             self.runtime = "local"
@@ -74,7 +76,7 @@ class Sandbox:
             "--security-opt", "no-new-privileges",
             "-v", f"{self.root}:{self.workdir}",
             "-w", self.workdir,
-            "-e", "HOME=/tmp",
+            "-e", "HOME=/tmp", "-e", f"PYTHONPATH={self.workdir}/src",
             self.cfg.get("image", "python:3.11-slim"),
             "sleep", "infinity",
         ]
@@ -85,7 +87,32 @@ class Sandbox:
             self.runtime = "local"
             return
         self.container = name
+        if not self._workspace_visible():
+            # Docker Desktop's WSL integration silently mounts an empty
+            # directory when the host path also exists inside the engine VM
+            # (/tmp is the usual victim). Gates would then all fail against a
+            # workspace the container cannot see, so refuse to run blind.
+            self.log.warn("sandbox.workspace_not_shared", root=str(self.root),
+                          error=self._probe_error,
+                          hint="the docker engine must share this path and the "
+                               "directory must be readable inside the container",
+                          fallback="local")
+            self.stop()
+            self.runtime = "local"
+            return
         self.log.info("sandbox.started", container=name, image=self.cfg.get("image"))
+
+    def _workspace_visible(self) -> bool:
+        """Confirm the bind mount really shows this workspace, not an empty dir."""
+        token = uuid.uuid4().hex
+        probe = self.root / f".hermes-mount-{token}"
+        probe.write_text(token)
+        try:
+            seen = self.run(f"cat {shlex.quote(self.workdir)}/{probe.name}")
+        finally:
+            probe.unlink(missing_ok=True)
+        self._probe_error = seen.stderr.strip()[:200]
+        return seen.stdout.strip() == token
 
     def stop(self) -> None:
         if self.container:
@@ -172,7 +199,7 @@ class Sandbox:
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "-v", f"{self.root}:{self.workdir}",
             "-w", self.workdir if not cwd else f"{self.workdir}/{cwd}",
-            "-e", "HOME=/tmp",
+            "-e", "HOME=/tmp", "-e", f"PYTHONPATH={self.workdir}/src",
             self.cfg.get("image", "python:3.11-slim"),
             "/bin/sh", "-lc", command,
         ]
@@ -185,6 +212,7 @@ class Sandbox:
                if not any(b in k.upper() for b in blocked)}
         env["HOME"] = str(self.root)
         env["HERMES_SANDBOX"] = "local"
+        env["PYTHONPATH"] = str(self.root / "src")
         return env
 
     def run_all(self, commands: list[str], *, timeout: int | None = None,

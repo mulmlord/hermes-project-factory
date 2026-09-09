@@ -56,6 +56,11 @@ clean checkout rather than from leftover build state.
   `llama.cpp`'s server or vLLM
 - Docker, strongly recommended. Without it Hermes falls back to local
   subprocess execution, which is a much weaker isolation guarantee.
+- A project directory the Docker engine can actually bind-mount. Under Docker
+  Desktop on WSL a path such as `/tmp/project` mounts as an empty directory,
+  because that path also exists inside the engine's own VM. Hermes checks this
+  at startup and refuses to run blind, falling back to local execution with a
+  warning; keep projects under your home directory to avoid it.
 - `git`, and `gh` if you want GitHub publishing
 
 Only one third-party package is needed: PyYAML.

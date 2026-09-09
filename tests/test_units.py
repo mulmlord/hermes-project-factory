@@ -10,7 +10,7 @@ from hermes.models import extract_json, strip_reasoning
 from hermes.sandbox import Sandbox, SandboxError
 from hermes.state import State, StateError, checkpoint, restore
 from hermes.tickets import Board
-from hermes.verify import scan_unsafe
+from hermes.verify import scan_unsafe, verify_project
 from hermes import workspace
 
 
@@ -218,11 +218,12 @@ def test_decision_records_increment(tmp_path):
     assert workspace.next_decision_number(tmp_path) == 2
 
 
-def test_docker_install_gets_network_then_loses_it(tmp_path):
+def test_docker_install_gets_network_then_loses_it(shared_tmp):
     """Setup installs must persist in the container and leave it offline again."""
     import shutil
     if not shutil.which("docker"):
         pytest.skip("docker unavailable")
+    tmp_path = shared_tmp
     sandbox = Sandbox(tmp_path, {"runtime": "docker", "timeout": 300,
                                  "image": "python:3.11-slim"})
     with sandbox:
@@ -233,3 +234,31 @@ def test_docker_install_gets_network_then_loses_it(tmp_path):
         assert not sandbox.run(
             "python -c \"import urllib.request as u; u.urlopen('http://example.com', timeout=4)\""
         ).ok
+
+
+def test_missing_tool_is_installed_and_recorded(shared_tmp):
+    """A gate failing with exit 127 is an absent tool, not a code defect."""
+    import shutil
+    if not shutil.which("docker"):
+        pytest.skip("docker unavailable")
+    tmp_path = shared_tmp
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_ok.py").write_text("def test_ok():\n    assert True\n")
+    plan = {"commands": {"setup": "true", "build": "true", "test": "pytest tests -q"}}
+    sandbox = Sandbox(tmp_path, {"runtime": "docker", "timeout": 300,
+                                 "image": "python:3.11-slim"})
+    with sandbox:
+        if sandbox.runtime != "docker":
+            pytest.skip("docker present but unusable")
+        verification = verify_project(sandbox, plan)
+    assert verification.passed, verification.report()
+    assert sandbox.installed == ["pytest"]
+    assert plan["commands"]["setup"] == "pip install pytest"
+
+
+def test_src_layout_is_importable(tmp_path):
+    """Hermes mandates src/, so code there must import without packaging."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "thing.py").write_text("VALUE = 7\n")
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 30})
+    assert "7" in sandbox.run("python3 -c 'import thing; print(thing.VALUE)'").stdout

@@ -69,7 +69,11 @@ def architect(agents, spec: dict, research: str, log: Logger = NULL) -> dict:
         "}\n"
         "Commands must be real, runnable, non-interactive shell commands that "
         "work from the project root inside a Linux container. Never use sudo. "
-        "Prefer commands that need no network at run time."
+        "The container is a bare base image with nothing but the language "
+        "runtime installed. Only the setup command has network access, so it "
+        "must install every tool the build, test and lint commands invoke "
+        "(for example 'pip install pytest flake8'). Every other command runs "
+        "offline."
     )
     plan.setdefault("commands", {})
     for key, fallback in (("build", "true"), ("test", "true"), ("setup", "true")):

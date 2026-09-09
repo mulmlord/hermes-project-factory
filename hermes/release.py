@@ -53,7 +53,7 @@ def validate_clean_room(sandbox: Sandbox, state, log: Logger = NULL) -> tuple[Ve
         clean = Sandbox(staging, dict(sandbox.cfg), log)
         with clean:
             run_commands(clean, [commands.get("setup", "")], "clean-room-setup",
-                         verification, required=False, log=log)
+                         verification, required=False, install=True, log=log)
             run_commands(clean, [commands.get("build", "")], "build",
                          verification, log=log)
             run_commands(clean, [commands.get("test", "")], "tests",

@@ -125,6 +125,37 @@ class Sandbox:
                        seconds=round(result.seconds, 1))
         return result
 
+    def install(self, command: str, *, timeout: int | None = None) -> Result:
+        """Run a dependency install with network, then restore isolation.
+
+        Installs have to land in the long-lived container or they vanish with
+        the one-shot box, so the container is briefly attached to the bridge
+        network rather than replaced. Everything else still runs offline.
+        """
+        if not command.strip() or command.strip() == "true":
+            return Result(command, 0, "", "", 0.0)
+        if self.runtime != "docker" or not self.container:
+            return self.run(command, timeout=timeout, network=True)
+        isolated = self.cfg.get("network", "none") != "host"
+        if isolated and not self._reconnect("none", "bridge"):
+            return self.run(command, timeout=timeout, network=True)
+        try:
+            return self.run(command, timeout=timeout or 900)
+        finally:
+            if isolated:
+                self._reconnect("bridge", "none")
+
+    def _reconnect(self, old: str, new: str) -> bool:
+        """Swap the container between docker networks. False if docker refused."""
+        for verb, net in (("disconnect", old), ("connect", new)):
+            proc = subprocess.run(["docker", "network", verb, net, self.container],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                self.log.warn("sandbox.network", action=f"{verb} {net}",
+                              error=proc.stderr.strip()[:200])
+                return False
+        return True
+
     def _docker_argv(self, command: str, cwd: str | None, network: bool | None) -> list[str]:
         if self.container and not network:
             work = self.workdir if not cwd else f"{self.workdir}/{cwd}"

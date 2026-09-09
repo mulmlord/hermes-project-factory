@@ -216,3 +216,20 @@ def test_decision_records_increment(tmp_path):
     workspace.create(tmp_path, "idea")
     workspace.write_decision(tmp_path, 1, "Use SQLite", "c", "d", "q")
     assert workspace.next_decision_number(tmp_path) == 2
+
+
+def test_docker_install_gets_network_then_loses_it(tmp_path):
+    """Setup installs must persist in the container and leave it offline again."""
+    import shutil
+    if not shutil.which("docker"):
+        pytest.skip("docker unavailable")
+    sandbox = Sandbox(tmp_path, {"runtime": "docker", "timeout": 300,
+                                 "image": "python:3.11-slim"})
+    with sandbox:
+        if sandbox.runtime != "docker":
+            pytest.skip("docker present but unusable")
+        assert sandbox.install("pip install --quiet pytest").ok
+        assert sandbox.run("python -c 'import pytest'").ok
+        assert not sandbox.run(
+            "python -c \"import urllib.request as u; u.urlopen('http://example.com', timeout=4)\""
+        ).ok

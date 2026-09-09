@@ -61,14 +61,16 @@ class Verification:
 
 def run_commands(sandbox: Sandbox, commands: list[str], name: str,
                  verification: Verification, *, required: bool = True,
-                 timeout: int | None = None, log: Logger = NULL) -> None:
+                 timeout: int | None = None, install: bool = False,
+                 log: Logger = NULL) -> None:
     """Run a command list and fold the outcome into *verification* as one gate."""
     commands = [c for c in commands if c and c.strip() and c.strip() != "true"]
     if not commands:
         verification.gates.append(Gate(name, True, "no command configured", skipped=True))
         return
     for command in commands:
-        result = sandbox.run(command, timeout=timeout)
+        runner = sandbox.install if install else sandbox.run
+        result = runner(command, timeout=timeout)
         verification.results.append(result)
         if not result.ok:
             verification.gates.append(
@@ -110,7 +112,7 @@ def verify_project(sandbox: Sandbox, plan: dict, *, include_benchmark: bool = Fa
     commands = plan.get("commands") or {}
     verification = Verification()
     run_commands(sandbox, [commands.get("setup", "")], "setup", verification,
-                 required=False, log=log)
+                 required=False, install=True, log=log)
     run_commands(sandbox, [commands.get("build", "")], "build", verification, log=log)
     run_commands(sandbox, [commands.get("lint", "")], "lint", verification,
                  required=False, log=log)

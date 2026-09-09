@@ -163,7 +163,7 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
             continue
 
         if change.dependencies and (state.plan.get("commands") or {}).get("setup"):
-            sandbox.run(state.plan["commands"]["setup"], timeout=600)
+            sandbox.install(state.plan["commands"]["setup"], timeout=600)
 
         for command in change.commands[:3]:
             sandbox.run(command, timeout=300)

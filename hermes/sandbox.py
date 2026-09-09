@@ -1,0 +1,223 @@
+"""Isolated execution of generated code.
+
+Generated code is untrusted. The default runtime is a long-lived Docker
+container with no network, capped CPU/RAM/PIDs and only the project
+workspace mounted. ``runtime: local`` exists for hosts without Docker and
+is explicitly a weaker guarantee.
+"""
+from __future__ import annotations
+
+import os
+import shlex
+import shutil
+import subprocess
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+from .log import Logger, NULL
+
+#: Host paths that must never be visible to generated code.
+FORBIDDEN_MOUNTS = ("~/.ssh", "~/.aws", "~/.config/gh", "~/.gnupg", "~/.kube")
+
+
+@dataclass
+class Result:
+    command: str
+    exit_code: int
+    stdout: str
+    stderr: str
+    seconds: float
+    timed_out: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.exit_code == 0 and not self.timed_out
+
+    def summary(self, limit: int = 4000) -> str:
+        tail = (self.stdout + ("\n" + self.stderr if self.stderr else ""))[-limit:]
+        status = "timeout" if self.timed_out else f"exit {self.exit_code}"
+        return f"$ {self.command}\n[{status}, {self.seconds:.1f}s]\n{tail}"
+
+
+class SandboxError(RuntimeError):
+    pass
+
+
+class Sandbox:
+    """Runs commands against a project workspace under resource limits."""
+
+    def __init__(self, root: Path, cfg: dict, log: Logger = NULL):
+        self.root = Path(root).resolve()
+        self.cfg = cfg
+        self.log = log
+        self.runtime = cfg.get("runtime", "docker")
+        self.workdir = cfg.get("workdir", "/workspace")
+        self.container: str | None = None
+        if self.runtime == "docker" and not shutil.which("docker"):
+            self.log.warn("sandbox.docker_missing", fallback="local")
+            self.runtime = "local"
+
+    # -- lifecycle -------------------------------------------------------
+    def start(self) -> None:
+        if self.runtime != "docker" or self.container:
+            return
+        name = f"hermes-{self.root.name}-{uuid.uuid4().hex[:8]}"
+        cmd = [
+            "docker", "run", "-d", "--rm", "--name", name,
+            "--network", "none" if self.cfg.get("network", "none") != "host" else "bridge",
+            "--memory", str(self.cfg.get("memory", "8g")),
+            "--cpus", str(self.cfg.get("cpus", 4)),
+            "--pids-limit", str(self.cfg.get("pids", 512)),
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "-v", f"{self.root}:{self.workdir}",
+            "-w", self.workdir,
+            "-e", "HOME=/tmp",
+            self.cfg.get("image", "python:3.11-slim"),
+            "sleep", "infinity",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            self.log.warn("sandbox.start_failed", error=proc.stderr.strip()[:300],
+                          fallback="local")
+            self.runtime = "local"
+            return
+        self.container = name
+        self.log.info("sandbox.started", container=name, image=self.cfg.get("image"))
+
+    def stop(self) -> None:
+        if self.container:
+            subprocess.run(["docker", "rm", "-f", self.container],
+                           capture_output=True, text=True)
+            self.log.info("sandbox.stopped", container=self.container)
+            self.container = None
+
+    def __enter__(self) -> "Sandbox":
+        self.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
+
+    # -- execution -------------------------------------------------------
+    def run(self, command: str, *, timeout: int | None = None, cwd: str | None = None,
+            network: bool | None = None) -> Result:
+        timeout = timeout or int(self.cfg.get("timeout", 900))
+        started = time.time()
+        if self.runtime == "docker":
+            argv = self._docker_argv(command, cwd, network)
+        else:
+            argv = ["/bin/bash", "-lc", command]
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout,
+                cwd=str(self.root / (cwd or ".")) if self.runtime != "docker" else None,
+                env=self._local_env() if self.runtime != "docker" else None,
+            )
+            result = Result(command, proc.returncode, proc.stdout, proc.stderr,
+                            time.time() - started)
+        except subprocess.TimeoutExpired as exc:
+            result = Result(command, 124, _text(exc.stdout), _text(exc.stderr),
+                            time.time() - started, timed_out=True)
+        self.log.debug("sandbox.run", command=command[:120], exit=result.exit_code,
+                       seconds=round(result.seconds, 1))
+        return result
+
+    def _docker_argv(self, command: str, cwd: str | None, network: bool | None) -> list[str]:
+        if self.container and not network:
+            work = self.workdir if not cwd else f"{self.workdir}/{cwd}"
+            return ["docker", "exec", "-w", work, self.container,
+                    "/bin/sh", "-lc", command]
+        # One-shot container: used when the caller needs network (dependency
+        # installs, research fetches) which the long-lived box does not have.
+        return [
+            "docker", "run", "--rm",
+            "--network", "bridge" if network else "none",
+            "--memory", str(self.cfg.get("memory", "8g")),
+            "--cpus", str(self.cfg.get("cpus", 4)),
+            "--pids-limit", str(self.cfg.get("pids", 512)),
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "-v", f"{self.root}:{self.workdir}",
+            "-w", self.workdir if not cwd else f"{self.workdir}/{cwd}",
+            "-e", "HOME=/tmp",
+            self.cfg.get("image", "python:3.11-slim"),
+            "/bin/sh", "-lc", command,
+        ]
+
+    def _local_env(self) -> dict:
+        """Strip host secrets before handing the environment to generated code."""
+        blocked = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AWS_", "GH_",
+                   "GITHUB_", "ANTHROPIC", "OPENAI")
+        env = {k: v for k, v in os.environ.items()
+               if not any(b in k.upper() for b in blocked)}
+        env["HOME"] = str(self.root)
+        env["HERMES_SANDBOX"] = "local"
+        return env
+
+    def run_all(self, commands: list[str], *, timeout: int | None = None,
+                stop_on_failure: bool = True) -> list[Result]:
+        results = []
+        for command in commands:
+            result = self.run(command, timeout=timeout)
+            results.append(result)
+            if stop_on_failure and not result.ok:
+                break
+        return results
+
+    # -- file access -----------------------------------------------------
+    def write(self, relative: str, content: str) -> Path:
+        """Write inside the workspace, refusing escapes via .. or absolute paths."""
+        target = self.resolve(relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        return target
+
+    def read(self, relative: str, limit: int | None = None) -> str:
+        target = self.resolve(relative)
+        if not target.is_file():
+            return ""
+        text = target.read_text(errors="replace")
+        return text if limit is None else text[:limit]
+
+    def resolve(self, relative: str) -> Path:
+        candidate = (self.root / relative).resolve()
+        if candidate != self.root and self.root not in candidate.parents:
+            raise SandboxError(f"path escapes workspace: {relative}")
+        return candidate
+
+
+def _text(value) -> str:
+    if value is None:
+        return ""
+    return value.decode(errors="replace") if isinstance(value, bytes) else str(value)
+
+
+def probe_resources() -> dict:
+    """Best-effort view of host CPU/RAM/disk/GPU for the scheduler."""
+    info = {"cpus": os.cpu_count() or 1}
+    try:
+        with open("/proc/meminfo") as fh:
+            mem = {line.split(":")[0]: line.split()[1] for line in fh if ":" in line}
+        info["ram_gb"] = round(int(mem.get("MemTotal", 0)) / 1024 / 1024, 1)
+        info["ram_free_gb"] = round(int(mem.get("MemAvailable", 0)) / 1024 / 1024, 1)
+    except OSError:
+        pass
+    try:
+        usage = shutil.disk_usage(".")
+        info["disk_free_gb"] = round(usage.free / 1e9, 1)
+    except OSError:
+        pass
+    if shutil.which("nvidia-smi"):
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True)
+        if proc.returncode == 0:
+            info["gpus"] = [
+                dict(zip(("name", "vram_mb", "vram_free_mb"),
+                         [p.strip() for p in line.split(",")]))
+                for line in proc.stdout.strip().splitlines() if line.strip()
+            ]
+    return info

@@ -1,0 +1,37 @@
+# Hermes Project Factory configuration. Local models only.
+models:
+  default:
+    backend: ollama
+    base_url: http://localhost:11434
+    model: qwen3:30b-a3b
+    context: 32768
+    temperature: 0.2
+    timeout: 1200
+
+routing:
+  research: default
+  architecture: default
+  coding: default
+  review: default
+  simple: default
+  evolution: default
+
+sandbox:
+  runtime: docker
+  image: python:3.11-slim
+  network: none
+  memory: 8g
+  cpus: 4
+  timeout: 900
+
+research:
+  enabled: true
+  max_rounds: 3
+
+evolution:
+  enabled: true
+  max_generations: 20
+
+github:
+  enabled: false
+  private: true

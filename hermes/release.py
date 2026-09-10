@@ -46,7 +46,10 @@ def validate_clean_room(sandbox: Sandbox, state, log: Logger = NULL) -> tuple[Ve
     """Run the project's own commands against a fresh export of itself."""
     commands = state.plan.get("commands") or {}
     verification = Verification()
-    staging = Path(tempfile.mkdtemp(prefix="hermes-release-"))
+    # Beside the project, not in the system tmpdir: docker cannot always
+    # bind-mount /tmp, and a clean room the container cannot see proves nothing.
+    staging = Path(tempfile.mkdtemp(prefix="hermes-release-",
+                                    dir=sandbox.root.parent))
     log.info("release.clean_room", staging=str(staging))
     try:
         entries = export(sandbox.root, staging)

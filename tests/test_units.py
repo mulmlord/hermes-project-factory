@@ -262,3 +262,40 @@ def test_src_layout_is_importable(tmp_path):
     (tmp_path / "src" / "thing.py").write_text("VALUE = 7\n")
     sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 30})
     assert "7" in sandbox.run("python3 -c 'import thing; print(thing.VALUE)'").stdout
+
+
+def test_console_script_triggers_editable_install(shared_tmp):
+    """A missing console script means the project is not installed, not broken."""
+    import shutil
+    if not shutil.which("docker"):
+        pytest.skip("docker unavailable")
+    (shared_tmp / "greet.py").write_text("def main():\n    print('hi')\n")
+    (shared_tmp / "setup.py").write_text(
+        "from setuptools import setup\n"
+        "setup(name='greet', version='0', py_modules=['greet'],\n"
+        "      entry_points={'console_scripts': ['greet=greet:main']})\n")
+    plan = {"commands": {"build": "true", "test": "greet | grep -q hi"}}
+    sandbox = Sandbox(shared_tmp, {"runtime": "docker", "timeout": 300,
+                                   "image": "python:3.11-slim"})
+    with sandbox:
+        if sandbox.runtime != "docker":
+            pytest.skip("docker present but unusable")
+        verification = verify_project(sandbox, plan)
+    assert verification.passed, verification.report()
+    assert plan["commands"]["setup"] == "pip install -e ."
+
+
+def test_unknown_tool_is_not_fetched_from_pypi(shared_tmp):
+    """Model-written command text must not become a PyPI install."""
+    import shutil
+    if not shutil.which("docker"):
+        pytest.skip("docker unavailable")
+    plan = {"commands": {"build": "true", "test": "definitely-not-a-tool --run"}}
+    sandbox = Sandbox(shared_tmp, {"runtime": "docker", "timeout": 120,
+                                   "image": "python:3.11-slim"})
+    with sandbox:
+        if sandbox.runtime != "docker":
+            pytest.skip("docker present but unusable")
+        verification = verify_project(sandbox, plan)
+    assert not verification.passed
+    assert sandbox.installed == []

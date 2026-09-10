@@ -62,6 +62,14 @@ class Verification:
 
 _MISSING_TOOL = re.compile(r"([\w.+-]+): (?:not found|command not found)")
 
+#: Tools a gate may legitimately need. Anything else named by a model-written
+#: command is not fetched from PyPI: that would make typosquatting a supply
+#: chain into the sandbox.
+DEV_TOOLS = frozenset({
+    "pytest", "pytest-cov", "flake8", "ruff", "mypy", "black", "pylint",
+    "isort", "coverage", "tox", "hypothesis", "bandit",
+})
+
 
 def _install_missing(sandbox: Sandbox, result, log: Logger) -> bool:
     """Exit 127 means a tool is absent, not that the generated code is wrong.
@@ -70,15 +78,28 @@ def _install_missing(sandbox: Sandbox, result, log: Logger) -> bool:
     routinely forgets, which otherwise fails every gate for the rest of the run.
     """
     found = _MISSING_TOOL.search(result.stderr + result.stdout)
-    tool = found.group(1) if found else (shlex.split(result.command or "")[:1] or [""])[0]
+    if found:
+        tool = found.group(1)
+    elif result.exit_code == 127:
+        # A pipeline hides 127 behind the exit code of its last stage, so the
+        # message above is the reliable signal and this is only the fallback.
+        tool = (shlex.split(result.command or "")[:1] or [""])[0]
+    else:
+        return False
     if tool in ("", "sh", "bash", "python", "python3"):
         return False
     if sandbox.runtime != "docker":
         return False  # installing onto the host is not ours to do
-    log.info("verify.install_missing", tool=tool)
-    if not sandbox.install(f"pip install --quiet {shlex.quote(tool)}").ok:
+    if tool in DEV_TOOLS:
+        target = tool
+    elif any((sandbox.root / f).is_file() for f in ("pyproject.toml", "setup.py")):
+        target = "-e ."  # a missing console script means the project is uninstalled
+    else:
         return False
-    sandbox.installed.append(tool)
+    log.info("verify.install_missing", tool=tool, install=target)
+    if not sandbox.install(f"pip install --quiet {target}").ok:
+        return False
+    sandbox.installed.append(target)
     return True
 
 
@@ -94,8 +115,7 @@ def run_commands(sandbox: Sandbox, commands: list[str], name: str,
     for command in commands:
         runner = sandbox.install if install else sandbox.run
         result = runner(command, timeout=timeout)
-        if (result.exit_code == 127 and autofix
-                and _install_missing(sandbox, result, log)):
+        if not result.ok and autofix and _install_missing(sandbox, result, log):
             result = runner(command, timeout=timeout)
         verification.results.append(result)
         if not result.ok:

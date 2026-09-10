@@ -18,6 +18,11 @@ from pathlib import Path
 
 from .log import Logger, NULL
 
+#: The container runs as the host user, so pip cannot write to /usr/local.
+#: PIP_USER sends every install to $HOME/.local instead, including installs
+#: from project-written setup commands, and this PATH finds them again.
+_PATH = "/tmp/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+
 #: Host paths that must never be visible to generated code.
 FORBIDDEN_MOUNTS = ("~/.ssh", "~/.aws", "~/.config/gh", "~/.gnupg", "~/.kube")
 
@@ -76,7 +81,9 @@ class Sandbox:
             "--security-opt", "no-new-privileges",
             "-v", f"{self.root}:{self.workdir}",
             "-w", self.workdir,
+            *self._user_args(),
             "-e", "HOME=/tmp", "-e", f"PYTHONPATH={self.workdir}/src",
+            "-e", "PIP_USER=1", "-e", f"PATH={_PATH}",
             self.cfg.get("image", "python:3.11-slim"),
             "sleep", "infinity",
         ]
@@ -101,6 +108,13 @@ class Sandbox:
             self.runtime = "local"
             return
         self.log.info("sandbox.started", container=name, image=self.cfg.get("image"))
+
+    @staticmethod
+    def _user_args() -> list[str]:
+        """Match the host user so build artifacts stay owned by the host."""
+        if not hasattr(os, "getuid"):
+            return []
+        return ["--user", f"{os.getuid()}:{os.getgid()}"]
 
     def _workspace_visible(self) -> bool:
         """Confirm the bind mount really shows this workspace, not an empty dir."""
@@ -187,7 +201,7 @@ class Sandbox:
         if self.container and not network:
             work = self.workdir if not cwd else f"{self.workdir}/{cwd}"
             return ["docker", "exec", "-w", work, self.container,
-                    "/bin/sh", "-lc", command]
+                    "/bin/sh", "-c", command]
         # One-shot container: used when the caller needs network (dependency
         # installs, research fetches) which the long-lived box does not have.
         return [
@@ -199,9 +213,11 @@ class Sandbox:
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "-v", f"{self.root}:{self.workdir}",
             "-w", self.workdir if not cwd else f"{self.workdir}/{cwd}",
+            *self._user_args(),
             "-e", "HOME=/tmp", "-e", f"PYTHONPATH={self.workdir}/src",
+            "-e", "PIP_USER=1", "-e", f"PATH={_PATH}",
             self.cfg.get("image", "python:3.11-slim"),
-            "/bin/sh", "-lc", command,
+            "/bin/sh", "-c", command,
         ]
 
     def _local_env(self) -> dict:

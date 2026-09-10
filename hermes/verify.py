@@ -71,7 +71,8 @@ DEV_TOOLS = frozenset({
 })
 
 
-def _install_missing(sandbox: Sandbox, result, log: Logger) -> bool:
+def _install_missing(sandbox: Sandbox, result, verification: 'Verification',
+                     log: Logger) -> bool:
     """Exit 127 means a tool is absent, not that the generated code is wrong.
 
     The architect is meant to install its tooling in the setup command and
@@ -97,7 +98,11 @@ def _install_missing(sandbox: Sandbox, result, log: Logger) -> bool:
     else:
         return False
     log.info("verify.install_missing", tool=tool, install=target)
-    if not sandbox.install(f"pip install --quiet {target}").ok:
+    attempt = sandbox.install(f"pip install --quiet {target}")
+    if not attempt.ok:
+        # Why the install failed is the actual diagnosis (a src/ layout with no
+        # package_dir, say), so it has to reach the agent that must fix it.
+        verification.results.append(attempt)
         return False
     sandbox.installed.append(target)
     return True
@@ -115,7 +120,7 @@ def run_commands(sandbox: Sandbox, commands: list[str], name: str,
     for command in commands:
         runner = sandbox.install if install else sandbox.run
         result = runner(command, timeout=timeout)
-        if not result.ok and autofix and _install_missing(sandbox, result, log):
+        if not result.ok and autofix and _install_missing(sandbox, result, verification, log):
             result = runner(command, timeout=timeout)
         verification.results.append(result)
         if not result.ok:

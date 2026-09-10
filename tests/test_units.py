@@ -299,3 +299,27 @@ def test_unknown_tool_is_not_fetched_from_pypi(shared_tmp):
         verification = verify_project(sandbox, plan)
     assert not verification.passed
     assert sandbox.installed == []
+
+
+def test_failed_install_reaches_the_agent(shared_tmp):
+    """The install error is the diagnosis, so it must survive into the report."""
+    import shutil
+    if not shutil.which("docker"):
+        pytest.skip("docker unavailable")
+    (shared_tmp / "src").mkdir()
+    (shared_tmp / "src" / "greet.py").write_text("def main():\n    print('hi')\n")
+    # packages=['greet'] with the code under src/ and no package_dir: the
+    # editable install cannot work, and saying so is the point.
+    (shared_tmp / "setup.py").write_text(
+        "from setuptools import setup\n"
+        "setup(name='greet', version='0', packages=['greet'],\n"
+        "      entry_points={'console_scripts': ['greet=greet:main']})\n")
+    plan = {"commands": {"build": "true", "test": "greet"}}
+    sandbox = Sandbox(shared_tmp, {"runtime": "docker", "timeout": 300,
+                                   "image": "python:3.11-slim"})
+    with sandbox:
+        if sandbox.runtime != "docker":
+            pytest.skip("docker present but unusable")
+        verification = verify_project(sandbox, plan)
+    assert not verification.passed
+    assert "pip install" in verification.failure_output()

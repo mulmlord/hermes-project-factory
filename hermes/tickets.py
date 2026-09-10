@@ -7,6 +7,7 @@ write so the workspace stays readable without Hermes internals.
 from __future__ import annotations
 
 import json
+import subprocess
 import re
 import time
 from dataclasses import dataclass, field, asdict
@@ -64,6 +65,21 @@ class Ticket:
             + block("Expected Artifacts", self.artifacts)
             + block("Notes", self.notes)
         )
+
+
+def split_validation(entries: list[str]) -> tuple[list[str], list[str]]:
+    """Separate runnable commands from prose the planner wrote by mistake.
+
+    A validation entry is executed as a shell command. Planners regularly put
+    an English acceptance criterion there instead, which can only ever fail,
+    so it is demoted to acceptance rather than run. ``sh -n`` parses without
+    executing, so nothing here runs model-written text.
+    """
+    commands, prose = [], []
+    for entry in entries:
+        checked = subprocess.run(["/bin/sh", "-n", "-c", entry], capture_output=True)
+        (commands if checked.returncode == 0 else prose).append(entry)
+    return commands, prose
 
 
 class Board:

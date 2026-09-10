@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .log import Logger, NULL
 from .sandbox import Result, Sandbox
+from .tickets import split_validation
 
 #: Patterns that mark generated code as unsafe regardless of test results.
 UNSAFE_PATTERNS = [
@@ -204,7 +205,10 @@ def verify_ticket(sandbox: Sandbox, ticket, plan: dict, changed: list[str],
     commands = plan.get("commands") or {}
     verification = Verification()
     run_commands(sandbox, [commands.get("build", "")], "build", verification, log=log)
-    run_commands(sandbox, ticket.validation, f"ticket:{ticket.id}", verification, log=log)
+    # Filtered here too, not just at planning: tickets created before the check
+    # exists still carry prose that would fail as a command.
+    runnable, _ = split_validation(ticket.validation)
+    run_commands(sandbox, runnable, f"ticket:{ticket.id}", verification, log=log)
     run_commands(sandbox, [commands.get("test", "")], "tests", verification,
                  required=tests_required, log=log)
     hits = scan_unsafe(sandbox.root, changed)

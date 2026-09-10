@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
 from .log import Logger, NULL
-from .tickets import Board, KINDS, Ticket
+from .tickets import Board, KINDS, Ticket, split_validation
 from .workspace import slugify
 
 MAX_TICKET_FIELDS = 400
@@ -155,7 +154,7 @@ def _ingest(board: Board, raw: list, *, parent: Ticket | None = None, depth: int
     for item in raw:
         if not isinstance(item, dict) or not item.get("title"):
             continue
-        commands, prose = _split_validation(_strings(item.get("validation")))
+        commands, prose = split_validation(_strings(item.get("validation")))
         if prose:
             log.debug("planning.prose_validation", title=str(item["title"])[:60],
                       dropped=len(prose))
@@ -206,21 +205,6 @@ def _break_cycles(board: Board, log: Logger = NULL) -> None:
             d for d in board.tickets[offender].dependencies if d != victim
         ]
         log.warn("planning.cycle_broken", removed=f"{offender}->{victim}")
-
-
-def _split_validation(entries: list[str]) -> tuple[list[str], list[str]]:
-    """Separate runnable commands from prose the planner wrote by mistake.
-
-    A validation entry is executed as a shell command. Planners regularly put
-    an English acceptance criterion there instead, which can only ever fail,
-    so it is demoted to acceptance rather than run. ``sh -n`` parses without
-    executing, so nothing here runs model-written text.
-    """
-    commands, prose = [], []
-    for entry in entries:
-        checked = subprocess.run(["/bin/sh", "-n", "-c", entry], capture_output=True)
-        (commands if checked.returncode == 0 else prose).append(entry)
-    return commands, prose
 
 
 def _strings(value) -> list[str]:

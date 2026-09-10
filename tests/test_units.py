@@ -7,10 +7,9 @@ from hermes.config import Config, ConfigError, deep_merge, is_local_url
 from hermes.evolve import Objective, parse_score
 from hermes.implement import _protected, apply_change
 from hermes.models import extract_json, strip_reasoning
-from hermes.planning import _split_validation
 from hermes.sandbox import Sandbox, SandboxError
 from hermes.state import State, StateError, checkpoint, restore
-from hermes.tickets import Board
+from hermes.tickets import Board, split_validation
 from hermes.verify import scan_unsafe, verify_project
 from hermes import workspace
 
@@ -328,7 +327,7 @@ def test_failed_install_reaches_the_agent(shared_tmp):
 
 def test_prose_validation_becomes_an_acceptance_criterion():
     """A planner sentence in the validation list can only ever fail as a command."""
-    commands, prose = _split_validation([
+    commands, prose = split_validation([
         "pytest tests -q",
         "All standard subtractive pairs (IV, IX, XL, XC, CD, CM) pass",
         "python -c 'import roman'",

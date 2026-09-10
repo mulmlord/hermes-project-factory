@@ -330,7 +330,13 @@ def test_prose_validation_becomes_an_acceptance_criterion():
     commands, prose = split_validation([
         "pytest tests -q",
         "All standard subtractive pairs (IV, IX, XL, XC, CD, CM) pass",
+        "All test cases pass without false positives",
         "python -c 'import roman'",
+        "make build",
+        "cargo test --all-features",
+        "bash scripts/check.sh one two three four",
     ])
-    assert commands == ["pytest tests -q", "python -c 'import roman'"]
-    assert len(prose) == 1
+    assert commands == ["pytest tests -q", "python -c 'import roman'", "make build",
+                        "cargo test --all-features",
+                        "bash scripts/check.sh one two three four"]
+    assert len(prose) == 2

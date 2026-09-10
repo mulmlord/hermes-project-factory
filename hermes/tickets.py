@@ -67,6 +67,9 @@ class Ticket:
         )
 
 
+_SHELL_CHARS = set("|&;<>()$`\"'=/\\")
+
+
 def split_validation(entries: list[str]) -> tuple[list[str], list[str]]:
     """Separate runnable commands from prose the planner wrote by mistake.
 
@@ -78,8 +81,21 @@ def split_validation(entries: list[str]) -> tuple[list[str], list[str]]:
     commands, prose = [], []
     for entry in entries:
         checked = subprocess.run(["/bin/sh", "-n", "-c", entry], capture_output=True)
-        (commands if checked.returncode == 0 else prose).append(entry)
+        runnable = checked.returncode == 0 and not _reads_as_english(entry)
+        (commands if runnable else prose).append(entry)
     return commands, prose
+
+
+def _reads_as_english(entry: str) -> bool:
+    """A sentence like "All test cases pass" parses as a shell command but is not one.
+
+    Real commands are short, or carry a flag, a path or a shell metacharacter.
+    A long run of bare words with none of those is a criterion, not a command.
+    """
+    words = entry.split()
+    if len(words) <= 3 or any(c in _SHELL_CHARS for c in entry):
+        return False
+    return not any(word.startswith("-") for word in words)
 
 
 class Board:

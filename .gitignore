@@ -10,3 +10,6 @@ projects/
 .headroom/
 .serena/
 .claude/.headroom_wrap_*
+# Per-machine editor/agent settings. Anything meant to be shared belongs in
+# .claude/settings.json, which is tracked.
+.claude/settings.local.json

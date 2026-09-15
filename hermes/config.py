@@ -92,7 +92,13 @@ DEFAULTS: dict[str, Any] = {
         "measure_drain_seconds": 120,   # how long a benchmark waits for the GPU to clear
     },
     "git": {"enabled": True, "author": "Hermes Factory <hermes@localhost>"},
-    "github": {"enabled": False, "private": True, "owner": None, "name": None},
+    "github": {
+        "enabled": False, "private": True, "owner": None, "name": None,
+        "issues": True,       # project the ticket board onto issues, one way
+        "issue_batch": 20,    # issues touched per save, so a freshly planned
+                              # board spreads over iterations instead of
+                              # spending a hundred API calls at once
+    },
     "openhands": {"enabled": False, "command": "openhands"},
     "logging": {"level": "info"},
 }
@@ -280,4 +286,7 @@ evolution:
 github:
   enabled: false
   private: true
+  issues: true           # mirror the ticket board onto issues. One way: the
+                         # board is the source of truth and an edit made on
+                         # GitHub is never read back.
 """

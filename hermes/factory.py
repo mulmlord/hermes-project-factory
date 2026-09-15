@@ -15,7 +15,7 @@ from . import workspace
 from .agents import build as build_agents, context_block
 from .config import Config
 from .evolve import Evolution, objective_from_spec
-from .git_ops import GitHub, Repo
+from .git_ops import GitHub, Issues, Repo
 from .implement import Change, execute_ticket, generate
 from .journal import Journal
 from .log import Logger, for_workspace
@@ -46,6 +46,8 @@ class Factory:
         self.sandbox = Sandbox(self.root, self.config.get("sandbox", {}), self.log)
         self.repo = Repo(self.root, self.log, self.config.get("git.author"))
         self.github = GitHub(self.config.get("github", {}), self.log)
+        self.issues = Issues(self.github, self.root, self.log,
+                             int(self.config.get("github.issue_batch", 20)))
         self.openhands = OpenHands(self.config.get("openhands", {}),
                                    self.config.model_for("coding"), self.log)
         self.resources = self.governor.snapshot()
@@ -63,6 +65,10 @@ class Factory:
         self.state.save(self.root)
         self.board.save()
         workspace.write_context(self.root, self.state, self._board_extra())
+        if self.config.get("github.issues", True):
+            # Free while GitHub is disabled or the project has no repository,
+            # and free again on a board that did not move.
+            self.issues.sync(self.board.tickets.values())
         if label and self.state.iteration % max(
                 1, int(self.config.get("execution.checkpoint_every", 1))) == 0:
             checkpoint(self.root, label)

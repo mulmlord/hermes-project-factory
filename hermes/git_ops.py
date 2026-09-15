@@ -5,12 +5,16 @@ through the ``gh`` CLI, which holds its own auth on the host.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from .log import Logger, NULL
+from .tickets import FINISHED
 
 PREFIXES = ("feat", "fix", "test", "perf", "docs", "refactor", "chore", "build")
 
@@ -158,6 +162,175 @@ class GitHub:
             self.log.warn("github.release_failed", error=proc.stderr.strip()[:200])
             return None
         return proc.stdout.strip()
+
+
+ONE_WAY = (
+    "\n\n---\n*Projected from the Hermes ticket board. The board is the source "
+    "of truth and this projection is one way: an edit made here is not read "
+    "back, because the factory is specified to run without a human in the "
+    "loop. Change the project by changing the board.*\n"
+)
+
+
+def issue_body(ticket) -> str:
+    """A ticket rendered as an issue: everything an onlooker needs, no internals."""
+    def block(name: str, items) -> str:
+        return f"### {name}\n" + ("\n".join(f"- {i}" for i in items) or "- (none)") + "\n\n"
+
+    body = (
+        f"**Status:** {ticket.status} · **Kind:** {ticket.kind} · "
+        f"**Priority:** {ticket.priority} · **Risk:** {ticket.risk} · "
+        f"**Attempts:** {ticket.attempts}\n\n"
+        f"### Objective\n{ticket.objective or ticket.title}\n\n"
+        + (f"### Context\n{ticket.context}\n\n" if ticket.context else "")
+        + block("Acceptance criteria", ticket.acceptance)
+        + block("Validation", [f"`{v}`" for v in ticket.validation])
+        + block("Expected artifacts", ticket.artifacts)
+        + (block("Depends on", ticket.dependencies) if ticket.dependencies else "")
+    )
+    return body[:60000] + ONE_WAY
+
+
+class Issues:
+    """One-way projection of the ticket board onto GitHub issues.
+
+    Section 23 asks for issue synchronisation; this is the half of it that
+    does not put a human back into an unattended loop. Nothing is ever read
+    from GitHub, and every issue says so in its own footer.
+
+    Only a ticket whose issue would actually differ costs an API call, so the
+    save that runs every iteration is free on an unchanged board, and free
+    entirely until the project has a repository to synchronise with.
+    """
+
+    #: How long a failed readiness check is trusted before being retried. The
+    #: repository only appears at release, so "not ready" is usually temporary.
+    RECHECK = 60.0
+
+    def __init__(self, github: GitHub, root: Path, log: Logger = NULL,
+                 batch: int = 20):
+        self.github = github
+        self.root = Path(root)
+        self.log = log
+        self.batch = batch
+        self.path = self.root / ".hermes" / "state" / "github_issues.json"
+        self.known: dict[str, dict] = self._load()
+        self._ready = False
+        self._checked = 0.0
+
+    def _load(self) -> dict:
+        if not self.path.is_file():
+            return {}
+        try:
+            return json.loads(self.path.read_text()).get("issues", {})
+        except (json.JSONDecodeError, OSError):
+            # A lost map means duplicate issues, which is worth a warning but
+            # not worth failing a build over.
+            self.log.warn("github.issue_map_unreadable", path=str(self.path))
+            return {}
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({"issues": self.known}, indent=2))
+
+    def ready(self) -> bool:
+        """True once GitHub is usable and the project has a remote.
+
+        Before publication there is no repository, so this is what keeps an
+        ordinary run from making any network call at all.
+        """
+        if self._ready:
+            return True
+        now = time.time()
+        if now - self._checked < self.RECHECK:
+            return False
+        self._checked = now
+        if not self.github.ready():
+            return False
+        remote = subprocess.run(["git", "remote", "get-url", "origin"],
+                                cwd=self.root, capture_output=True, text=True)
+        self._ready = remote.returncode == 0
+        return self._ready
+
+    def sync(self, tickets) -> int:
+        """Bring issues in line with the board. Returns the API calls spent."""
+        if not self.ready():
+            return 0
+        spent, dirty = 0, False
+        for ticket in sorted(tickets, key=lambda t: t.id):
+            if spent >= self.batch:
+                # The rest is picked up next iteration: a freshly planned
+                # board should not spend a hundred API calls in one save.
+                self.log.info("github.issues_deferred", synced=spent)
+                break
+            called, changed = self._project(ticket)
+            spent += int(called)
+            dirty = dirty or changed
+        if dirty:
+            self._save()
+        return spent
+
+    def _project(self, ticket) -> tuple[bool, bool]:
+        """One ticket. Returns (an API call was made, the map changed)."""
+        title = f"{ticket.id}: {ticket.title}"[:250]
+        body = issue_body(ticket)
+        closed = ticket.status in FINISHED
+        digest = hashlib.sha256(f"{title}\n{body}\n{closed}".encode()).hexdigest()[:16]
+        record = self.known.get(ticket.id, {})
+        if record.get("digest") == digest:
+            return False, False
+
+        number = record.get("number")
+        if number is None:
+            if closed:
+                # Finished before the repository existed: opening an issue in
+                # order to close it is noise, not observability.
+                self.known[ticket.id] = {"number": None, "digest": digest,
+                                         "closed": True}
+                return False, True
+            number = self._open(title, body)
+            if number is None:
+                return False, False
+            self.known[ticket.id] = {"number": number, "digest": digest,
+                                     "closed": False}
+            return True, True
+
+        if not self._edit(number, title, body, closed, bool(record.get("closed"))):
+            return False, False
+        self.known[ticket.id] = {"number": number, "digest": digest, "closed": closed}
+        return True, True
+
+    def _open(self, title: str, body: str) -> int | None:
+        proc = self.github._gh("issue", "create", "--title", title, "--body", body,
+                               cwd=self.root)
+        if proc.returncode != 0:
+            self.log.warn("github.issue_create_failed", title=title[:60],
+                          error=proc.stderr.strip()[:200])
+            return None
+        number = _issue_number(proc.stdout)
+        self.log.info("github.issue_opened", number=number, title=title[:60])
+        return number
+
+    def _edit(self, number: int, title: str, body: str, closed: bool,
+              was_closed: bool) -> bool:
+        proc = self.github._gh("issue", "edit", str(number), "--title", title,
+                               "--body", body, cwd=self.root)
+        if proc.returncode != 0:
+            self.log.warn("github.issue_edit_failed", number=number,
+                          error=proc.stderr.strip()[:200])
+            return False
+        if closed != was_closed:
+            self.github._gh("issue", "close" if closed else "reopen", str(number),
+                            cwd=self.root)
+            self.log.info("github.issue_state", number=number,
+                          state="closed" if closed else "reopened")
+        return True
+
+
+def _issue_number(stdout: str) -> int | None:
+    """``gh issue create`` prints the URL of what it made."""
+    match = re.search(r"/issues/(\d+)", stdout or "")
+    return int(match.group(1)) if match else None
 
 
 def _split_author(author: str) -> tuple[str, str]:

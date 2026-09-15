@@ -62,6 +62,13 @@ candidate that fails the tests is discarded before its score is read.
 and builds and tests it there, proving the repository is reproducible from a
 clean checkout rather than from leftover build state.
 
+With GitHub enabled, the board is projected onto issues as tickets move: one
+issue per ticket, closed when the ticket is, so a running project is
+observable without shell access to the host. The projection is one way. The
+board is the source of truth, an edit made on GitHub is never read back, and
+each issue says so — a loop specified to run unattended should not have a
+text box a human can steer it from.
+
 ## Requirements
 
 - Python 3.10 or newer

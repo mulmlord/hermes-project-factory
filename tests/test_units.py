@@ -1,5 +1,6 @@
 """Unit checks for the logic that has to be right for the loop to terminate."""
 import json
+import subprocess
 import threading
 import time
 
@@ -12,6 +13,7 @@ from hermes.evolve import Bandit, Candidate, Evolution, Objective, parse_score
 from hermes.implement import (Change, _protected, _race, apply_change, execute_ticket,
                               relevant_files, restore as restore_files,
                               snapshot as snapshot_files)
+from hermes.git_ops import GitHub, Issues
 from hermes.journal import Entry, Journal
 from hermes.log import NULL
 from hermes.models import ModelError, Router, extract_json, strip_reasoning
@@ -766,6 +768,140 @@ def test_research_without_a_network_budget_fetches_nothing(tmp_path):
     assert payload["sources"] == []
     assert payload["findings"][0]["sources"] == []
     assert not (tmp_path / "research" / "sources").exists()
+
+
+# -- github issue sync -------------------------------------------------------
+
+class _Gh:
+    """Stands in for the gh CLI, recording what it was asked to do."""
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+        self.opened = 0
+
+    def __call__(self, *args, cwd=None):
+        self.calls.append(list(args))
+        if args[:2] == ("issue", "create"):
+            self.opened += 1
+            return subprocess.CompletedProcess(
+                args, 0, f"https://github.com/o/r/issues/{self.opened}\n", "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def verbs(self) -> list[str]:
+        return [" ".join(call[:2]) for call in self.calls]
+
+
+@pytest.fixture
+def gh(monkeypatch):
+    fake = _Gh()
+    monkeypatch.setattr(GitHub, "_gh",
+                        lambda self, *args, cwd=None: fake(*args, cwd=cwd))
+    return fake
+
+
+def _published(root):
+    """A project that has a repository, which is what sync waits for."""
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "remote", "add", "origin",
+                    "https://example.invalid/o/r.git"], cwd=root, check=True)
+
+
+def _sync(root, batch=20, enabled=True):
+    github = GitHub({"enabled": enabled}, NULL)
+    github.available = True          # gh need not be installed to test the logic
+    return Issues(github, root, NULL, batch)
+
+
+def test_each_ticket_becomes_an_issue(tmp_path, gh):
+    workspace.create(tmp_path, "an idea")
+    _published(tmp_path)
+    board = Board(tmp_path)
+    board.add(title="Implement calc", objective="add and divide",
+              acceptance=["add works"], validation=["pytest -q"])
+    board.add(title="Add tests", kind="test")
+    sync = _sync(tmp_path)
+
+    assert sync.sync(board.tickets.values()) == 2
+    assert gh.verbs().count("issue create") == 2
+    assert set(sync.known) == set(board.tickets)
+    assert (tmp_path / ".hermes" / "state" / "github_issues.json").is_file()
+    # Every issue carries the statement that it is not an input.
+    assert "is not read back" in " ".join(gh.calls[-1])
+
+
+def test_a_board_that_did_not_move_costs_nothing(tmp_path, gh):
+    workspace.create(tmp_path, "an idea")
+    _published(tmp_path)
+    board = Board(tmp_path)
+    board.add(title="Implement calc")
+    sync = _sync(tmp_path)
+    sync.sync(board.tickets.values())
+    spent = len(gh.calls)
+
+    assert sync.sync(board.tickets.values()) == 0
+    assert len(gh.calls) == spent
+
+
+def test_a_finished_ticket_closes_its_issue(tmp_path, gh):
+    workspace.create(tmp_path, "an idea")
+    _published(tmp_path)
+    board = Board(tmp_path)
+    ticket = board.add(title="Implement calc")
+    sync = _sync(tmp_path)
+    sync.sync(board.tickets.values())
+
+    board.move(ticket.id, "completed", "gates passed")
+    sync.sync(board.tickets.values())
+
+    assert "issue close" in gh.verbs()
+    assert sync.known[ticket.id]["closed"] is True
+
+
+def test_the_projection_never_reads_an_issue_back(tmp_path, gh):
+    """Two-way sync would put a human inside a loop meant to run unattended."""
+    workspace.create(tmp_path, "an idea")
+    _published(tmp_path)
+    board = Board(tmp_path)
+    ticket = board.add(title="Implement calc")
+    sync = _sync(tmp_path)
+    sync.sync(board.tickets.values())
+    board.move(ticket.id, "active", "picked up")
+    sync.sync(board.tickets.values())
+
+    assert not [v for v in gh.verbs() if v in ("issue view", "issue list")]
+
+
+def test_a_project_without_a_repository_makes_no_calls(tmp_path, gh):
+    workspace.create(tmp_path, "an idea")        # no git remote yet
+    board = Board(tmp_path)
+    board.add(title="Implement calc")
+
+    assert _sync(tmp_path).sync(board.tickets.values()) == 0
+    assert not [v for v in gh.verbs() if v.startswith("issue")]
+
+
+def test_disabled_github_reaches_nothing(tmp_path, gh):
+    workspace.create(tmp_path, "an idea")
+    _published(tmp_path)
+    board = Board(tmp_path)
+    board.add(title="Implement calc")
+
+    assert _sync(tmp_path, enabled=False).sync(board.tickets.values()) == 0
+    assert gh.calls == []
+
+
+def test_a_freshly_planned_board_spreads_over_iterations(tmp_path, gh):
+    workspace.create(tmp_path, "an idea")
+    _published(tmp_path)
+    board = Board(tmp_path)
+    for n in range(5):
+        board.add(title=f"ticket {n}")
+    sync = _sync(tmp_path, batch=2)
+
+    assert sync.sync(board.tickets.values()) == 2
+    assert sync.sync(board.tickets.values()) == 2
+    assert sync.sync(board.tickets.values()) == 1
+    assert gh.verbs().count("issue create") == 5
 
 
 # -- verification ------------------------------------------------------------

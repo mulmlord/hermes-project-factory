@@ -66,8 +66,12 @@ clean checkout rather than from leftover build state.
   at startup and refuses to run blind, falling back to local execution with a
   warning; keep projects under your home directory to avoid it.
 - `git`, and `gh` if you want GitHub publishing
+- Optionally the OpenHands agent layer. Its CLI pins CPython 3.12, so
+  `install.sh` gives it an environment of its own rather than sharing Hermes';
+  `uv` provisions that interpreter for you if you have it.
 
-Only one third-party package is needed: PyYAML.
+Hermes itself needs one third-party package: PyYAML. OpenHands, when you
+install it, keeps its own dependency tree out of Hermes' virtualenv.
 
 ## Install
 
@@ -77,9 +81,12 @@ $ ./install.sh
 
 It builds a virtualenv for the factory, installs it, links `hpf` and `hermes`
 into `~/.local/bin`, writes a starter config to `~/.config/hermes/config.yaml`
-if you have none, pre-pulls the sandbox image, and finishes by running
-`hermes doctor`. It installs no model: Hermes is local-model-only and will not
-guess which one you want.
+if you have none, pre-pulls the sandbox image, installs the OpenHands agent
+layer beside Hermes, and finishes by running `hermes doctor`. It installs no
+model: Hermes is local-model-only and will not guess which one you want.
+
+Nothing is installed for the Feynman research workflow, because it is part of
+Hermes itself rather than a package.
 
 | Flag | Effect |
 |---|---|
@@ -88,6 +95,7 @@ guess which one you want.
 | `--bin DIR`, `--venv DIR` | choose where the commands and the virtualenv go |
 | `--no-docker-image` | skip pre-pulling the sandbox image |
 | `--no-config` | leave `~/.config/hermes/config.yaml` alone |
+| `--no-openhands` | skip the optional OpenHands agent layer |
 
 A virtualenv rather than a `--user` install, because most distributions now
 mark the system interpreter externally managed and `pip` refuses to write to
@@ -104,6 +112,31 @@ $ hermes doctor
 `hermes doctor` checks that every routed model is actually installed on your
 local server, that the sandbox runtime works, and that the tooling is present.
 It refuses to guess.
+
+## Uninstall
+
+```console
+$ ./uninstall.sh
+```
+
+It removes the virtualenv, the `hpf` and `hermes` links, the editable-install
+leftovers in this repository and the OpenHands agent layer. It keeps your
+config, because the model routing in it is yours rather than something the
+installer wrote, and it keeps the sandbox image, because `python:3.11-slim` is
+a stock image other containers may share. A link on your PATH that points
+somewhere other than the environments being removed is left alone.
+
+| Flag | Effect |
+|---|---|
+| `--config` | also delete `~/.config/hermes/config.yaml` |
+| `--docker-image` | also delete the pre-pulled sandbox image |
+| `--all` | both of the above |
+| `--keep-openhands` | leave the OpenHands agent layer installed |
+| `--system`, `--bin DIR`, `--venv DIR` | mirror the install flags |
+| `--dry-run` | report what would be removed, remove nothing |
+
+Generated projects are never touched: they are ordinary directories the
+installer never created. To finish, delete this repository.
 
 ## Configuration
 
@@ -232,8 +265,12 @@ promoted.
 - Agents patch files with exact search/replace edits and fall back to whole
   files. A local model that cannot copy an anchor character for character
   loses the edit and retries, which costs a generation.
-- OpenHands integration is optional and off by default; without it Hermes
-  uses its own implementer.
+- OpenHands is installed by default but stays dormant until you set
+  `openhands.enabled: true`; without it Hermes uses its own implementer. The
+  delegation path is checked against a live install: the invocation and the
+  `LLM_*` variables are what OpenHands 1.21 accepts, and a run reaches only the
+  endpoint Hermes names. What a full multi-file ticket costs there, against a
+  real local model, is still unmeasured.
 - Research works from what the model knows. Network research is not enabled
   by default.
 

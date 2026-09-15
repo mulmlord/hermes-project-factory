@@ -13,6 +13,7 @@ from hermes.implement import (Change, _protected, _race, apply_change, execute_t
 from hermes.journal import Entry, Journal
 from hermes.log import NULL
 from hermes.models import ModelError, Router, extract_json, strip_reasoning
+from hermes.openhands import OpenHands
 from hermes import harness
 from hermes.sandbox import Sandbox, SandboxError
 from hermes.state import State, StateError, checkpoint, restore
@@ -49,6 +50,45 @@ def test_remote_allowed_only_with_explicit_optin(tmp_path):
 def test_deep_merge_keeps_untouched_defaults():
     merged = deep_merge({"a": {"b": 1, "c": 2}}, {"a": {"b": 9}})
     assert merged == {"a": {"b": 9, "c": 2}}
+
+
+# -- openhands ---------------------------------------------------------------
+
+def test_openhands_delegation_stays_headless_and_local(tmp_path, monkeypatch):
+    """The invocation must match the CLI Hermes actually shells out to.
+
+    Two of these assertions are load-bearing rather than cosmetic: there is no
+    --directory flag, so passing one aborts the run, and without
+    --override-with-envs the LLM_* variables are ignored and OpenHands falls
+    back to a hosted endpoint, which Hermes is not allowed to reach.
+    """
+    model = SimpleNamespace(backend="ollama", model="qwen3:30b-a3b",
+                            base_url="http://localhost:11434")
+    agent = OpenHands({"enabled": True, "command": "openhands"}, model)
+    ticket = SimpleNamespace(id="T001", title="tidy", kind="refactor",
+                             objective="o", context="c", acceptance=[],
+                             validation=[], artifacts=[])
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        seen["env"] = kw.get("env", {})
+        seen["cwd"] = kw.get("cwd")
+        return SimpleNamespace(returncode=0, stdout="done", stderr="")
+
+    monkeypatch.setattr("hermes.openhands.subprocess.run", fake_run)
+    assert agent.run_ticket(tmp_path, ticket, "CONTEXT")["ok"]
+
+    assert "--headless" in seen["argv"]
+    assert "--override-with-envs" in seen["argv"]
+    assert "-t" in seen["argv"]
+    assert "--directory" not in seen["argv"]
+    assert seen["cwd"] == tmp_path  # the working directory is the cwd, not a flag
+
+    env = seen["env"]
+    assert env["LLM_MODEL"] == "ollama/qwen3:30b-a3b"
+    assert is_local_url(env["LLM_BASE_URL"])
+    assert not [k for k in env if "ANTHROPIC" in k.upper() or "OPENAI_API_KEY" in k]
 
 
 # -- model output parsing ----------------------------------------------------

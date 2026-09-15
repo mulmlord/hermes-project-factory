@@ -3,12 +3,13 @@
 # Install the Hermes Project Factory.
 #
 # Creates an isolated virtualenv for the factory, installs it and its single
-# dependency, and puts `hpf` and `hermes` on your PATH. It never installs a
-# model: Hermes is local-model-only and refuses to guess which model you want,
-# so this script only reports what is missing and how to get it.
+# dependency, and puts `hpf` and `hermes` on your PATH. The optional OpenHands
+# agent layer is installed alongside it, in an environment of its own. It never
+# installs a model: Hermes is local-model-only and refuses to guess which model
+# you want, so this script only reports what is missing and how to get it.
 #
 # Usage: ./install.sh [--dev] [--system] [--bin DIR] [--venv DIR]
-#                     [--no-docker-image] [--no-config]
+#                     [--no-docker-image] [--no-config] [--no-openhands]
 #
 #   --dev              also install the test dependencies
 #   --system           link into /usr/local/bin instead of ~/.local/bin (sudo)
@@ -16,14 +17,17 @@
 #   --venv DIR         build the virtualenv in DIR (default: <repo>/.venv)
 #   --no-docker-image  skip pre-pulling the sandbox image
 #   --no-config        do not write ~/.config/hermes/config.yaml
+#   --no-openhands     skip the optional OpenHands agent layer
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$REPO/.venv"
+OH_VENV="$REPO/.venv-openhands"
 BIN_DIR="$HOME/.local/bin"
 DEV=0
 PULL_IMAGE=1
 WRITE_CONFIG=1
+OPENHANDS=1
 
 note() { printf '==> %s\n' "$*"; }
 warn() { printf ' !  %s\n' "$*" >&2; }
@@ -37,7 +41,8 @@ while [ $# -gt 0 ]; do
     --venv)            VENV="${2:?--venv needs a directory}"; shift ;;
     --no-docker-image) PULL_IMAGE=0 ;;
     --no-config)       WRITE_CONFIG=0 ;;
-    -h|--help)         sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-openhands)    OPENHANDS=0 ;;
+    -h|--help)         sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)                 die "unknown option: $1 (try --help)" ;;
   esac
   shift
@@ -121,6 +126,49 @@ elif command -v docker >/dev/null; then
 else
   warn "docker not found: generated code would run unsandboxed on this host."
   warn "install docker before building anything you have not read."
+fi
+
+# -- openhands ---------------------------------------------------------------
+
+# The optional agent layer of specification section 10, installed beside Hermes
+# rather than into its virtualenv. Two reasons, both hard: the published CLI
+# pins CPython 3.12, which is older than the interpreter Hermes itself runs on
+# here, and its dependency tree carries hosted-provider SDKs that have no
+# business in the factory's own environment. Hermes only ever invokes it as a
+# subprocess, so a neighbouring install is the whole of the integration.
+#
+# Nothing is installed for the Feynman research workflow: it is part of Hermes
+# itself (hermes/research.py), not a package.
+if [ "$OPENHANDS" -eq 1 ]; then
+  note "installing the OpenHands agent layer"
+  if command -v openhands >/dev/null 2>&1; then
+    note "openhands is already on PATH ($(command -v openhands))"
+  elif command -v uv >/dev/null 2>&1; then
+    # uv fetches CPython 3.12 itself, so this succeeds even on a host whose
+    # only interpreter is too new for the package.
+    uv tool install -q --python 3.12 openhands \
+      || warn "uv could not install openhands; Hermes will use its own implementer"
+  elif command -v python3.12 >/dev/null 2>&1; then
+    if python3.12 -m venv "$OH_VENV" \
+       && "$OH_VENV/bin/python" -m pip install --quiet --upgrade pip \
+       && "$OH_VENV/bin/python" -m pip install --quiet openhands; then
+      if [ -w "$BIN_DIR" ]; then
+        ln -sf "$OH_VENV/bin/openhands" "$BIN_DIR/openhands"
+      else
+        sudo ln -sf "$OH_VENV/bin/openhands" "$BIN_DIR/openhands"
+      fi
+      note "installed openhands into $OH_VENV"
+    else
+      warn "could not install openhands into $OH_VENV"
+    fi
+  else
+    warn "openhands requires CPython 3.12 and neither uv nor python3.12 was found."
+    warn "install uv (https://docs.astral.sh/uv/) and re-run, or pass --no-openhands."
+    warn "Hermes falls back to its own implementer either way."
+  fi
+  if command -v openhands >/dev/null 2>&1 || [ -x "$OH_VENV/bin/openhands" ]; then
+    note "to use it, set 'enabled: true' under 'openhands' in your hermes.yaml"
+  fi
 fi
 
 # -- models ------------------------------------------------------------------

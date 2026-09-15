@@ -52,7 +52,10 @@ class OpenHands:
         env.update({
             "LLM_MODEL": model,
             "LLM_BASE_URL": api_base,
-            "LLM_API_KEY": "local",          # placeholder: local servers ignore it
+            # Required, not cosmetic: under --override-with-envs OpenHands
+            # aborts when LLM_API_KEY or LLM_MODEL is unset. Local servers
+            # ignore the value itself.
+            "LLM_API_KEY": "local",
             "LLM_NUM_RETRIES": "2",
             "SANDBOX_USER_ID": str(os.getuid()),
             "LOG_ALL_EVENTS": "false",
@@ -73,7 +76,15 @@ class OpenHands:
             "validation commands yourself and fix what fails. Do not stop until "
             "they pass. Do not ask questions."
         )
-        argv = [*self.command.split(), "--task", task, "--directory", str(root)]
+        # Observed against openhands 1.21, not inferred from documentation: the
+        # task is seeded with -t, the working directory is the process's own cwd
+        # rather than a flag, and --override-with-envs is not optional -- without
+        # it the LLM_* variables below are ignored and OpenHands falls back to
+        # its stored settings, whose default endpoint is a hosted proxy
+        # (llm-proxy.app.all-hands.dev). Hermes may not reach a hosted API, so
+        # the flag is what keeps the guarantee.
+        argv = [*self.command.split(), "--headless", "--override-with-envs",
+                "-t", task]
         self.log.info("openhands.start", ticket=ticket.id)
         try:
             proc = subprocess.run(argv, cwd=root, env=self._env(), capture_output=True,

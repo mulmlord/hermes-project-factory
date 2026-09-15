@@ -43,7 +43,12 @@ detected and broken before the scheduler ever sees them.
 **Implementation** picks the next ticket by score, not by order: priority,
 how much other work it unblocks, expected information gain, cost, risk and
 past failures all feed the choice. Each ticket is generated, applied,
-verified, reviewed, and either completed or diagnosed and repaired.
+verified, reviewed, and either completed or diagnosed and repaired. While one
+ticket spends minutes on the CPU in its gates, the next independent one is
+generated on the GPU — but only when the host actually has room for a second
+concurrent model call, and never while a benchmark is being timed, because a
+measurement that shares the machine records the contention rather than the
+code.
 
 **Optimisation** runs an AlphaEvolve-style loop when the project has an
 automatically measurable objective. Correctness gates performance: a

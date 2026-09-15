@@ -82,8 +82,10 @@ DEFAULTS: dict[str, Any] = {
         "prefetch": True,       # generate the next ticket while this one verifies
     },
     "resources": {
-        "reserve_ram_gb": 2,
-        "max_parallel_heavy": 1,
+        "reserve_ram_gb": 2,            # free RAM a host without a GPU keeps back
+        "reserve_vram_mb": 1024,        # free VRAM a second concurrent generation needs
+        "max_concurrent_inference": 2,  # 1 stops generation overlapping at all
+        "measure_drain_seconds": 120,   # how long a benchmark waits for the GPU to clear
     },
     "git": {"enabled": True, "author": "Hermes Factory <hermes@localhost>"},
     "github": {"enabled": False, "private": True, "owner": None, "name": None},

@@ -1,5 +1,7 @@
 """Unit checks for the logic that has to be right for the loop to terminate."""
 import json
+import threading
+import time
 
 import pytest
 
@@ -14,6 +16,7 @@ from hermes.journal import Entry, Journal
 from hermes.log import NULL
 from hermes.models import ModelError, Router, extract_json, strip_reasoning
 from hermes.openhands import OpenHands
+from hermes.resources import Governor
 from hermes import harness
 from hermes.sandbox import Sandbox, SandboxError
 from hermes.state import State, StateError, checkpoint, restore
@@ -492,6 +495,108 @@ def test_relevant_files_reads_journal_hints(tmp_path):
     ticket = Board(tmp_path).add(title="use the config", artifacts=["src/never_built.py"])
     text = relevant_files(sandbox, ticket, {}, ["src/config.py"])
     assert "VALUE = 1" in text
+
+
+# -- resource governor -------------------------------------------------------
+
+def _governor(cfg=None, **probe):
+    """A governor over a fixed probe, so the host running the tests cannot
+    decide whether they pass."""
+    return Governor(cfg or {}, NULL, probe=lambda: probe)
+
+
+def test_a_full_gpu_defers_the_prefetch():
+    governor = _governor({"reserve_vram_mb": 1024}, gpus=[{"vram_free_mb": "300"}])
+    assert not governor.admit_inference()
+    assert "VRAM" in governor.last_refusal
+
+
+def test_headroom_admits_a_second_generation():
+    governor = _governor({"reserve_vram_mb": 1024}, gpus=[{"vram_free_mb": "7000"}])
+    assert governor.admit_inference()
+
+
+def test_a_benchmark_under_measurement_blocks_concurrent_generation():
+    """Evolution selects on timings: a shared GPU measures contention instead."""
+    governor = _governor(gpus=[{"vram_free_mb": "7000"}])
+    with governor.measuring():
+        assert not governor.admit_inference()
+        assert "benchmark" in governor.last_refusal
+    assert governor.admit_inference()
+
+
+def test_the_concurrency_limit_is_honoured():
+    governor = _governor({"max_concurrent_inference": 1},
+                         gpus=[{"vram_free_mb": "7000"}])
+    with governor.inference():
+        assert not governor.admit_inference()
+    assert governor.admit_inference()
+
+
+def test_a_host_without_a_gpu_is_judged_on_free_ram():
+    governor = _governor({"reserve_ram_gb": 8}, cpus=4, ram_free_gb=2.0)
+    assert not governor.admit_inference()
+    assert "RAM" in governor.last_refusal
+
+
+def test_an_unreadable_probe_still_admits():
+    """A machine with no nvidia-smi must not become one that never prefetches."""
+    def boom():
+        raise OSError("no nvidia-smi here")
+
+    assert Governor({}, NULL, probe=boom).admit_inference()
+
+
+def test_measuring_waits_for_inference_to_drain():
+    governor = _governor({"measure_drain_seconds": 5},
+                         gpus=[{"vram_free_mb": "7000"}])
+    released = []
+
+    def hold():
+        with governor.inference():
+            time.sleep(0.2)
+            released.append(time.time())  # recorded before the slot is given up
+
+    worker = threading.Thread(target=hold)
+    worker.start()
+    while not governor.status()["inflight"]:
+        time.sleep(0.01)
+    with governor.measuring():
+        entered = time.time()
+    worker.join()
+    assert released and entered > released[0]
+
+
+def test_a_stuck_model_call_cannot_block_a_benchmark_forever():
+    """A bounded wait: a noisy measurement beats a loop that never measures."""
+    governor = _governor({"measure_drain_seconds": 0.1},
+                         gpus=[{"vram_free_mb": "7000"}])
+    started = time.time()
+    with governor.inference():
+        with governor.measuring():
+            pass
+    assert time.time() - started < 3
+
+
+def test_the_router_registers_every_call_with_the_governor():
+    """The governor can only judge a second call if it was told about the first."""
+    governor = _governor(gpus=[{"vram_free_mb": "7000"}])
+    config = Config({"models": {"default": {"backend": "ollama", "model": "m"}},
+                     "routing": {"coding": "default"}})
+    router = Router(config, NULL, governor)
+    seen = {}
+
+    class Stub:
+        cfg = SimpleNamespace(model="m")
+
+        def complete(self, system, prompt, **kw):
+            seen["inflight"] = governor.status()["inflight"]
+            return "ok"
+
+    router._cache["coding"] = Stub()
+    router.complete("coding", "sys", "prompt")
+    assert seen["inflight"] == 1
+    assert governor.status()["inflight"] == 0
 
 
 # -- verification ------------------------------------------------------------

@@ -23,7 +23,8 @@ from .models import Router
 from .openhands import OpenHands
 from .planning import architect, decompose, generate_tickets, intake
 from .research import investigate, topics_for
-from .sandbox import Sandbox, probe_resources
+from .resources import Governor
+from .sandbox import Sandbox
 from .state import State, checkpoint
 from .tickets import Board
 from .verify import record_evaluation, scan_unsafe, verify_project
@@ -38,14 +39,15 @@ class Factory:
         self.state = State.load(self.root)
         self.board = Board(self.root)
         self.journal = Journal(self.root, self.log)
-        self.router = Router(self.config, self.log)
+        self.governor = Governor(self.config.get("resources", {}), self.log)
+        self.router = Router(self.config, self.log, self.governor)
         self.agents = build_agents(self.router, self.log)
         self.sandbox = Sandbox(self.root, self.config.get("sandbox", {}), self.log)
         self.repo = Repo(self.root, self.log, self.config.get("git.author"))
         self.github = GitHub(self.config.get("github", {}), self.log)
         self.openhands = OpenHands(self.config.get("openhands", {}),
                                    self.config.model_for("coding"), self.log)
-        self.resources = probe_resources()
+        self.resources = self.governor.snapshot()
         self._pool: ThreadPoolExecutor | None = None
         self._prefetch: tuple[str, Future] | None = None
 
@@ -226,6 +228,12 @@ class Factory:
             return
         candidate = self._independent_ticket(current)
         if candidate is None:
+            return
+        if not self.governor.admit_inference():
+            # Sequential generation is the fallback, and it is exactly what the
+            # loop did before prefetching existed. Nothing is lost but overlap.
+            self.log.info("prefetch.deferred", ticket=candidate.id,
+                          reason=self.governor.last_refusal)
             return
         if self._pool is None:
             self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hermes-pf")
@@ -430,7 +438,8 @@ class Factory:
             self.state.transition("DOCUMENTATION", "no optimisation targets found")
             return
         engine = Evolution(self.sandbox, self.agents, self.state, objective, targets,
-                           self.config.get("evolution", {}), self.log)
+                           self.config.get("evolution", {}), self.log,
+                           governor=self.governor)
         best = engine.run(
             max_generations=int(self.config.get("evolution.max_generations", 20)),
             patience=int(self.config.get("evolution.patience", 5)))

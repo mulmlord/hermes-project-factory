@@ -17,6 +17,7 @@ import re
 import shutil
 import statistics
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
@@ -153,7 +154,11 @@ class Evolution:
     """Drives generations of candidates against a benchmark."""
 
     def __init__(self, sandbox: Sandbox, agents, state, objective: Objective,
-                 targets: list[str], cfg: dict, log: Logger = NULL):
+                 targets: list[str], cfg: dict, log: Logger = NULL, governor=None):
+        #: Optional :class:`~hermes.resources.Governor`. Selection here is
+        #: decided by timings, so a benchmark that shares the machine with a
+        #: model call measures the contention instead of the candidate.
+        self.governor = governor
         self.sandbox = sandbox
         self.agents = agents
         self.state = state
@@ -232,8 +237,9 @@ class Evolution:
             return False, None, verification
         if not verification.passed:
             return False, None, verification
-        result = self.sandbox.run(self.objective.command,
-                                  timeout=timeout or self.full_timeout())
+        with self._quiet():
+            result = self.sandbox.run(self.objective.command,
+                                      timeout=timeout or self.full_timeout())
         verification.results.append(result)
         self.last_seconds = result.seconds
         if not result.ok:
@@ -261,16 +267,21 @@ class Evolution:
             return self.full_timeout()
         return max(30, min(self.full_timeout(), int(factor * self.best_seconds) + 5))
 
+    def _quiet(self):
+        """Hold the machine as still as it can be made for a measurement."""
+        return self.governor.measuring() if self.governor else nullcontext()
+
     def repeat(self, times: int, timeout: int | None = None) -> list[float]:
         """Re-run the benchmark on the code as it stands right now."""
         samples = []
-        for _ in range(max(0, times)):
-            result = self.sandbox.run(self.objective.command,
-                                      timeout=timeout or self.full_timeout())
-            score = parse_score(result.stdout + "\n" + result.stderr) if result.ok else None
-            if score is not None:
-                samples.append(score)
-                self.best_seconds = max(self.best_seconds, result.seconds)
+        with self._quiet():
+            for _ in range(max(0, times)):
+                result = self.sandbox.run(self.objective.command,
+                                          timeout=timeout or self.full_timeout())
+                score = parse_score(result.stdout + "\n" + result.stderr) if result.ok else None
+                if score is not None:
+                    samples.append(score)
+                    self.best_seconds = max(self.best_seconds, result.seconds)
         return samples
 
     # -- selection -------------------------------------------------------

@@ -11,6 +11,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from contextlib import nullcontext
 from typing import Any, Iterable
 
 from .config import Config, ConfigError, ModelConfig
@@ -193,11 +194,15 @@ def _match(text: str, start: int, opener: str, closer: str) -> int:
 class Router:
     """Resolves a task kind to a backend, with a small usage ledger."""
 
-    def __init__(self, config: Config, log: Logger = NULL):
+    def __init__(self, config: Config, log: Logger = NULL, governor=None):
         self.config = config
         self.log = log
         self._cache: dict[str, Backend] = {}
         self.usage: list[dict[str, Any]] = []
+        #: Optional :class:`~hermes.resources.Governor`. Every completion is
+        #: registered with it, which is what lets it know whether the GPU is
+        #: already busy before it admits a second concurrent generation.
+        self.governor = governor
 
     def backend(self, task: str) -> Backend:
         if task not in self._cache:
@@ -212,7 +217,8 @@ class Router:
     def complete(self, task: str, system: str, prompt: str, **kw: Any) -> str:
         backend = self.backend(task)
         started = time.time()
-        text = backend.complete(system, prompt, **kw)
+        with self.governor.inference() if self.governor else nullcontext():
+            text = backend.complete(system, prompt, **kw)
         elapsed = time.time() - started
         self.usage.append(
             {"task": task, "model": backend.cfg.model, "seconds": round(elapsed, 2),

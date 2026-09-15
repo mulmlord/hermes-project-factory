@@ -253,6 +253,56 @@ def test_prefetched_work_is_reused_exactly_once(factory):
     factory._stop_prefetch()
 
 
+def test_a_regressing_review_retry_keeps_the_version_that_passed(tmp_path):
+    """A blocking review must not cost the factory the code that already worked."""
+    root = tmp_path / "proj"
+    root.mkdir()
+    workspace.create(root, "A minimal arithmetic library")
+    config = Config.load()
+    config.data["sandbox"]["runtime"] = "local"
+    config.data["sandbox"]["timeout"] = 60
+    config.data["github"]["enabled"] = False
+    config.data["execution"]["max_ticket_attempts"] = 3
+
+    class Picky(StubRouter):
+        """Blocks the first change it reviews, then breaks the module fixing it."""
+
+        def __init__(self):
+            super().__init__()
+            self.prompts = []
+            self.blocked = False
+
+        def _answer(self, prompt):
+            if "Implement this ticket completely" in prompt:
+                self.prompts.append(prompt)
+                if ("KIND: implementation" in prompt and "REPAIR INSTRUCTIONS" in prompt
+                        and "PREVIOUS ATTEMPT FAILED" not in prompt):
+                    # The rewrite that answers the reviewer and stops importing.
+                    return {"summary": "guard the inputs", "files": [
+                        {"path": "src/calc.py",
+                         "content": "def add(a, b)\n    return a + b\n"}]}
+            if "Review this change" in prompt and not self.blocked:
+                self.blocked = True
+                return {"approved": False, "meets_acceptance": False,
+                        "blocking": ["add does not guard non-numeric input"],
+                        "advisory": [], "security": [], "reason": "needs a guard"}
+            return super()._answer(prompt)
+
+    built = Factory(root, config, quiet=True)
+    built.router = Picky()
+    from hermes.agents import build as build_agents
+    built.agents = build_agents(built.router, built.log)
+    state = built.run(max_iterations=40)
+
+    assert state.phase == "COMPLETED", (state.phase, state.notes)
+    assert (root / "src" / "calc.py").read_text() == CALC
+    repaired = [p for p in built.router.prompts if "PREVIOUS ATTEMPT FAILED" in p]
+    assert repaired, "the regression was never reported back to the implementer"
+    assert "broke gates that had already passed" in repaired[0]
+    assert "add does not guard non-numeric input" in repaired[0]
+    assert "return a + b" in repaired[0]  # the restored module, not the broken retry
+
+
 def test_failed_gates_send_ticket_back(tmp_path, monkeypatch):
     """A ticket whose validation fails must not be marked completed."""
     root = tmp_path / "proj"

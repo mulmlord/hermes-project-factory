@@ -7,8 +7,9 @@ from types import SimpleNamespace
 
 from hermes.config import Config, ConfigError, deep_merge, is_local_url
 from hermes.evolve import Bandit, Candidate, Evolution, Objective, parse_score
-from hermes.implement import (Change, _protected, _race, apply_change, relevant_files,
-                              restore as restore_files, snapshot as snapshot_files)
+from hermes.implement import (Change, _protected, _race, apply_change, execute_ticket,
+                              relevant_files, restore as restore_files,
+                              snapshot as snapshot_files)
 from hermes.journal import Entry, Journal
 from hermes.log import NULL
 from hermes.models import ModelError, Router, extract_json, strip_reasoning
@@ -306,6 +307,77 @@ def test_snapshot_restores_a_file_that_did_not_exist(tmp_path):
     sandbox.write("src/new.py", "written\n")
     restore_files(sandbox, saved)
     assert not (tmp_path / "src" / "new.py").exists()
+
+
+#: One attempt each for the review cycle below: the change that clears the
+#: gates, the rewrite that answers the reviewer by breaking them, and the one
+#: that manages both.
+PASSES = {"summary": "carry the value",
+          "files": [{"path": "src/a.py", "content": "value = 'good'\n"}]}
+REGRESSES = {"summary": "answer the reviewer",
+             "files": [{"path": "src/a.py", "content": "value = 'broken'\n"},
+                       {"path": "src/extra.py", "content": "helper = 1\n"}]}
+SATISFIES = {"summary": "answer the reviewer without breaking anything",
+             "files": [{"path": "src/a.py", "content": "value = 'good'  # guarded\n"}]}
+
+
+def _review_cycle(tmp_path, replies):
+    """Run one ticket whose first attempt passes the gates but is blocked in review.
+
+    *replies* answers the implementer once per attempt. The reviewer approves
+    only the guarded version, so the ticket can finish in no other way than by
+    a change that clears the gates and the finding at the same time.
+    """
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 30})
+    board = Board(tmp_path)
+    ticket = board.add(title="carry a value", status="ready", artifacts=["src/a.py"],
+                       validation=["grep -q good src/a.py"])
+    state = State(idea="carry a value",
+                  plan={"commands": {"build": "true", "test": "true"}})
+    prompts = []
+
+    def implement(prompt):
+        prompts.append(prompt)
+        return replies[min(len(prompts), len(replies)) - 1]
+
+    def reviewer(_prompt):
+        approved = "guarded" in sandbox.read("src/a.py")
+        return {"approved": approved, "advisory": [], "security": [],
+                "blocking": [] if approved else ["guard the empty input case"]}
+
+    def triager(_prompt):
+        return {"diagnosis": "the value is wrong", "classification": "implementation",
+                "action": "repair", "instructions": "write the right value"}
+
+    agents = {name: SimpleNamespace(ask_json=lambda prompt, _fn=fn, **kw: _fn(prompt))
+              for name, fn in (("implementer", implement), ("tester", implement),
+                               ("reviewer", reviewer), ("triager", triager))}
+    outcome = execute_ticket(agents, sandbox, state, board, ticket, lambda: "src/a.py",
+                             max_attempts=len(replies))
+    return outcome, sandbox, prompts, ticket
+
+
+def test_a_review_retry_that_regresses_a_gate_is_rolled_back(tmp_path):
+    """Work that already passed must survive the attempt to answer the reviewer."""
+    outcome, sandbox, prompts, _ = _review_cycle(tmp_path, [PASSES, REGRESSES, SATISFIES])
+
+    assert outcome["status"] == "completed"
+    assert "guarded" in sandbox.read("src/a.py")
+    # The retry's second file went back with the first: answering a review is
+    # not confined to the files the passing attempt happened to write.
+    assert not (tmp_path / "src" / "extra.py").exists()
+    # The next attempt was told both what it broke and what it was sent back for.
+    assert "broke gates that had already passed" in prompts[2]
+    assert "guard the empty input case" in prompts[2]
+
+
+def test_a_restored_snapshot_does_not_satisfy_the_review(tmp_path):
+    """Recovering the passing tree answers the reviewer's objection not at all."""
+    outcome, sandbox, _prompts, ticket = _review_cycle(tmp_path, [PASSES, REGRESSES])
+
+    assert outcome["status"] == "failed"
+    assert sandbox.read("src/a.py") == "value = 'good'\n"  # restored, not the retry's
+    assert ticket.status != "completed"
 
 
 # -- work journal ------------------------------------------------------------

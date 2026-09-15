@@ -257,6 +257,10 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
     last_verification: Verification | None = None
     last_change: Change | None = None
     notified = False
+    #: True once the workspace holds a tree that cleared the gates and is only
+    #: waiting on a review finding. From then on a failing attempt is a
+    #: regression against work that was already good, not the ticket's state.
+    gates_held = False
 
     def gate(change: Change) -> Verification:
         nonlocal notified
@@ -285,6 +289,14 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
             failure = "the implementer produced no usable output"
             continue
 
+        # A review-driven retry is free to touch files the passing attempt never
+        # wrote, so the guard covers what *this* attempt declares it will touch
+        # rather than what the last one did; every other file is still the tree
+        # that passed and needs no copy. It is taken before anything is applied,
+        # so what it captures is the passing content.
+        guard = snapshot(sandbox, [path for payload in payloads
+                                   for path in targets_of(payload)]) if gates_held else None
+
         change, verification = _race(sandbox, payloads, gate, ticket, log)
         last_change = change
         if change is None or change.empty:
@@ -308,6 +320,30 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
             instructions = "Address these review findings:\n" + "\n".join(
                 f"- {b}" for b in verdict["blocking"])
             failure = ""
+            gates_held = True
+            continue
+
+        if guard is not None:
+            # The gates passed before this attempt, so failing them now is this
+            # attempt's regression rather than the ticket's state: put the tree
+            # that passed back, so the next attempt starts from the good version
+            # instead of the worse one. Triage is deliberately skipped -- the
+            # diagnosis is already known, and its verdict could be "decompose"
+            # or "rollback", which would throw away the work just recovered.
+            # Restoring satisfies none of the review findings: they stay in
+            # *instructions*, so the ticket still cannot reach COMPLETED until
+            # one change passes the gates and the reviewer both.
+            restore(sandbox, guard)
+            log.warn("ticket.regression_restored", ticket=ticket.id,
+                     gates=", ".join(g.name for g in verification.failures))
+            failure = (
+                "Your last attempt broke gates that had already passed, so the "
+                "files have been restored to the version that passed them; the "
+                "contents shown above are that restored version. Make the "
+                "smallest change that answers the review findings without "
+                "breaking these gates again:\n" + verification.failure_output())
+            if change.unmatched:
+                failure += "\n\nEDITS THAT DID NOT APPLY:\n" + "\n".join(change.unmatched)
             continue
 
         diagnosis = triage(agents, ticket, verification,

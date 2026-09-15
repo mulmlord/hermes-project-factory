@@ -25,7 +25,7 @@ from .planning import architect, decompose, generate_tickets, intake
 from .research import investigate, topics_for
 from .resources import Governor
 from .sandbox import Sandbox
-from .sources import Librarian
+from .sources import STORE as SOURCE_STORE, Librarian
 from .state import State, checkpoint
 from .tickets import Board
 from .verify import record_evaluation, scan_unsafe, verify_project
@@ -153,8 +153,39 @@ class Factory:
         """
         if not self.config.get("research.network", False):
             return None
+        self._record_evidence_policy()
         return Librarian(self.sandbox, self.root, self.config.get("research", {}),
                          self.log)
+
+    def _record_evidence_policy(self) -> None:
+        """Say in the project what becomes of the pages it retrieves.
+
+        Written once, and only for a project that actually reaches the
+        network, so a project that never fetched is not handed a decision it
+        never took.
+        """
+        directory = self.root / "docs" / "decisions"
+        if any(directory.glob("*-retrieved-research-pages*.md")):
+            return
+        workspace.write_decision(
+            self.root, workspace.next_decision_number(self.root),
+            "Retrieved research pages are kept as evidence, not published",
+            "Networked research stores each page it reads under "
+            f"`{SOURCE_STORE}/` so that a citation can be re-read rather than "
+            "taken on trust. Those bytes are third-party material, and up to "
+            "several hundred kilobytes of it per research round.",
+            "Keep the pages in the working tree, and keep them out of the "
+            "repository. The directory is gitignored, so it is never committed "
+            "and never pushed, and the clean-room export drops it even where an "
+            "older project committed it. The extracted text and the citation "
+            "stay in `docs/research/`, which is published.",
+            "Evidence survives for whoever audits a finding on this machine. A "
+            "fresh clone has the citations but not the copies, so a claim is "
+            "re-checked against the source itself rather than against a stale "
+            "snapshot of it.",
+            "Publishing the copies would republish someone else's pages under "
+            "this project's licence. Keeping only the extracted text would make "
+            "a citation unverifiable the moment the page changed.")
 
     def _record_decisions(self, decisions: list) -> None:
         for decision in decisions:

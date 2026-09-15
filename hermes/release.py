@@ -18,6 +18,23 @@ from .verify import Gate, Verification, run_commands, scan_unsafe
 #: Never shipped in a release: factory internals and evolution scratch.
 EXCLUDE = (".hermes", "artifacts", ".git", "__pycache__", ".pytest_cache", ".venv")
 
+#: Also never shipped, but matched against the whole relative path instead of
+#: any one name, because `sources` is far too ordinary a directory name to
+#: exclude wherever it appears. Retrieved research pages are third-party bytes
+#: kept as the evidence behind a citation: evidence is for re-reading, not for
+#: republishing under this project's licence. Generated projects gitignore the
+#: directory too, so this covers the ones created before that was true.
+EXCLUDE_PATHS = ("research/sources",)
+
+
+def shipped(relative: str | Path) -> bool:
+    """Whether a tracked path belongs in the released tree."""
+    path = Path(relative)
+    if any(part in EXCLUDE for part in path.parts):
+        return False
+    posix = path.as_posix()
+    return not any(posix == p or posix.startswith(p + "/") for p in EXCLUDE_PATHS)
+
 
 def export(root: Path, dest: Path) -> list[str]:
     """Copy the releasable tree into *dest*. Returns the top-level entries."""
@@ -26,7 +43,7 @@ def export(root: Path, dest: Path) -> list[str]:
     if tracked:
         for relative in tracked:
             source = root / relative
-            if not source.is_file() or any(part in EXCLUDE for part in Path(relative).parts):
+            if not source.is_file() or not shipped(relative):
                 continue
             target = dest / relative
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -34,6 +51,8 @@ def export(root: Path, dest: Path) -> list[str]:
     else:
         shutil.copytree(root, dest, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns(*EXCLUDE))
+        for relative in EXCLUDE_PATHS:
+            shutil.rmtree(dest / relative, ignore_errors=True)
     return sorted(p.name for p in dest.iterdir())
 
 

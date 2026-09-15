@@ -37,6 +37,11 @@ venv/
 .hermes/logs/
 .hermes/checkpoints/
 artifacts/
+
+# Third-party pages retrieved during research. Kept locally so a citation can
+# be re-read, never committed: they are someone else's bytes and must not be
+# republished under this project's licence.
+research/sources/
 """
 
 AGENTS_MD = """\

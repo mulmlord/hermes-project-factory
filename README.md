@@ -38,7 +38,10 @@ research round that changes nothing is treated as a failed round. Enable
 `research.network` and the round also reads: the researcher names the pages
 worth consulting, the sandbox fetches them, the bytes are kept under
 `research/` as evidence, and a finding may cite only a page that was
-actually retrieved.
+actually retrieved. Those copies stay on your machine: they are gitignored
+and excluded from the release export, so a clone gets the citations and the
+extracted text without republishing someone else's pages under the project's
+licence.
 
 **Planning** decomposes the architecture into tickets small enough for one
 agent to implement, test and verify in a single pass. Dependency cycles are

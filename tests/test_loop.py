@@ -220,6 +220,26 @@ def test_state_survives_interruption(factory):
     assert second.run(max_iterations=40).phase == "COMPLETED"
 
 
+def test_networked_research_records_what_becomes_of_retrieved_pages(factory):
+    """A project that reaches the network says, in itself, what it keeps."""
+    factory.config.data["research"]["network"] = True
+    assert factory._librarian() is not None
+
+    records = list((factory.root / "docs" / "decisions").glob("*retrieved-*.md"))
+    assert len(records) == 1
+    text = records[0].read_text()
+    assert "gitignored" in text and "docs/research/" in text
+
+    factory._librarian()  # a second round must not restate the same decision
+    assert len(list((factory.root / "docs" / "decisions").glob("*retrieved-*.md"))) == 1
+
+
+def test_research_without_a_network_budget_takes_no_such_decision(factory):
+    """A project that never fetched is not handed a decision it never took."""
+    assert factory._librarian() is None
+    assert not list((factory.root / "docs" / "decisions").glob("*retrieved-*.md"))
+
+
 def test_a_wall_clock_deadline_stops_the_loop_without_damaging_it(factory):
     """Iterations bound how many phases run, not how long one takes.
 

@@ -34,7 +34,9 @@ from urllib.parse import urlparse
 from .log import Logger, NULL
 from .workspace import slugify
 
-#: Where fetched bytes are kept, relative to the project root.
+#: Where fetched bytes are kept, relative to the project root. Gitignored by
+#: the generated workspace and dropped by the release export: the copies are
+#: evidence for re-reading on this machine, not material to republish.
 STORE = "research/sources"
 
 #: Runs in the sandbox, never in the Hermes process. Takes the URL, the

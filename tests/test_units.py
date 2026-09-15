@@ -1118,6 +1118,67 @@ def test_eval_compare_refuses_to_read_meaning_into_an_unmoved_pair(tmp_path):
     assert "compares two stubs" in stubs
 
 
+# -- released tree -----------------------------------------------------------
+
+def _with_retrieved_pages(root):
+    """A project holding both retrieved evidence and a directory merely named
+    `sources`, which is far too ordinary a name to exclude wherever it lands."""
+    workspace.create(root, "an idea")
+    (root / "research" / "sources").mkdir(parents=True, exist_ok=True)
+    (root / "research" / "sources" / "guide.html").write_text("<p>someone else's</p>")
+    (root / "research" / "notes.md").write_text("cited <http://example.invalid/g>")
+    (root / "src" / "sources").mkdir(parents=True, exist_ok=True)
+    (root / "src" / "sources" / "feed.py").write_text("FEED = 1\n")
+
+
+def test_release_never_ships_retrieved_research_pages(tmp_path):
+    """Evidence is for re-reading, not for republishing under our own licence."""
+    from hermes import release
+    root = tmp_path / "proj"
+    root.mkdir()
+    _with_retrieved_pages(root)
+    # Committed on purpose: a project created before the pages were gitignored
+    # must still not ship them.
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A", "-f"], cwd=root, check=True)
+
+    out = tmp_path / "export"
+    release.export(root, out)
+    assert not (out / "research" / "sources").exists()
+    assert (out / "research" / "notes.md").is_file()      # the citation ships
+    assert (out / "src" / "sources" / "feed.py").is_file()  # the name is not the rule
+
+
+def test_release_drops_retrieved_pages_from_an_untracked_tree_too(tmp_path):
+    """The copytree fallback runs when there is no git; it must exclude them too."""
+    from hermes import release
+    root = tmp_path / "proj"
+    root.mkdir()
+    _with_retrieved_pages(root)
+
+    out = tmp_path / "export"
+    release.export(root, out)
+    assert not (out / "research" / "sources").exists()
+    assert (out / "src" / "sources" / "feed.py").is_file()
+    assert release.shipped("research/notes.md")
+    assert not release.shipped("research/sources/guide.html")
+
+
+def test_generated_projects_never_commit_retrieved_pages(tmp_path):
+    """Gitignored, so the pages are not pushed to GitHub either."""
+    workspace.create(tmp_path, "an idea")
+    assert "research/sources/" in (tmp_path / ".gitignore").read_text()
+
+    (tmp_path / "research" / "sources").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "research" / "sources" / "guide.html").write_text("<p>theirs</p>")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    listed = subprocess.run(["git", "ls-files"], cwd=tmp_path,
+                            capture_output=True, text=True).stdout
+    assert "research/sources" not in listed
+    assert ".gitignore" in listed
+
+
 # -- workspace ---------------------------------------------------------------
 
 def test_workspace_layout(tmp_path):

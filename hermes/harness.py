@@ -26,6 +26,10 @@ class Task:
     #: Iteration ceiling. An entry allowed to run forever reports nothing when
     #: it stalls, and a stall is the failure mode worth catching.
     iterations: int = 40
+    #: Wall-clock ceiling. Iterations bound how many phases run, not how long
+    #: one takes: a single stuck command is bounded only by the sandbox
+    #: timeout, so without this one bad idea can consume a whole suite run.
+    budget_seconds: float = 1800.0
 
 
 #: Ideas small enough to finish on local models, chosen to differ in what they
@@ -70,11 +74,23 @@ class Trial:
     sandbox_seconds: float = 0.0
     model_calls: int = 0
     chars_out: int = 0
+    #: Iterations the loop got through, which is what separates a task that
+    #: stalled from one that failed fast.
+    iterations: int = 0
+    #: True when the wall-clock budget stopped the run, rather than the
+    #: factory reaching a terminal state of its own accord.
+    timed_out: bool = False
+    #: Wall clock neither ledger explains, and wall clock both claim.
+    #: Prefetch generates while gates run, so the ledgers may legitimately
+    #: exceed the clock. Both numbers are reported instead of assumed to be
+    #: zero, because a split nobody checked is a split nobody should trust.
+    unaccounted_seconds: float = 0.0
+    overlap_seconds: float = 0.0
     error: str = ""
     root: str = ""
 
     def row(self) -> str:
-        mark = "pass" if self.completed else "FAIL"
+        mark = "pass" if self.completed else ("TIME" if self.timed_out else "FAIL")
         return (f"{self.name:<14} {mark:>4} {self.phase:<14} "
                 f"tickets={self.tickets_completed}/{self.tickets} "
                 f"first_pass={self.first_pass:.0%} "
@@ -85,14 +101,19 @@ class Trial:
 
 
 def collect(name: str, state, board, usage: list[dict], sandbox_seconds: float,
-            seconds: float, error: str = "", root: str = "") -> Trial:
+            seconds: float, error: str = "", root: str = "",
+            timed_out: bool = False) -> Trial:
     """Turn a finished run into numbers.
 
     Kept free of the factory so the accounting can be tested without standing
-    up a project or calling a model.
+    up a project or calling a model. Everything is read defensively: the runs
+    worth measuring include the ones that crashed or ran out of clock, and a
+    partial run has written less than a finished one.
     """
     counts = board.counts()
     done = board.by_status("completed")
+    inference = round(sum(c.get("seconds", 0.0) for c in usage), 1)
+    ledgers = inference + sandbox_seconds
     return Trial(
         name=name,
         phase=getattr(state, "phase", "UNKNOWN"),
@@ -102,17 +123,22 @@ def collect(name: str, state, board, usage: list[dict], sandbox_seconds: float,
         tickets_abandoned=counts.get("abandoned", 0),
         first_pass=(sum(1 for t in done if t.attempts <= 1) / len(done)) if done else 0.0,
         seconds=round(seconds, 1),
-        inference_seconds=round(sum(c.get("seconds", 0.0) for c in usage), 1),
+        inference_seconds=inference,
         sandbox_seconds=round(sandbox_seconds, 1),
         model_calls=len(usage),
         chars_out=sum(c.get("chars_out", 0) for c in usage),
+        iterations=int(getattr(state, "iteration", 0) or 0),
+        timed_out=timed_out,
+        unaccounted_seconds=round(max(0.0, seconds - ledgers), 1),
+        overlap_seconds=round(max(0.0, ledgers - seconds), 1),
         error=error,
         root=root,
     )
 
 
 def run_task(task: Task, root: Path, config: Config | None = None,
-             max_iterations: int | None = None, quiet: bool = True) -> Trial:
+             max_iterations: int | None = None, quiet: bool = True,
+             budget: float | None = None) -> Trial:
     """Build one suite entry from scratch and report what it cost."""
     from .factory import create
     from .state import State
@@ -125,7 +151,8 @@ def run_task(task: Task, root: Path, config: Config | None = None,
     error = ""
     try:
         factory = create(root, task.idea, config, quiet=quiet)
-        factory.run(max_iterations=max_iterations or task.iterations)
+        factory.run(max_iterations=max_iterations or task.iterations,
+                    deadline=started + (budget or task.budget_seconds))
     except Exception as exc:  # noqa: BLE001 - a crashed entry is a result, not a stop
         error = f"{type(exc).__name__}: {exc}"[:300]
     if factory is None:
@@ -133,12 +160,15 @@ def run_task(task: Task, root: Path, config: Config | None = None,
                        time.time() - started, error, str(root))
     return collect(task.name, factory.state, factory.board,
                    list(getattr(factory.router, "usage", [])),
-                   factory.sandbox.spent, time.time() - started, error, str(root))
+                   float(getattr(getattr(factory, "sandbox", None), "spent", 0.0)),
+                   time.time() - started, error, str(root),
+                   timed_out=bool(factory.state.metrics.get("deadline_reached")))
 
 
 def run_suite(root: Path, config: Config | None = None,
               names: list[str] | None = None, max_iterations: int | None = None,
-              quiet: bool = True, on_trial=None) -> list[Trial]:
+              quiet: bool = True, on_trial=None,
+              budget: float | None = None) -> list[Trial]:
     """Run the suite serially.
 
     Serially on purpose: two projects sharing one GPU measure each other's
@@ -149,7 +179,8 @@ def run_suite(root: Path, config: Config | None = None,
     chosen = [t for t in SUITE if not names or t.name in names]
     trials = []
     for task in chosen:
-        trial = run_task(task, root / task.name, config, max_iterations, quiet)
+        trial = run_task(task, root / task.name, config, max_iterations, quiet,
+                         budget)
         trials.append(trial)
         if on_trial is not None:
             on_trial(trial)
@@ -170,7 +201,8 @@ def summarise(trials: list[Trial]) -> str:
     sandbox = sum(t.sandbox_seconds for t in trials)
     weight = sum(t.tickets_completed for t in trials)
     first = sum(t.first_pass * t.tickets_completed for t in trials)
-    return "\n".join([t.row() for t in trials] + [
+    timed = sum(1 for t in trials if t.timed_out)
+    lines = [t.row() for t in trials] + [
         "",
         f"completed      {sum(1 for t in trials if t.completed)}/{len(trials)}",
         f"first-pass     {(first / weight if weight else 0):.0%} of "
@@ -178,7 +210,42 @@ def summarise(trials: list[Trial]) -> str:
         f"wall clock     {seconds / 60:.1f}m",
         f"inference      {inference / 60:.1f}m ({inference / seconds:.0%})",
         f"sandbox        {sandbox / 60:.1f}m ({sandbox / seconds:.0%})",
-    ])
+        f"unaccounted    {sum(t.unaccounted_seconds for t in trials) / 60:.1f}m "
+        f"of clock neither ledger explains",
+        f"overlap        {sum(t.overlap_seconds for t in trials) / 60:.1f}m "
+        f"claimed by both ledgers, which prefetch makes possible",
+        resolution(trials),
+    ]
+    if timed:
+        lines.append(f"timed out      {timed} task(s) stopped on their budget, "
+                     "so their numbers are a floor rather than a result")
+    if not any(t.model_calls for t in trials):
+        lines.append("warning        no model calls recorded: these numbers "
+                     "describe a stub, not a model")
+    return "\n".join(lines)
+
+
+def resolution(trials: list[Trial]) -> str:
+    """Whether this suite can rank a change at all.
+
+    A suite where every task passes, or every task fails, produces real
+    numbers that cannot separate a better factory from a worse one. Saying so
+    is the difference between a measurement and a decoration, and it is the
+    check that catches a suite whose tasks are too easy or too hard for the
+    model in front of it.
+    """
+    if len(trials) < 2:
+        return "resolution     too few tasks to rank anything"
+    completed = sum(1 for t in trials if t.completed)
+    rates = {round(t.first_pass, 2) for t in trials if t.tickets_completed}
+    if completed == 0:
+        return ("resolution     NONE: no task completed. Nothing here can rank "
+                "a change; fix the factory or the model first")
+    if completed == len(trials) and len(rates) <= 1:
+        return ("resolution     NONE: every task completed at one first-pass "
+                "rate, so this suite cannot tell two factories apart")
+    return (f"resolution     {completed}/{len(trials)} completed, "
+            f"{len(rates)} distinct first-pass rate(s)")
 
 
 def write_report(directory: Path, trials: list[Trial]) -> Path:
@@ -216,4 +283,23 @@ def compare(before: Path, after: Path) -> str:
         passed = "{:.0%} -> {:.0%}".format(a["first_pass"], b["first_pass"])
         clock = "{:.1f}m -> {:.1f}m".format(a["seconds"] / 60, b["seconds"] / 60)
         lines.append(f"{name:<14} {done:>18} {passed:>16} {clock:>18}")
-    return "\n".join(lines)
+    return "\n".join(lines + ["", _verdict(old, new)])
+
+
+def _verdict(old: dict, new: dict) -> str:
+    """What this pair of runs does and does not support concluding."""
+    shared = set(old) & set(new)
+    if not shared:
+        return "nothing to compare: the two runs share no task"
+    if not any(t.get("model_calls") for t in list(old.values()) + list(new.values())):
+        return ("neither run made a model call: this compares two stubs and "
+                "cannot justify a change")
+    moved = sorted(
+        name for name in shared
+        if old[name]["completed"] != new[name]["completed"]
+        or abs(old[name].get("first_pass", 0) - new[name].get("first_pass", 0)) > 0.01
+    )
+    if not moved:
+        return ("no task changed completion or first-pass rate: this pair does "
+                "not support accepting or rejecting the change")
+    return f"{len(moved)} of {len(shared)} task(s) moved: {', '.join(moved)}"

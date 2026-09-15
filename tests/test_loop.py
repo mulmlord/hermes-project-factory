@@ -220,6 +220,27 @@ def test_state_survives_interruption(factory):
     assert second.run(max_iterations=40).phase == "COMPLETED"
 
 
+def test_a_wall_clock_deadline_stops_the_loop_without_damaging_it(factory):
+    """Iterations bound how many phases run, not how long one takes.
+
+    A single stuck command is otherwise bounded only by the sandbox timeout,
+    which is what lets one bad idea eat a whole suite run. Stopping must leave
+    the project resumable: a deadline is a pause, not a failure.
+    """
+    import time
+
+    state = factory.run(max_iterations=40, deadline=time.time() - 1)
+    assert state.phase != "COMPLETED"
+    assert state.metrics["deadline_reached"] is True
+    assert any("deadline" in note for note in state.notes)
+
+    from hermes.state import State
+    assert State.load(factory.root).phase == state.phase   # the stop is persisted
+
+    factory.state.metrics.pop("deadline_reached")
+    assert factory.run(max_iterations=40).phase == "COMPLETED"
+
+
 def test_prefetch_refuses_a_ticket_that_writes_the_same_file(factory):
     """Generating ahead is only safe while the two tickets cannot collide."""
     board = factory.board

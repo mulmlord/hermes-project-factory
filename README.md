@@ -272,6 +272,20 @@ $ hermes eval --compare evaluations/before/results.json \
                         evaluations/after/results.json
 ```
 
+Each task also gets a wall-clock ceiling (`--budget MINUTES`, 30 by default),
+because iterations bound how many phases run rather than how long one takes,
+and without it a single stuck command lets one idea consume the whole run. A
+task stopped that way is marked `TIME` and its numbers are reported as a floor
+rather than a result.
+
+The report says what it does not know. Wall clock that neither ledger explains
+is printed as `unaccounted`, time both ledgers claim is printed as `overlap`
+(prefetch generates while gates run, so the two may legitimately exceed the
+clock), and a suite where every task passed identically, or none passed at
+all, is labelled as having no resolution — real numbers that still cannot rank
+one factory against another. `--compare` says the same thing about a pair of
+runs where nothing moved.
+
 This exists because everything else in this section is a trade. Constrained
 decoding, search/replace edits, prefetching the next ticket, racing several
 samples through the gates and the noise-aware evolution selector all cost
@@ -294,6 +308,12 @@ promoted.
   `LLM_*` variables are what OpenHands 1.21 accepts, and a run reaches only the
   endpoint Hermes names. What a full multi-file ticket costs there, against a
   real local model, is still unmeasured.
+- `hermes eval` has only ever been run against the stub model in the test
+  suite. Its bookkeeping, budgets and the honesty checks above are tested, but
+  no suite run against a real local model has been recorded, so the eight
+  tasks are uncalibrated: whether they can actually separate a better factory
+  from a worse one on your model is exactly what the `resolution` line will
+  tell you the first time you run it.
 - Research works from what the model knows until you set
   `research.network: true`, which buys it real sources within a page, byte
   and time budget. The retrieval path is exercised against a real server on

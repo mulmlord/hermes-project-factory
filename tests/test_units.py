@@ -1041,6 +1041,83 @@ def test_eval_writes_both_report_formats(tmp_path):
     assert "completed      1/1" in harness.summarise([trial])
 
 
+def test_eval_reports_the_clock_neither_ledger_explains(tmp_path):
+    """The GPU/CPU split is only trustworthy if the remainder is shown."""
+    trial = harness.collect("demo", SimpleNamespace(phase="COMPLETED", iteration=7),
+                            Board(tmp_path), [{"seconds": 12.0}], 30.0, 100.0)
+    assert trial.unaccounted_seconds == 58.0
+    assert trial.overlap_seconds == 0.0
+    assert trial.iterations == 7
+    assert "unaccounted    1.0m" in harness.summarise([trial])
+
+
+def test_eval_reports_ledgers_that_overlap_rather_than_hiding_them(tmp_path):
+    """Prefetch generates while gates run, so the ledgers may exceed the clock."""
+    trial = harness.collect("demo", SimpleNamespace(phase="COMPLETED"),
+                            Board(tmp_path), [{"seconds": 80.0}], 60.0, 100.0)
+    assert trial.overlap_seconds == 40.0
+    assert trial.unaccounted_seconds == 0.0
+
+
+def test_eval_collects_a_run_that_never_got_going(tmp_path):
+    """A crashed or timed-out entry is a result: reading it must not raise."""
+    trial = harness.collect("demo", SimpleNamespace(), Board(tmp_path), [], 0.0,
+                            5.0, error="boom", timed_out=True)
+    assert trial.phase == "UNKNOWN" and not trial.completed
+    assert trial.iterations == 0 and trial.timed_out
+    assert "TIME" in trial.row()
+    assert "timed out      1 task(s)" in harness.summarise([trial])
+
+
+def test_eval_says_when_a_suite_cannot_rank_anything():
+    """A suite where everything passes identically cannot compare two factories."""
+    same = [harness.Trial(name=n, completed=True, tickets_completed=2, first_pass=1.0)
+            for n in ("a", "b")]
+    assert "resolution     NONE" in harness.summarise(same)
+    assert "cannot tell two factories apart" in harness.summarise(same)
+
+    none_done = [harness.Trial(name=n) for n in ("a", "b")]
+    assert "no task completed" in harness.summarise(none_done)
+
+    mixed = [harness.Trial(name="a", completed=True, tickets_completed=2,
+                           first_pass=1.0),
+             harness.Trial(name="b", completed=True, tickets_completed=2,
+                           first_pass=0.5)]
+    assert "resolution     2/2 completed, 2 distinct" in harness.summarise(mixed)
+
+
+def test_eval_warns_that_a_stub_run_measures_nothing():
+    """Numbers produced without a model describe the stub, not the factory."""
+    trials = [harness.Trial(name="a", completed=True, tickets_completed=1,
+                            first_pass=1.0),
+              harness.Trial(name="b", model_calls=0)]
+    assert "no model calls recorded" in harness.summarise(trials)
+
+    with_model = [harness.Trial(name="a", completed=True, model_calls=3)]
+    assert "no model calls recorded" not in harness.summarise(with_model)
+
+
+def test_eval_compare_refuses_to_read_meaning_into_an_unmoved_pair(tmp_path):
+    """Two runs that agree everywhere cannot justify accepting a change."""
+    def report(name, **over):
+        directory = tmp_path / name
+        trial = harness.Trial(name="json-diff", completed=True, seconds=60.0,
+                              tickets_completed=2, first_pass=1.0, model_calls=9)
+        for key, value in over.items():
+            setattr(trial, key, value)
+        harness.write_report(directory, [trial])
+        return directory / "results.json"
+
+    unmoved = harness.compare(report("before"), report("after"))
+    assert "does not support accepting or rejecting" in unmoved
+
+    moved = harness.compare(report("b2"), report("a2", first_pass=0.5))
+    assert "1 of 1 task(s) moved: json-diff" in moved
+
+    stubs = harness.compare(report("b3", model_calls=0), report("a3", model_calls=0))
+    assert "compares two stubs" in stubs
+
+
 # -- workspace ---------------------------------------------------------------
 
 def test_workspace_layout(tmp_path):

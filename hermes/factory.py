@@ -556,8 +556,16 @@ class Factory:
         "RELEASE": phase_release,
     }
 
-    def run(self, max_iterations: int | None = None) -> State:
-        """Drive the project to a terminal state without user interaction."""
+    def run(self, max_iterations: int | None = None,
+            deadline: float | None = None) -> State:
+        """Drive the project to a terminal state without user interaction.
+
+        *deadline* is an absolute wall-clock time after which the loop stops
+        between iterations. Iterations bound how many phases run, not how long
+        one takes, so without it a single stuck command is bounded only by the
+        sandbox timeout. A phase already running still finishes: the real
+        ceiling is the deadline plus one phase.
+        """
         limit = max_iterations or int(self.config.get("execution.max_loop_iterations", 400))
         self.log.info("factory.start", project=self.state.name, phase=self.state.phase,
                       resources=self.resources)
@@ -567,6 +575,12 @@ class Factory:
         started = time.time()
         with self.sandbox:
             while not self.state.done and self.state.iteration < limit:
+                if deadline is not None and time.time() >= deadline:
+                    self.log.warn("factory.deadline", phase=self.state.phase,
+                                  iteration=self.state.iteration)
+                    self.state.metrics["deadline_reached"] = True
+                    self.state.notes.append("stopped: wall-clock deadline reached")
+                    break
                 if self.state.paused:
                     self.log.info("factory.paused")
                     break

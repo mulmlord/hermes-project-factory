@@ -249,7 +249,8 @@ def cmd_eval(args) -> int:
         Path.cwd() / "evaluations" / time.strftime("%Y%m%d-%H%M%S"))
     trials = run_suite(root, _config(args), names=args.task,
                        max_iterations=args.max_iterations, quiet=args.quiet,
-                       on_trial=lambda trial: print(trial.row(), flush=True))
+                       on_trial=lambda trial: print(trial.row(), flush=True),
+                       budget=args.budget * 60 if args.budget else None)
     print("\n" + summarise(trials))
     print(f"\nreport: {write_report(root, trials)}")
     return 0 if trials and all(t.completed for t in trials) else 2
@@ -389,6 +390,8 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("-t", "--task", action="append", help="only this task (repeatable)")
     ev.add_argument("--into", help="directory to build the evaluation in")
     ev.add_argument("-n", "--max-iterations", type=int)
+    ev.add_argument("--budget", type=float, metavar="MINUTES",
+                    help="wall-clock ceiling per task (default 30)")
     ev.add_argument("--list", action="store_true", help="show the suite and exit")
     ev.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"),
                     help="compare two results.json files")

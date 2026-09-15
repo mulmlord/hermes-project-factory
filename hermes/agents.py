@@ -12,11 +12,19 @@ from typing import Any
 from .log import Logger, NULL
 from .models import Router
 
-FILE_PROTOCOL = """\
+_PROTOCOL_HEAD = """\
 Return JSON of exactly this shape:
 {
   "summary": "one sentence describing the change",
   "files": [{"path": "src/thing.py", "content": "<COMPLETE file contents>"}],
+"""
+
+_PROTOCOL_EDITS = """\
+  "edits": [{"path": "src/thing.py", "find": "<exact text to replace>",
+             "replace": "<the text that takes its place>"}],
+"""
+
+_PROTOCOL_TAIL = """\
   "delete": ["path/to/remove"],
   "commands": ["shell command to run after writing, e.g. a test command"],
   "dependencies": ["package names you added, with justification in summary"]
@@ -25,8 +33,28 @@ Rules:
 - "content" is the ENTIRE file after your change, never a diff or a fragment.
 - Never write outside the project directory and never use absolute paths.
 - Prefer the standard library. Justify every new dependency in the summary.
-- Omit "delete", "commands" or "dependencies" when empty.
+- Omit any key you are not using.
 """
+
+_EDIT_RULES = """\
+- Use "edits" to change part of a file that already exists. "find" must be text
+  copied character for character from the file as shown to you, and long enough
+  to appear exactly once in it; "replace" is what it becomes. An edit that does
+  not match is discarded and you will be told so.
+- Use "files" for a file you are creating, or when you are genuinely rewriting a
+  whole small file. Re-emitting a large file to change a few lines is slow and
+  tends to lose code you did not mean to touch.
+"""
+
+
+def file_protocol(edits: bool = True) -> str:
+    """The change format agents must answer in."""
+    return (_PROTOCOL_HEAD + (_PROTOCOL_EDITS if edits else "") + _PROTOCOL_TAIL
+            + (_EDIT_RULES if edits else ""))
+
+
+#: The whole-file format, kept as a name for callers that only ever write files.
+FILE_PROTOCOL = file_protocol(edits=False)
 
 
 @dataclass
@@ -120,6 +148,12 @@ PROMPTS = {
         "distinguish a trivial slip from a wrong implementation from a wrong "
         "architecture from a genuine knowledge gap."
     ),
+    "summariser": (
+        f"{BASE} You are the Summariser. You compress technical material without "
+        "losing a decision, a number, a name, a constraint or a rejected "
+        "alternative. You keep what changes what gets built and drop the rest. "
+        "You never add anything the source did not say."
+    ),
 }
 
 ROUTING = {
@@ -133,6 +167,7 @@ ROUTING = {
     "documenter": "coding",
     "planner": "architecture",
     "triager": "review",
+    "summariser": "simple",
 }
 
 
@@ -146,7 +181,16 @@ def build(router: Router, log: Logger = NULL) -> dict[str, Agent]:
 
 # -- shared prompt fragments -------------------------------------------------
 
-def context_block(state, tree: str, extra: str = "") -> str:
+def context_block(state, tree: str = "", extra: str = "") -> str:
+    """Project orientation for any agent.
+
+    Ordered stable-first. The identity, architecture and commands change at
+    most once per project, while the file listing changes after every ticket,
+    so putting the settled part first lets a local inference server reuse the
+    cached KV prefix across the many calls that share it. Callers holding
+    something more volatile still (a failing test log, a repair instruction)
+    should append it after this block rather than pass it in.
+    """
     spec = state.spec or {}
     plan = state.plan or {}
     return (
@@ -156,8 +200,8 @@ def context_block(state, tree: str, extra: str = "") -> str:
         f"ARCHITECTURE: {plan.get('architecture', 'not yet defined')}\n"
         f"BUILD: {(plan.get('commands') or {}).get('build', 'n/a')}\n"
         f"TEST: {(plan.get('commands') or {}).get('test', 'n/a')}\n"
-        f"\nFILES:\n{tree}\n"
         + (f"\n{extra}\n" if extra else "")
+        + (f"\nFILES:\n{tree}\n" if tree else "")
     )
 
 

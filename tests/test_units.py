@@ -3,15 +3,21 @@ import json
 
 import pytest
 
+from types import SimpleNamespace
+
 from hermes.config import Config, ConfigError, deep_merge, is_local_url
-from hermes.evolve import Objective, parse_score
-from hermes.implement import _protected, apply_change
-from hermes.models import extract_json, strip_reasoning
+from hermes.evolve import Bandit, Candidate, Evolution, Objective, parse_score
+from hermes.implement import (Change, _protected, _race, apply_change, relevant_files,
+                              restore as restore_files, snapshot as snapshot_files)
+from hermes.journal import Entry, Journal
+from hermes.log import NULL
+from hermes.models import ModelError, Router, extract_json, strip_reasoning
+from hermes import harness
 from hermes.sandbox import Sandbox, SandboxError
 from hermes.state import State, StateError, checkpoint, restore
 from hermes.tickets import Board, split_validation
 from hermes.verify import scan_unsafe, verify_project
-from hermes import workspace
+from hermes import cli, workspace
 
 
 # -- config ------------------------------------------------------------------
@@ -62,6 +68,42 @@ def test_extract_json_raises_when_absent():
 
 def test_strip_reasoning():
     assert strip_reasoning("<think>a</think>b") == "b"
+
+
+def test_json_mode_downgrades_instead_of_failing(monkeypatch):
+    """A server that rejects the JSON parameter must not fail the whole task."""
+    router = Router(Config.load())
+    backend = router.backend("coding")
+    asked = []
+
+    def fake(system, prompt, *, json_mode=False, **kw):
+        asked.append(json_mode)
+        if json_mode:
+            raise ModelError("http://localhost:11434/api/chat: HTTP 400 bad format")
+        return '{"ok": true}'
+
+    monkeypatch.setattr(backend, "complete", fake)
+    assert router.complete_json("coding", "sys", "prompt") == {"ok": True}
+    assert asked == [True, False]
+    assert backend.json_mode is False  # and it does not ask again
+
+
+def test_a_server_fault_is_not_mistaken_for_a_missing_feature(monkeypatch):
+    router = Router(Config.load())
+    backend = router.backend("coding")
+    monkeypatch.setattr(backend, "complete", lambda *a, **k: (_ for _ in ()).throw(
+        ModelError("http://localhost:11434: HTTP 500 out of memory")))
+    with pytest.raises(ModelError, match="500"):
+        router.complete_json("coding", "sys", "prompt")
+    assert backend.json_mode is True
+
+
+def test_only_routed_models_are_preflighted():
+    """A model no agent ever asks for must not be able to fail a run."""
+    from hermes.agents import ROUTING
+    tasks = Router(Config.load()).routed_tasks()
+    assert set(tasks) == set(ROUTING.values())
+    assert "simple" in tasks  # the summariser gives the small model real work
 
 
 # -- state -------------------------------------------------------------------
@@ -122,6 +164,29 @@ def test_repeated_failures_deprioritise(tmp_path):
     assert board.score(ticket) < before
 
 
+def test_longest_chain_beats_a_wide_fan_out(tmp_path):
+    """A project finishes when its longest chain finishes, not its widest."""
+    board = Board(tmp_path)
+    chain = board.add(title="chain head", priority=2, cost=1)
+    previous = chain
+    for step in range(3):
+        previous = board.add(title=f"step {step}", dependencies=[previous.id], cost=3)
+    hub = board.add(title="hub", priority=2, cost=1)
+    for _ in range(4):
+        board.add(title="leaf", dependencies=[hub.id], cost=1)
+    assert board.critical_path(chain) > board.critical_path(hub)
+    assert board.score(chain) > board.score(hub)
+
+
+def test_finished_work_cannot_extend_the_critical_path(tmp_path):
+    board = Board(tmp_path)
+    hub = board.add(title="hub", cost=1)
+    dependent = board.add(title="dependent", dependencies=[hub.id], cost=5)
+    before = board.critical_path(hub)
+    board.move(dependent.id, "completed")
+    assert board.critical_path(hub) < before
+
+
 def test_board_renders_markdown(tmp_path):
     board = Board(tmp_path)
     ticket = board.add(title="write parser", acceptance=["parses input"])
@@ -176,6 +241,147 @@ def test_apply_change_rejects_and_writes(tmp_path):
     assert not (tmp_path.parent / "evil.py").exists()
 
 
+def test_edit_protocol_offers_edits_only_when_enabled():
+    from hermes.agents import file_protocol
+    assert '"edits"' in file_protocol(True)
+    assert '"edits"' not in file_protocol(False)
+
+
+def test_an_edit_replaces_a_unique_match(tmp_path):
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/a.py", "def add(a, b):\n    return a - b\n")
+    change = apply_change(sandbox, {"summary": "fix the sign", "edits": [
+        {"path": "src/a.py", "find": "return a - b", "replace": "return a + b"}]})
+    assert change.written == ["src/a.py"] and not change.unmatched
+    assert sandbox.read("src/a.py") == "def add(a, b):\n    return a + b\n"
+
+
+def test_an_ambiguous_edit_is_refused_with_a_reason(tmp_path):
+    """Guessing which identical anchor was meant is how working code is lost."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/a.py", "x = 1\nx = 1\n")
+    change = apply_change(sandbox, {"edits": [
+        {"path": "src/a.py", "find": "x = 1", "replace": "x = 2"}]})
+    assert sandbox.read("src/a.py") == "x = 1\nx = 1\n"
+    assert change.empty and "appears 2 times" in change.unmatched[0]
+
+
+def test_an_edit_to_a_missing_file_asks_for_the_whole_file(tmp_path):
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    change = apply_change(sandbox, {"edits": [
+        {"path": "src/new.py", "find": "a", "replace": "b"}]})
+    assert change.empty and "does not exist" in change.unmatched[0]
+
+
+def test_an_edit_cannot_reach_a_protected_file(tmp_path):
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write(".hermes/state/state.json", '{"phase": "INTAKE"}')
+    change = apply_change(sandbox, {"edits": [
+        {"path": ".hermes/state/state.json", "find": "INTAKE", "replace": "COMPLETED"}]})
+    assert change.rejected == [".hermes/state/state.json"]
+    assert "INTAKE" in sandbox.read(".hermes/state/state.json")
+
+
+def test_a_losing_candidate_is_rolled_back(tmp_path):
+    """The next sample must start from the workspace the first one saw."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/a.py", "original\n")
+    payloads = [{"files": [{"path": "src/a.py", "content": "first\n"}]},
+                {"files": [{"path": "src/b.py", "content": "second\n"}]}]
+    seen = []
+
+    def gate(change):
+        seen.append(sandbox.read("src/a.py"))
+        return SimpleNamespace(passed=len(seen) == 2, gates=[], report=lambda: "")
+
+    change, verification = _race(sandbox, payloads, gate,
+                                 SimpleNamespace(id="T001"), NULL)
+    assert seen == ["first\n", "original\n"]  # the loser's write was undone
+    assert verification.passed and change.written == ["src/b.py"]
+
+
+def test_snapshot_restores_a_file_that_did_not_exist(tmp_path):
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    saved = snapshot_files(sandbox, ["src/new.py"])
+    sandbox.write("src/new.py", "written\n")
+    restore_files(sandbox, saved)
+    assert not (tmp_path / "src" / "new.py").exists()
+
+
+# -- work journal ------------------------------------------------------------
+
+def _done(journal, ticket, summary, files):
+    return journal.record(ticket, {
+        "status": "completed",
+        "change": Change(summary=summary, written=files)})
+
+
+def test_journal_prefers_dependencies_over_recency(tmp_path):
+    """Recent noise must not crowd out the ticket this one is built on."""
+    board, journal = Board(tmp_path), Journal(tmp_path)
+    base = board.add(title="config loader", artifacts=["src/config.py"])
+    ticket = board.add(title="wire config in", dependencies=[base.id])
+    _done(journal, base, "reads hermes.yaml", ["src/config.py"])
+    for index in range(30):
+        _done(journal, board.add(title=f"unrelated {index}"), "x", [f"src/n{index}.py"])
+
+    block = journal.block(ticket, board, budget=400)
+    assert base.id in block and "src/config.py" in block
+    assert len(block) < 1200  # budget honoured, not the whole history
+    assert journal.suggested_files(ticket, board)[0] == "src/config.py"
+
+
+def test_journal_carries_dead_ends_to_the_next_agent(tmp_path):
+    board, journal = Board(tmp_path), Journal(tmp_path)
+    failed = board.add(title="thread pool scheduler")
+    journal.record(failed, {"diagnosis": {"diagnosis": "deadlocked under load"}},
+                   status="abandoned")
+    block = journal.block(board.add(title="scheduler, second attempt"), board)
+    assert "abandoned" in block and "deadlocked under load" in block
+
+
+def test_journal_owner_index_names_the_newest_writer(tmp_path):
+    board, journal = Board(tmp_path), Journal(tmp_path)
+    _done(journal, board.add(title="first"), "created it", ["src/a.py"])
+    second = board.add(title="second")
+    _done(journal, second, "rewrote it", ["src/a.py"])
+    assert journal.owners()["src/a.py"].ticket == second.id
+
+
+def test_journal_keeps_only_the_latest_attempt_per_ticket(tmp_path):
+    board, journal = Board(tmp_path), Journal(tmp_path)
+    ticket = board.add(title="parser")
+    journal.record(ticket, {"diagnosis": {"diagnosis": "wrong grammar"}}, status="failed")
+    _done(journal, ticket, "fixed the grammar", ["src/parser.py"])
+    latest = journal.latest()
+    assert len(latest) == 1 and latest[0].outcome == "completed"
+
+
+def test_journal_survives_a_torn_line(tmp_path):
+    """A crash mid-append must not make the journal unreadable."""
+    journal = Journal(tmp_path)
+    journal.append(Entry(ticket="T001", title="ok", files=["src/a.py"]))
+    with journal.path.open("a") as fh:
+        fh.write('{"ticket": "T002", "tit')
+    assert [e.ticket for e in Journal(tmp_path).entries] == ["T001"]
+
+
+def test_journal_mirrors_to_a_readable_worklog(tmp_path):
+    journal = Journal(tmp_path)
+    journal.append(Entry(ticket="T001", title="config loader", summary="reads yaml"))
+    text = (tmp_path / "docs" / "generated" / "worklog.md").read_text()
+    assert "T001" in text and "reads yaml" in text
+
+
+def test_relevant_files_reads_journal_hints(tmp_path):
+    """Hints point at files that exist; ticket artifacts are only a guess."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/config.py", "VALUE = 1\n")
+    ticket = Board(tmp_path).add(title="use the config", artifacts=["src/never_built.py"])
+    text = relevant_files(sandbox, ticket, {}, ["src/config.py"])
+    assert "VALUE = 1" in text
+
+
 # -- verification ------------------------------------------------------------
 
 def test_security_scan_flags_real_problems(tmp_path):
@@ -199,6 +405,118 @@ def test_objective_direction():
     assert minimise.better(1.0, 2.0) and not minimise.better(3.0, 2.0)
     assert maximise.better(3.0, 2.0) and not maximise.better(1.0, 2.0)
     assert not minimise.better(None, 2.0)
+
+
+def _engine(tmp_path, cfg=None, direction="minimize"):
+    state = SimpleNamespace(plan={}, spec={}, name="p", idea="i")
+    return Evolution(Sandbox(tmp_path, {"runtime": "local", "timeout": 5}), {}, state,
+                     Objective("time", direction, "true"), ["src/a.py"], cfg or {})
+
+
+def test_measurement_noise_is_not_an_improvement(tmp_path):
+    """One run is a measurement; promoting its wobble stalls the whole search."""
+    engine = _engine(tmp_path, {"min_relative_gain": 0.0})
+    engine.noise = 0.5
+    assert not engine.significant(9.7, 10.0)
+    assert engine.significant(9.4, 10.0)
+
+
+def test_a_gain_too_small_to_be_worth_the_risk_is_rejected(tmp_path):
+    engine = _engine(tmp_path, {"min_relative_gain": 0.05})
+    assert not engine.significant(9.9, 10.0)
+    assert engine.significant(9.4, 10.0)
+
+
+def test_archive_ranks_by_direction_and_is_capped(tmp_path):
+    engine = _engine(tmp_path, {"archive": 2}, direction="maximize")
+    for index, score in enumerate([1.0, 5.0, 3.0], start=1):
+        engine.history.append(Candidate(index, 0, "m", score, True, []))
+    assert [c.score for c in engine.archive()][:2] == [5.0, 3.0]
+
+
+def test_screening_bounds_a_run_by_the_incumbent(tmp_path):
+    engine = _engine(tmp_path, {"benchmark_timeout": 900, "screen_factor": 2.0})
+    assert engine.screen_timeout() == 900  # nothing measured yet
+    engine.best_seconds = 100.0
+    assert engine.screen_timeout() == 205
+    engine.best_seconds = 10000.0
+    assert engine.screen_timeout() == 900  # never beyond the hard budget
+
+
+def test_evolution_promotes_only_a_gain_that_clears_the_margin(tmp_path):
+    """The whole loop: propose, measure, reject noise, confirm, promote."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 30})
+    sandbox.write("src/kernel.py", "COST = 10\n")
+    state = SimpleNamespace(plan={"commands": {"build": "true", "test": "true"}},
+                            spec={}, name="p", idea="i")
+    objective = Objective("cost", "minimize",
+                          "python3 -c \"exec(open('src/kernel.py').read()); "
+                          "print('SCORE:', COST)\"")
+    proposals = [
+        {"mutation": "shave a little",
+         "files": [{"path": "src/kernel.py", "content": "COST = 9.95\n"}]},
+        {"mutation": "halve the cost",
+         "files": [{"path": "src/kernel.py", "content": "COST = 5\n"}]},
+    ]
+
+    class StubEvolver:
+        def ask_json(self, prompt, **kw):
+            return proposals.pop(0)
+
+    engine = Evolution(sandbox, {"evolver": StubEvolver()}, state, objective,
+                       ["src/kernel.py"],
+                       {"population": 1, "baseline_repeats": 2,
+                        "min_relative_gain": 0.01}, NULL)
+    best = engine.run(max_generations=2, patience=5)
+
+    assert [c.mutation for c in engine.history] == [
+        "baseline", "shave a little", "halve the cost"]
+    # 0.05 is under the 1% margin, so it is not an improvement, it is weather.
+    assert engine.history[1].notes.startswith("no significant gain")
+    assert best.score == 5 and sandbox.read("src/kernel.py") == "COST = 5\n"
+    # The gain was measured more than once before it was believed.
+    assert len(best.samples) == 2
+
+
+def test_bandit_tries_every_family_once_before_repeating():
+    bandit = Bandit(("a", "b", "c"))
+    for _ in range(3):
+        bandit.update(bandit.select(), 0.0)
+    assert set(bandit.counts.values()) == {1}
+
+
+def test_bandit_concentrates_on_the_family_that_paid_off():
+    bandit = Bandit(("a", "b"))
+    for _ in range(3):
+        bandit.update("a", 0.0)
+        bandit.update("b", 1.0)
+    assert bandit.select() == "b"
+
+
+# -- evaluation harness ------------------------------------------------------
+
+def test_eval_counts_first_attempt_completions(tmp_path):
+    board = Board(tmp_path)
+    for attempts in (1, 1, 3):
+        board.add(title="t", status="completed").attempts = attempts
+    board.add(title="dead end", status="abandoned")
+    trial = harness.collect("demo", SimpleNamespace(phase="COMPLETED"), board,
+                            [{"seconds": 12.0, "chars_out": 100}], 30.0, 100.0)
+    assert trial.completed and trial.tickets_completed == 3
+    assert trial.tickets_abandoned == 1
+    assert trial.first_pass == pytest.approx(2 / 3)
+    assert trial.inference_seconds == 12.0 and trial.sandbox_seconds == 30.0
+    assert trial.model_calls == 1
+
+
+def test_eval_writes_both_report_formats(tmp_path):
+    trial = harness.Trial(name="demo", completed=True, seconds=60.0,
+                          tickets=2, tickets_completed=2, first_pass=1.0)
+    report = harness.write_report(tmp_path, [trial])
+    assert report.is_file() and "demo" in report.read_text()
+    saved = json.loads((tmp_path / "results.json").read_text())
+    assert saved["trials"][0]["name"] == "demo"
+    assert "completed      1/1" in harness.summarise([trial])
 
 
 # -- workspace ---------------------------------------------------------------
@@ -340,3 +658,60 @@ def test_prose_validation_becomes_an_acceptance_criterion():
                         "cargo test --all-features",
                         "bash scripts/check.sh one two three four"]
     assert len(prose) == 2
+
+
+# -- hpf entry point ---------------------------------------------------------
+
+@pytest.fixture
+def captured_main(monkeypatch):
+    """Record the argv hpf hands to the main CLI instead of running a factory."""
+    seen: dict = {}
+
+    def fake_main(argv):
+        seen["argv"] = argv
+        return 0
+
+    monkeypatch.setattr(cli, "main", fake_main)
+    return seen
+
+
+def test_hpf_starts_a_project_in_the_current_directory(tmp_path, monkeypatch,
+                                                       captured_main):
+    monkeypatch.chdir(tmp_path)
+    assert cli.hpf(["Build", "a", "trading", "engine"]) == 0
+    assert captured_main["argv"] == ["new", "Build a trading engine",
+                                     "--into", str(tmp_path)]
+
+
+def test_hpf_without_an_idea_resumes_the_project_here(tmp_path, monkeypatch,
+                                                      captured_main):
+    workspace.create(tmp_path, "an idea")
+    monkeypatch.chdir(tmp_path)
+    assert cli.hpf([]) == 0
+    assert captured_main["argv"] == ["--project", str(tmp_path), "run"]
+
+
+def test_hpf_without_an_idea_or_a_project_explains_itself(tmp_path, monkeypatch,
+                                                          captured_main):
+    monkeypatch.chdir(tmp_path)
+    assert cli.hpf([]) == 2
+    assert "argv" not in captured_main
+
+
+def test_hpf_refuses_to_overwrite_an_existing_project(tmp_path, monkeypatch,
+                                                      captured_main):
+    workspace.create(tmp_path, "first idea")
+    monkeypatch.chdir(tmp_path)
+    assert cli.hpf(["a", "second", "idea"]) == 1
+    assert "argv" not in captured_main
+    assert cli.hpf(["a", "second", "idea", "--force"]) == 0
+    assert "--force" in captured_main["argv"]
+
+
+def test_hpf_places_global_and_subcommand_flags_correctly(tmp_path, monkeypatch,
+                                                          captured_main):
+    """-q is a global flag, -n belongs to the subcommand; argparse is strict."""
+    monkeypatch.chdir(tmp_path)
+    cli.hpf(["an idea", "-q", "-n", "5"])
+    assert captured_main["argv"] == ["-q", "new", "an idea", "--into",
+                                     str(tmp_path), "-n", "5"]

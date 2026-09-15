@@ -51,9 +51,11 @@ class Backend:
 
     def __init__(self, cfg: ModelConfig):
         self.cfg = cfg
+        #: Constrained decoding, until a server tells us it does not speak it.
+        self.json_mode = cfg.structured_output
 
     def complete(self, system: str, prompt: str, *, temperature: float | None = None,
-                 max_tokens: int | None = None) -> str:
+                 max_tokens: int | None = None, json_mode: bool = False) -> str:
         raise NotImplementedError
 
     def available_models(self) -> list[str]:
@@ -61,7 +63,8 @@ class Backend:
 
 
 class OllamaBackend(Backend):
-    def complete(self, system, prompt, *, temperature=None, max_tokens=None):
+    def complete(self, system, prompt, *, temperature=None, max_tokens=None,
+                 json_mode=False):
         payload = {
             "model": self.cfg.model,
             "messages": [
@@ -69,6 +72,9 @@ class OllamaBackend(Backend):
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
+            # Verification runs for minutes between calls, which is long enough
+            # for ollama to evict the model and charge a full reload next time.
+            "keep_alive": self.cfg.keep_alive,
             "options": {
                 "temperature": self.cfg.temperature if temperature is None else temperature,
                 "num_ctx": self.cfg.context,
@@ -76,6 +82,8 @@ class OllamaBackend(Backend):
                 **self.cfg.extra.get("options", {}),
             },
         }
+        if json_mode and self.json_mode:
+            payload["format"] = "json"
         data = _post(f"{self.cfg.base_url.rstrip('/')}/api/chat", payload, self.cfg.timeout)
         return (data.get("message") or {}).get("content", "")
 
@@ -91,7 +99,8 @@ class OpenAICompatBackend(Backend):
         base = self.cfg.base_url.rstrip("/")
         return base if base.endswith("/v1") else base + "/v1"
 
-    def complete(self, system, prompt, *, temperature=None, max_tokens=None):
+    def complete(self, system, prompt, *, temperature=None, max_tokens=None,
+                 json_mode=False):
         payload = {
             "model": self.cfg.model,
             "messages": [
@@ -103,6 +112,8 @@ class OpenAICompatBackend(Backend):
         }
         if max_tokens:
             payload["max_tokens"] = max_tokens
+        if json_mode and self.json_mode:
+            payload["response_format"] = {"type": "json_object"}
         data = _post(f"{self._base()}/chat/completions", payload, self.cfg.timeout)
         choices = data.get("choices") or []
         if not choices:
@@ -211,14 +222,34 @@ class Router:
                        seconds=round(elapsed, 1), chars_out=len(text))
         return strip_reasoning(text)
 
+    def _json_attempt(self, task: str, system: str, prompt: str, kw: dict) -> str:
+        """One completion asked for under constrained decoding where supported."""
+        backend = self.backend(task)
+        try:
+            return self.complete(task, system, prompt, json_mode=True, **kw)
+        except ModelError as exc:
+            if not (backend.json_mode and _rejects_parameter(exc)):
+                raise
+            # The server does not speak this parameter. Losing the guarantee is
+            # survivable; failing the task over a capability probe is not.
+            backend.json_mode = False
+            self.log.warn("model.json_mode_unsupported", task=task, error=str(exc)[:200])
+            return self.complete(task, system, prompt, **kw)
+
     def complete_json(self, task: str, system: str, prompt: str, *, attempts: int = 3,
                       **kw: Any) -> Any:
-        """Completion that must parse as JSON. Retries with a repair nudge."""
+        """Completion that must parse as JSON. Retries with a repair nudge.
+
+        Constrained decoding makes malformed JSON structurally impossible on
+        servers that support it, so the repair loop is the fallback for the
+        ones that do not rather than the normal path. Each repair costs a whole
+        generation, which on a local model is the most expensive thing here.
+        """
         last_error = ""
         current = prompt
         for attempt in range(1, attempts + 1):
-            text = self.complete(task, system + "\n\nRespond with JSON only. No prose.",
-                                 current, **kw)
+            text = self._json_attempt(
+                task, system + "\n\nRespond with JSON only. No prose.", current, kw)
             try:
                 return extract_json(text)
             except ValueError as exc:
@@ -231,10 +262,20 @@ class Router:
                 kw["temperature"] = min(0.8, kw.get("temperature", 0.2) + 0.2 * attempt)
         raise ModelError(f"task {task}: no parseable JSON after {attempts} attempts: {last_error}")
 
+    def routed_tasks(self) -> list[str]:
+        """Task kinds some agent actually asks for.
+
+        Imported here rather than at module scope because agents.py imports
+        this module. Checking the full task list instead would fail a run over
+        a model that nothing was ever going to call.
+        """
+        from .agents import ROUTING
+        return sorted(set(ROUTING.values()))
+
     def preflight(self) -> list[str]:
-        """Verify every routed model is actually installed locally."""
+        """Verify every model an agent routes to is actually installed locally."""
         report = []
-        for task in ("research", "architecture", "coding", "review", "simple", "evolution"):
+        for task in self.routed_tasks():
             backend = self.backend(task)
             name = backend.cfg.model
             try:
@@ -250,7 +291,26 @@ class Router:
                     f"{backend.cfg.base_url}. Installed: {', '.join(installed) or 'none'}"
                 )
             report.append(f"{task}: {name} @ {backend.cfg.base_url} ok")
+        distinct = {self.backend(t).cfg.model for t in self.routed_tasks()}
+        if len(distinct) > 1:
+            # Routing roles to different models only pays off if they are
+            # co-resident; otherwise every role switch is a full model load,
+            # and the loop switches roles several times per ticket.
+            self.log.warn("model.multiple_models", count=len(distinct),
+                          models=", ".join(sorted(distinct)),
+                          hint="keep them loaded together or route every role "
+                               "to one model")
         return report
+
+
+def _rejects_parameter(exc: ModelError) -> bool:
+    """True when a local server refused the request as written.
+
+    The only optional field Hermes adds is the structured-output flag, so a
+    client error that appears once it is set is the server saying it does not
+    support it. A 5xx or a connection failure is a real fault and must surface.
+    """
+    return " HTTP 4" in str(exc)
 
 
 def _model_present(name: str, installed: list[str]) -> bool:

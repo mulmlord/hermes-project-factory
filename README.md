@@ -9,10 +9,14 @@ no path to a hosted API anywhere in the codebase, and a non-local endpoint is
 rejected at configuration time.
 
 ```console
-$ hermes new "Build a deterministic JSON diff tool in Python"
+$ ./install.sh
+$ mkdir -p ~/projects/json-diff && cd ~/projects/json-diff
+$ hpf "Build a deterministic JSON diff tool in Python"
 ```
 
-That command scaffolds a workspace, then runs to completion on its own.
+`hpf` builds the project in the directory you are standing in and runs to
+completion on its own. Run `hpf` there again with no idea to continue an
+interrupted project.
 
 ## How it works
 
@@ -65,6 +69,33 @@ clean checkout rather than from leftover build state.
 
 Only one third-party package is needed: PyYAML.
 
+## Install
+
+```console
+$ ./install.sh
+```
+
+It builds a virtualenv for the factory, installs it, links `hpf` and `hermes`
+into `~/.local/bin`, writes a starter config to `~/.config/hermes/config.yaml`
+if you have none, pre-pulls the sandbox image, and finishes by running
+`hermes doctor`. It installs no model: Hermes is local-model-only and will not
+guess which one you want.
+
+| Flag | Effect |
+|---|---|
+| `--dev` | also install the test dependencies |
+| `--system` | link into `/usr/local/bin` instead of `~/.local/bin` |
+| `--bin DIR`, `--venv DIR` | choose where the commands and the virtualenv go |
+| `--no-docker-image` | skip pre-pulling the sandbox image |
+| `--no-config` | leave `~/.config/hermes/config.yaml` alone |
+
+A virtualenv rather than a `--user` install, because most distributions now
+mark the system interpreter externally managed and `pip` refuses to write to
+it at all. The config in `$HOME` is what lets `hpf` work in project
+directories that have no `hermes.yaml` of their own.
+
+To install by hand instead:
+
 ```console
 $ pip install -e .
 $ hermes doctor
@@ -116,15 +147,19 @@ release, and it blocks completion regardless of whether the tests pass.
 
 | Command | What it does |
 |---|---|
+| `hpf "idea"` | build that project in the current directory, start to finish |
+| `hpf` | continue the project in the current directory |
 | `hermes new "idea"` | scaffold a project and build it autonomously |
 | `hermes run` | continue an existing project |
 | `hermes status` | phase, progress, active ticket, board |
 | `hermes pause` / `hermes resume` | stop after the current iteration, and restart |
 | `hermes logs -f` | follow the machine-readable log |
 | `hermes inspect [-t T003]` | spec, plan, board, history, or one ticket |
+| `hermes journal` | what each agent did, the record the agents themselves read |
 | `hermes test` | run the project's verification gates |
 | `hermes benchmark` | run the project's benchmark and report the score |
 | `hermes evolve -g 30` | run evolutionary optimisation |
+| `hermes eval` | build a fixed suite of ideas and report what the factory cost |
 | `hermes release --github` | clean-room validate, tag, and publish |
 | `hermes checkpoint` | list, create or restore a checkpoint |
 | `hermes doctor` | verify models, sandbox and tooling |
@@ -159,19 +194,44 @@ rather than declaring success.
 ## Development
 
 ```console
-$ pytest -q
+$ ./install.sh --dev
+$ .venv/bin/pytest -q
 ```
 
 The suite includes an end-to-end run of the entire state machine against a
 stub model, so the loop's ability to reach `COMPLETED` unaided is checked on
 every commit without needing inference.
 
+## Measuring the factory
+
+`hermes eval` builds a fixed suite of small projects and reports, per idea,
+whether it reached `COMPLETED`, how many tickets completed versus were
+abandoned, what share of tickets passed every gate on the first attempt, and
+how the wall clock split between inference and the sandbox.
+
+```console
+$ hermes eval --into evaluations/before
+$ hermes eval --into evaluations/after
+$ hermes eval --compare evaluations/before/results.json \
+                        evaluations/after/results.json
+```
+
+This exists because everything else in this section is a trade. Constrained
+decoding, search/replace edits, prefetching the next ticket, racing several
+samples through the gates and the noise-aware evolution selector all cost
+something to buy something, and which way a given change lands depends on the
+model and the machine. The first-pass rate and the GPU/CPU split are the two
+numbers that say which. It is also the precondition for the factory improving
+its own components: a self-modification that cannot be measured cannot be
+promoted.
+
 ## Limitations
 
 - Output quality tracks the local model. A small model produces a small
   project.
-- Agents return complete files rather than diffs. That is reliable with local
-  models but costs tokens on large files.
+- Agents patch files with exact search/replace edits and fall back to whole
+  files. A local model that cannot copy an anchor character for character
+  loses the edit and retries, which costs a generation.
 - OpenHands integration is optional and off by default; without it Hermes
   uses its own implementer.
 - Research works from what the model knows. Network research is not enabled

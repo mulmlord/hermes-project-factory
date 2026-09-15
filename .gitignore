@@ -8,3 +8,5 @@ build/
 dist/
 projects/
 .headroom/
+.serena/
+.claude/.headroom_wrap_*

@@ -11,6 +11,7 @@ import pytest
 from hermes import workspace
 from hermes.config import Config
 from hermes.factory import Factory
+from hermes.journal import Journal
 
 CALC = '''\
 """Tiny calculator."""
@@ -192,6 +193,12 @@ def test_loop_reaches_completed(factory):
     assert (factory.root / "docs" / "architecture" / "overview.md").is_file()
     assert list((factory.root / "docs" / "decisions").glob("*.md"))
 
+    # Every agent's work is recorded where the next agent will read it.
+    journal = Journal(factory.root)
+    assert {"src/calc.py", "tests/test_calc.py"} <= set(journal.owners())
+    assert all(e.commit for e in journal.entries if e.outcome == "completed")
+    assert (factory.root / "docs" / "generated" / "worklog.md").is_file()
+
     # Git history records the milestones.
     subjects = factory.repo.log_lines(30)
     assert any("feat:" in s for s in subjects), subjects
@@ -211,6 +218,39 @@ def test_state_survives_interruption(factory):
     from hermes.agents import build as build_agents
     second.agents = build_agents(second.router, second.log)
     assert second.run(max_iterations=40).phase == "COMPLETED"
+
+
+def test_prefetch_refuses_a_ticket_that_writes_the_same_file(factory):
+    """Generating ahead is only safe while the two tickets cannot collide."""
+    board = factory.board
+    current = board.add(title="writer", artifacts=["src/calc.py"], status="active")
+    clash = board.add(title="same file", artifacts=["src/calc.py"], status="ready",
+                      priority=1)
+    assert factory._independent_ticket(current) is None
+
+    clash.priority = 5
+    other = board.add(title="elsewhere", artifacts=["src/other.py"], status="ready",
+                      priority=1)
+    assert factory._independent_ticket(current).id == other.id
+
+
+def test_prefetched_work_is_reused_exactly_once(factory):
+    """Generated ahead of time, handed to the ticket it was generated for."""
+    board = factory.board
+    current = board.add(title="writer", artifacts=["src/calc.py"], status="active")
+    nxt = board.add(title="elsewhere", artifacts=["src/other.py"], status="ready",
+                    priority=1)
+
+    factory._prefetch_next(current)
+    assert factory._prefetch[0] == nxt.id
+    payload = factory._take_prefetch(nxt)
+    assert payload["files"][0]["path"] == "src/calc.py"  # the stub's answer
+    assert factory._take_prefetch(nxt) is None           # consumed, not reusable
+
+    # Prefetched for one ticket, never handed to a different one.
+    factory._prefetch_next(current)
+    assert factory._take_prefetch(current) is None
+    factory._stop_prefetch()
 
 
 def test_failed_gates_send_ticket_back(tmp_path, monkeypatch):

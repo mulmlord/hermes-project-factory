@@ -36,6 +36,8 @@ DEFAULTS: dict[str, Any] = {
             "context": 32768,
             "temperature": 0.2,
             "timeout": 900,
+            "structured_output": True,   # constrained decoding where supported
+            "keep_alive": "30m",         # survive a long build without a reload
         },
     },
     "routing": {role: "default" for role in TASK_ROLES},
@@ -58,8 +60,13 @@ DEFAULTS: dict[str, Any] = {
     "evolution": {
         "enabled": True,
         "max_generations": 20,
-        "population": 3,
+        "population": 3,              # candidates proposed per generation
         "patience": 5,                # generations without improvement
+        "baseline_repeats": 3,        # runs used to measure benchmark noise
+        "min_relative_gain": 0.01,    # ignore gains smaller than this fraction
+        "benchmark_timeout": 900,
+        "screen_factor": 2.0,         # kill a run this much slower than the best
+        "archive": 12,                # correct candidates kept as possible parents
     },
     "planning": {
         "max_tickets": 40,
@@ -70,6 +77,9 @@ DEFAULTS: dict[str, Any] = {
         "max_repair_attempts": 3,
         "max_loop_iterations": 400,
         "checkpoint_every": 1,
+        "candidates": 1,        # independent samples raced through the gates
+        "edit_protocol": True,  # let agents patch a file instead of rewriting it
+        "prefetch": True,       # generate the next ticket while this one verifies
     },
     "resources": {
         "reserve_ram_gb": 2,
@@ -96,6 +106,10 @@ class ModelConfig:
     temperature: float = 0.2
     timeout: int = 900
     allow_remote: bool = False
+    #: Ask the server to constrain decoding to JSON where it supports it.
+    structured_output: bool = True
+    #: How long ollama should hold the weights between calls.
+    keep_alive: str = "30m"
     extra: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
@@ -172,7 +186,7 @@ class Config:
                 f"no model configured for task {task!r} (routing -> {name!r})"
             )
         known = {"backend", "model", "base_url", "context", "temperature",
-                 "timeout", "allow_remote"}
+                 "timeout", "allow_remote", "structured_output", "keep_alive"}
         cfg = ModelConfig(
             role=name,
             backend=spec.get("backend", "ollama"),
@@ -182,6 +196,8 @@ class Config:
             temperature=float(spec.get("temperature", 0.2)),
             timeout=int(spec.get("timeout", 900)),
             allow_remote=bool(spec.get("allow_remote", False)),
+            structured_output=bool(spec.get("structured_output", True)),
+            keep_alive=str(spec.get("keep_alive", "30m")),
             extra={k: v for k, v in spec.items() if k not in known},
         )
         cfg.validate()
@@ -208,6 +224,8 @@ models:
     model: qwen3:30b-a3b
     context: 32768
     temperature: 0.2
+    structured_output: true          # constrain decoding to JSON server-side
+    keep_alive: 30m                   # do not evict the model during a build
   # coder:
   #   backend: openai                # llama.cpp / vLLM OpenAI-compatible server
   #   base_url: http://localhost:8080/v1
@@ -234,9 +252,20 @@ research:
   network: false
   max_rounds: 3
 
+execution:
+  candidates: 1          # samples raced through the gates per ticket; >1 costs
+                         # a whole extra verification pass, so raise it only if
+                         # the gates are cheap relative to generation
+  edit_protocol: true    # let agents patch a file instead of rewriting it whole
+  prefetch: true         # generate the next ticket while this one verifies
+
 evolution:
   enabled: true
   max_generations: 20
+  population: 3          # candidates proposed per generation
+  baseline_repeats: 3    # runs used to measure benchmark noise
+  min_relative_gain: 0.01
+  screen_factor: 2.0     # kill a run this much slower than the incumbent
 
 github:
   enabled: false

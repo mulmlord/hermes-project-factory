@@ -7,6 +7,8 @@ models:
     context: 32768
     temperature: 0.2
     timeout: 1200
+    structured_output: true
+    keep_alive: 30m
 
 routing:
   research: default
@@ -28,9 +30,16 @@ research:
   enabled: true
   max_rounds: 3
 
+execution:
+  candidates: 1
+  edit_protocol: true
+  prefetch: true
+
 evolution:
   enabled: true
   max_generations: 20
+  population: 3
+  baseline_repeats: 3
 
 github:
   enabled: false

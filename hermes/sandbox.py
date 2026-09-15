@@ -61,6 +61,9 @@ class Sandbox:
         self.workdir = cfg.get("workdir", "/workspace")
         self.container: str | None = None
         self.installed: list[str] = []  # tools Hermes had to add for the gates to run
+        #: Seconds spent executing generated code. Paired with the router's
+        #: own ledger it says whether a run was bound by the GPU or the CPU.
+        self.spent = 0.0
         self._probe_error = ""
         if self.runtime == "docker" and not shutil.which("docker"):
             self.log.warn("sandbox.docker_missing", fallback="local")
@@ -162,6 +165,7 @@ class Sandbox:
         except subprocess.TimeoutExpired as exc:
             result = Result(command, 124, _text(exc.stdout), _text(exc.stderr),
                             time.time() - started, timed_out=True)
+        self.spent += result.seconds
         self.log.debug("sandbox.run", command=command[:120], exit=result.exit_code,
                        seconds=round(result.seconds, 1))
         return result

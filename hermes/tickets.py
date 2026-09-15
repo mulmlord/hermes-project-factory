@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Iterable
 
 STATUSES = ["backlog", "ready", "active", "review", "blocked", "completed", "abandoned"]
+#: Statuses whose work is spent: they can neither be scheduled nor block others.
+FINISHED = ("completed", "abandoned")
 #: Only these directories are materialised (spec section 4).
 BOARD_DIRS = ["backlog", "active", "blocked", "review", "completed"]
 
@@ -218,22 +220,32 @@ class Board:
                 visit(node, [node])
         return found
 
-    def critical_path_depth(self, ticket: Ticket, _seen: set[str] | None = None) -> int:
-        """How many tickets transitively depend on this one."""
-        seen = _seen if _seen is not None else set()
-        if ticket.id in seen:
-            return 0
-        seen.add(ticket.id)
-        dependents = [t for t in self.tickets.values() if ticket.id in t.dependencies]
-        return len(dependents) + sum(
-            self.critical_path_depth(d, seen) for d in dependents
-        )
+    def critical_path(self, ticket: Ticket, _memo: dict[str, float] | None = None) -> float:
+        """Longest remaining cost path from *ticket* through its dependents.
 
-    def score(self, ticket: Ticket) -> float:
+        The project finishes when its longest chain finishes, so this is what
+        ticket selection should follow. Counting transitive dependents instead
+        ranks a wide, shallow fan-out of cheap leaves above the long chain that
+        actually decides the finish time. Work already completed or abandoned
+        cannot extend a remaining path and is excluded.
+        """
+        memo = {} if _memo is None else _memo
+        if ticket.id in memo:
+            return memo[ticket.id]
+        memo[ticket.id] = float(ticket.cost)  # a dependency cycle must not recurse
+        longest = max(
+            (self.critical_path(other, memo) for other in self.tickets.values()
+             if ticket.id in other.dependencies and other.status not in FINISHED),
+            default=0.0,
+        )
+        memo[ticket.id] = ticket.cost + longest
+        return memo[ticket.id]
+
+    def score(self, ticket: Ticket, _memo: dict[str, float] | None = None) -> float:
         """Higher is more urgent. Drives autonomous ticket selection."""
         return (
             (6 - ticket.priority) * 3.0            # priority dominates
-            + self.critical_path_depth(ticket) * 2.0   # unblock the most work
+            + self.critical_path(ticket, _memo) * 1.0  # shorten the longest chain
             + ticket.info_gain * 1.0               # prefer learning early
             + (6 - ticket.cost) * 0.5              # cheap wins first
             - ticket.risk * 0.5                    # defer risky work slightly
@@ -245,7 +257,10 @@ class Board:
         candidates = self.by_status("ready")
         if not candidates:
             return None
-        return max(candidates, key=lambda t: (self.score(t), -t.created))
+        # One memo for the whole comparison: the paths overlap heavily and
+        # recomputing them per candidate is quadratic on a large board.
+        memo: dict[str, float] = {}
+        return max(candidates, key=lambda t: (self.score(t, memo), -t.created))
 
     def progress(self) -> float:
         if not self.tickets:

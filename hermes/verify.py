@@ -219,12 +219,18 @@ def verify_ticket(sandbox: Sandbox, ticket, plan: dict, changed: list[str],
 
 
 def review(agents, ticket, diff: str, verification: Verification,
-           log: Logger = NULL) -> dict:
-    """Reviewer verdict on a ticket's change. Blocking issues send it back."""
+           prior: str = "", log: Logger = NULL) -> dict:
+    """Reviewer verdict on a ticket's change. Blocking issues send it back.
+
+    *prior* is the work journal, which lets the reviewer catch what a diff
+    alone cannot: duplicating an existing component, or renaming an interface
+    another ticket already depends on.
+    """
     verdict = agents["reviewer"].ask_json(
         f"TICKET {ticket.id}: {ticket.title}\n"
         f"OBJECTIVE: {ticket.objective}\n"
         f"ACCEPTANCE CRITERIA:\n" + "\n".join(f"- {a}" for a in ticket.acceptance) +
+        (f"\n\n{prior}" if prior else "") +
         f"\n\nVERIFICATION RESULTS:\n{verification.report()}\n\n"
         f"CHANGE:\n{diff[:20000]}\n\n"
         "Review this change. Return JSON:\n"

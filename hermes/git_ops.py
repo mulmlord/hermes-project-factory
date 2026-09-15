@@ -68,6 +68,13 @@ class Repo:
         self.log.info("git.commit", sha=sha, subject=subject)
         return sha
 
+    def files_in(self, ref: str = "HEAD") -> list[str]:
+        """Paths a commit touched: what an agent changed, as opposed to claimed."""
+        if not self.available or not (self.root / ".git").is_dir():
+            return []
+        out = self._run("show", "--name-only", "--pretty=format:", ref).stdout
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
     def branch(self, name: str) -> None:
         self._run("checkout", "-q", "-B", name, check=True)
 

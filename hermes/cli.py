@@ -5,10 +5,12 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from . import workspace
 from .config import Config, ConfigError, SAMPLE_CONFIG
+from .journal import Journal
 from .log import for_workspace
 from .sandbox import Sandbox, probe_resources
 from .state import PHASES, State, checkpoint, restore
@@ -165,6 +167,25 @@ def cmd_inspect(args) -> int:
     print("\n## Phase history")
     for entry in state.history[-15:]:
         print(f"  {entry['from']} -> {entry['to']}: {entry.get('reason', '')}")
+    recent = Journal(root).entries[-8:]
+    if recent:
+        print("\n## Recent work\n" + "\n".join(e.render() for e in recent))
+    return 0
+
+
+def cmd_journal(args) -> int:
+    """What each agent did: the same record the agents themselves read."""
+    root = _project_root(args)
+    entries = Journal(root).entries
+    if args.ticket:
+        entries = [e for e in entries if e.ticket == args.ticket]
+    entries = entries[-args.lines:]
+    if not entries:
+        print("no work recorded yet")
+        return 0
+    for entry in entries:
+        print(json.dumps(asdict(entry), default=str) if args.json
+              else entry.render() + "\n")
     return 0
 
 
@@ -212,6 +233,26 @@ def cmd_evolve(args) -> int:
     metrics = factory.state.metrics.get("optimization")
     print(json.dumps(metrics, indent=2) if metrics else "no measurable objective")
     return 0
+
+
+def cmd_eval(args) -> int:
+    """Measure the factory itself against a fixed suite of ideas."""
+    from .harness import SUITE, compare, run_suite, summarise, write_report
+    if args.compare:
+        print(compare(Path(args.compare[0]), Path(args.compare[1])))
+        return 0
+    if args.list:
+        for task in SUITE:
+            print(f"{task.name:<14} {task.idea}")
+        return 0
+    root = Path(args.into).resolve() if args.into else (
+        Path.cwd() / "evaluations" / time.strftime("%Y%m%d-%H%M%S"))
+    trials = run_suite(root, _config(args), names=args.task,
+                       max_iterations=args.max_iterations, quiet=args.quiet,
+                       on_trial=lambda trial: print(trial.row(), flush=True))
+    print("\n" + summarise(trials))
+    print(f"\nreport: {write_report(root, trials)}")
+    return 0 if trials and all(t.completed for t in trials) else 2
 
 
 def cmd_release(args) -> int:
@@ -329,6 +370,12 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("-t", "--ticket", help="show one ticket in full")
     inspect.set_defaults(func=cmd_inspect)
 
+    journal = sub.add_parser("journal", help="show what each agent did")
+    journal.add_argument("-n", "--lines", type=int, default=20)
+    journal.add_argument("-t", "--ticket", help="only this ticket's entries")
+    journal.add_argument("--json", action="store_true")
+    journal.set_defaults(func=cmd_journal)
+
     sub.add_parser("test", help="run the project's verification gates").set_defaults(
         func=cmd_test)
     sub.add_parser("benchmark", help="run the project's benchmark").set_defaults(
@@ -337,6 +384,15 @@ def build_parser() -> argparse.ArgumentParser:
     evolve = sub.add_parser("evolve", help="run evolutionary optimisation")
     evolve.add_argument("-g", "--generations", type=int)
     evolve.set_defaults(func=cmd_evolve)
+
+    ev = sub.add_parser("eval", help="measure the factory against its own suite")
+    ev.add_argument("-t", "--task", action="append", help="only this task (repeatable)")
+    ev.add_argument("--into", help="directory to build the evaluation in")
+    ev.add_argument("-n", "--max-iterations", type=int)
+    ev.add_argument("--list", action="store_true", help="show the suite and exit")
+    ev.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"),
+                    help="compare two results.json files")
+    ev.set_defaults(func=cmd_eval)
 
     release = sub.add_parser("release", help="clean-room validate and release")
     release.add_argument("--github", action="store_true")
@@ -354,6 +410,59 @@ def build_parser() -> argparse.ArgumentParser:
     cfg.add_argument("--sample", action="store_true", help="print a starter hermes.yaml")
     cfg.set_defaults(func=cmd_config)
     return parser
+
+
+def _hpf_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="hpf",
+        description="Build the project in this directory from a single idea, "
+                    "autonomously, using locally installed models.",
+        epilog='hpf "Build a ..."   start here    |    hpf   continue what is here')
+    parser.add_argument("idea", nargs="*",
+                        help="the project idea; quoting is optional")
+    parser.add_argument("-n", "--max-iterations", type=int)
+    parser.add_argument("-c", "--config", help="path to a hermes.yaml")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="suppress the log stream")
+    parser.add_argument("--github", action="store_true", help="publish when complete")
+    parser.add_argument("--force", action="store_true",
+                        help="restart even though this directory holds a project")
+    return parser
+
+
+def hpf(argv: list[str] | None = None) -> int:
+    """``hpf "idea"``: the whole factory, in the directory you are standing in.
+
+    The same command starts and continues the work, because deciding which of
+    those you meant is exactly the kind of question the factory is supposed to
+    answer for itself: an idea starts a project here, no idea resumes the one
+    already here.
+    """
+    parser = _hpf_parser()
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    here = Path.cwd()
+    idea = " ".join(args.idea).strip()
+    existing = (here / ".hermes" / "state" / "state.json").is_file()
+
+    head = (["-q"] if args.quiet else []) + (["-c", args.config] if args.config else [])
+    tail = ["-n", str(args.max_iterations)] if args.max_iterations else []
+
+    if not idea:
+        if not existing:
+            parser.print_help(sys.stderr)
+            print(f"\nno Hermes project in {here}; give it an idea to start one.",
+                  file=sys.stderr)
+            return 2
+        return main([*head, "--project", str(here), "run", *tail])
+
+    if existing and not args.force:
+        print(f"{here} already holds a Hermes project. Run `hpf` with no idea to "
+              "continue it, or pass --force to start over here.", file=sys.stderr)
+        return 1
+
+    return main([*head, "new", idea, "--into", str(here),
+                 *(["--github"] if args.github else []),
+                 *(["--force"] if args.force else []), *tail])
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 from . import workspace
@@ -15,7 +16,8 @@ from .agents import build as build_agents, context_block
 from .config import Config
 from .evolve import Evolution, objective_from_spec
 from .git_ops import GitHub, Repo
-from .implement import execute_ticket
+from .implement import Change, execute_ticket, generate
+from .journal import Journal
 from .log import Logger, for_workspace
 from .models import Router
 from .openhands import OpenHands
@@ -35,6 +37,7 @@ class Factory:
         self.log = log or for_workspace(self.root, self.config.get("logging.level"), quiet)
         self.state = State.load(self.root)
         self.board = Board(self.root)
+        self.journal = Journal(self.root, self.log)
         self.router = Router(self.config, self.log)
         self.agents = build_agents(self.router, self.log)
         self.sandbox = Sandbox(self.root, self.config.get("sandbox", {}), self.log)
@@ -43,6 +46,8 @@ class Factory:
         self.openhands = OpenHands(self.config.get("openhands", {}),
                                    self.config.model_for("coding"), self.log)
         self.resources = probe_resources()
+        self._pool: ThreadPoolExecutor | None = None
+        self._prefetch: tuple[str, Future] | None = None
 
     # -- helpers ---------------------------------------------------------
     def tree(self) -> str:
@@ -62,9 +67,11 @@ class Factory:
     def _board_extra(self) -> str:
         return f"## Board\n```\n{self.board.summary()}\n```\n"
 
-    def commit(self, message: str, kind: str = "chore") -> None:
-        if self.config.get("git.enabled", True):
-            self.repo.commit(message, kind=kind)
+    def commit(self, message: str, kind: str = "chore") -> str | None:
+        """Returns the short SHA so the journal can point at the real commit."""
+        if not self.config.get("git.enabled", True):
+            return None
+        return self.repo.commit(message, kind=kind)
 
     def research_summary(self, limit: int = 6000) -> str:
         path = self.root / ".hermes" / "state" / "research.json"
@@ -78,7 +85,29 @@ class Factory:
             for decision in round_.get("decisions", []):
                 lines.append(f"- DECISION: {decision.get('title')}: "
                              f"{decision.get('decision')}")
-        return "\n".join(lines)[:limit]
+        text = "\n".join(lines)
+        return text if len(text) <= limit else self._compress(text, limit)
+
+    def _compress(self, text: str, limit: int) -> str:
+        """Summarise overlong material instead of truncating it.
+
+        Cutting at a character count silently drops whichever findings sort
+        last, which is how the constraint the architect needed disappears.
+        This is the one job in the factory that wants the small fast model,
+        and it is what `routing.simple` is for.
+        """
+        try:
+            payload = self.agents["summariser"].ask_json(
+                f"RESEARCH FINDINGS ({len(text)} characters):\n{text[:40000]}\n\n"
+                f"Compress this to at most {limit // 12} words for an architect who "
+                "must choose a design from it. Keep every decision, constraint, "
+                "measured number, named technology and rejected alternative. "
+                'Return JSON: {"findings": ["one finding per entry"]}')
+            findings = [f"- {item}" for item in (payload.get("findings") or []) if item]
+        except Exception as exc:  # noqa: BLE001 - truncation is a valid fallback
+            self.log.warn("research.compress_failed", error=str(exc)[:200])
+            return text[:limit]
+        return "\n".join(findings)[:limit] or text[:limit]
 
     # -- phases ----------------------------------------------------------
     def phase_intake(self) -> None:
@@ -158,7 +187,12 @@ class Factory:
 
         outcome = execute_ticket(
             self.agents, self.sandbox, self.state, self.board, ticket, self.tree,
+            journal=self.journal,
             max_attempts=int(self.config.get("execution.max_ticket_attempts", 3)),
+            candidates=int(self.config.get("execution.candidates", 1)),
+            allow_edits=bool(self.config.get("execution.edit_protocol", True)),
+            prefetched=self._take_prefetch(ticket),
+            on_apply=lambda: self._prefetch_next(ticket),
             log=self.log)
 
         if outcome["status"] == "completed":
@@ -166,14 +200,82 @@ class Factory:
             self.state.clear_failure(ticket.id)
             record_evaluation(self.root, ticket.id, outcome["verification"],
                               {"review": outcome.get("review", {})})
-            self.commit(f"{_commit_kind(ticket.kind)}: {ticket.title}\n\n"
-                        f"Ticket {ticket.id}. {outcome['change'].summary}",
-                        kind=_commit_kind(ticket.kind))
+            sha = self.commit(f"{_commit_kind(ticket.kind)}: {ticket.title}\n\n"
+                              f"Ticket {ticket.id}. {outcome['change'].summary}",
+                              kind=_commit_kind(ticket.kind))
+            self.journal.record(ticket, outcome, commit=sha or "")
             self.log.info("ticket.completed", ticket=ticket.id,
                           progress=f"{self.board.progress():.0%}")
         else:
             self._handle_ticket_failure(ticket, outcome)
         self.save(f"ticket-{ticket.id}")
+
+    # -- pipelining ------------------------------------------------------
+    def _prefetch_next(self, current) -> None:
+        """Generate the next ticket's code while this one is being verified.
+
+        Verification is minutes of CPU during which the GPU sits idle, and
+        the two pieces of hardware are not in contention. The prefetched work
+        is strictly read-only -- one model call plus file reads, never a
+        write -- so the worst case is a payload built against files the
+        current ticket then changed. That payload fails its gates and the
+        normal retry path regenerates it, which is the same cost as not
+        having prefetched at all.
+        """
+        if not self.config.get("execution.prefetch", True) or self._prefetch:
+            return
+        candidate = self._independent_ticket(current)
+        if candidate is None:
+            return
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hermes-pf")
+        self.log.info("prefetch.start", ticket=candidate.id, during=current.id)
+        self._prefetch = (candidate.id, self._pool.submit(
+            generate, self.agents, self.sandbox, self.state, candidate, self.tree(),
+            prior=self.journal.block(candidate, self.board),
+            hints=self.journal.suggested_files(candidate, self.board),
+            allow_edits=bool(self.config.get("execution.edit_protocol", True)),
+            log=self.log))
+
+    def _independent_ticket(self, current):
+        """The ticket that will probably run next, unless it could collide.
+
+        Anything still depending on the running ticket is blocked rather than
+        ready, so the only remaining overlap is two tickets writing the same
+        file; that pair is left alone and generated in sequence.
+        """
+        candidate = self.board.next_ticket()
+        if candidate is None or candidate.id == current.id:
+            return None
+        if current.id in candidate.dependencies:
+            return None
+        busy = {a.lstrip("/") for a in current.artifacts}
+        if busy & {a.lstrip("/") for a in candidate.artifacts}:
+            return None
+        return candidate
+
+    def _take_prefetch(self, ticket) -> dict | None:
+        """The prefetched payload, when the ticket it was made for came up."""
+        if not self._prefetch:
+            return None
+        ticket_id, future = self._prefetch
+        self._prefetch = None
+        if ticket_id != ticket.id:
+            future.cancel()  # a running call cannot be stopped; drop the result
+            return None
+        try:
+            payload = future.result()
+        except Exception as exc:  # noqa: BLE001 - fall back to generating it now
+            self.log.warn("prefetch.failed", ticket=ticket.id, error=str(exc)[:200])
+            return None
+        self.log.info("prefetch.hit", ticket=ticket.id)
+        return payload if isinstance(payload, dict) else None
+
+    def _stop_prefetch(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+            self._pool = None
+        self._prefetch = None
 
     def _run_openhands(self, ticket) -> bool:
         self.board.move(ticket.id, "active", "delegated to OpenHands")
@@ -187,9 +289,17 @@ class Factory:
         verification = verify_ticket(self.sandbox, ticket, self.state.plan, [], self.log)
         if verification.passed:
             self.board.move(ticket.id, "completed", "OpenHands + gates passed")
-            self.commit(f"{_commit_kind(ticket.kind)}: {ticket.title}\n\n"
-                        f"Ticket {ticket.id}, implemented via OpenHands.",
-                        kind=_commit_kind(ticket.kind))
+            sha = self.commit(f"{_commit_kind(ticket.kind)}: {ticket.title}\n\n"
+                              f"Ticket {ticket.id}, implemented via OpenHands.",
+                              kind=_commit_kind(ticket.kind))
+            # OpenHands edits the workspace itself, so the commit is the only
+            # record of which files it actually touched.
+            self.journal.record(
+                ticket,
+                {"status": "completed", "verification": verification,
+                 "change": Change(summary="implemented by the OpenHands agent",
+                                  written=self.repo.files_in())},
+                commit=sha or "")
             self.save(f"ticket-{ticket.id}")
             return True
         self.board.move(ticket.id, "ready", "OpenHands output failed gates")
@@ -235,6 +345,12 @@ class Factory:
             self.board.move(ticket.id, "ready", f"retry after {action}")
         if self.board.tickets[ticket.id].status == "active":
             self.board.move(ticket.id, "ready", "released from active column")
+        # A recorded dead end is worth more to the next agent than a success:
+        # it is the only thing stopping the same approach being tried again.
+        self.journal.record(
+            ticket, outcome,
+            status="abandoned" if self.board.tickets[ticket.id].status == "abandoned"
+            else "failed")
 
     def _rollback(self, ticket, reason: str) -> None:
         """Undo the ticket's damage and park it rather than looping forever."""
@@ -440,8 +556,10 @@ class Factory:
                 except Exception as exc:  # a phase blowing up must not kill the run
                     self._recover_phase(phase, exc)
                 self.save(f"iter-{self.state.iteration}")
+            self._stop_prefetch()
         self.state.metrics["elapsed_seconds"] = round(time.time() - started, 1)
         self.state.metrics["model_usage"] = _usage(self.router)
+        self.state.metrics["sandbox_seconds"] = round(self.sandbox.spent, 1)
         self.save("final")
         self.log.info("factory.stop", phase=self.state.phase,
                       iterations=self.state.iteration,

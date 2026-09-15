@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .log import Logger, NULL
+from .sources import as_records
 from .workspace import slugify
 
 
@@ -25,15 +26,6 @@ class Unknown:
     resolution: str = ""
     confidence: str = "unknown"      # unknown | inferred | verified
     needs_experiment: bool = False
-
-
-@dataclass
-class Finding:
-    question: str
-    answer: str
-    confidence: str
-    implications: list[str] = field(default_factory=list)
-    source: str = "model-knowledge"
 
 
 class ResearchLog:
@@ -62,8 +54,13 @@ class ResearchLog:
 
 
 def investigate(agents, root: Path, topic: str, context: str, *,
-                max_unknowns: int = 6, log: Logger = NULL) -> dict:
-    """Run one Feynman round on *topic*. Returns findings and actions."""
+                max_unknowns: int = 6, log: Logger = NULL, librarian=None) -> dict:
+    """Run one Feynman round on *topic*. Returns findings and actions.
+
+    With a *librarian* the round first retrieves real sources and answers
+    from them; without one it answers from what the model already knows,
+    which is why every finding carries an explicit confidence either way.
+    """
     researcher = agents["researcher"]
     record = ResearchLog(root)
     log.info("research.round", topic=topic[:80])
@@ -86,6 +83,12 @@ def investigate(agents, root: Path, topic: str, context: str, *,
     )
     unknowns = (plan.get("unknowns") or [])[:max_unknowns]
 
+    refused_from = len(librarian.refusals) if librarian else 0
+    sources, material = [], ""
+    if librarian is not None and unknowns:
+        sources = _consult(researcher, librarian, topic, unknowns, context, log)
+        material = librarian.excerpts(sources)
+
     findings = []
     for index, unknown in enumerate(unknowns, 1):
         question = unknown.get("question") if isinstance(unknown, dict) else str(unknown)
@@ -95,12 +98,20 @@ def investigate(agents, root: Path, topic: str, context: str, *,
         answer = researcher.ask_json(
             f"{context}\n\nQUESTION: {question}\n"
             f"WHY IT MATTERS: {unknown.get('why_it_matters', '') if isinstance(unknown, dict) else ''}\n\n"
-            "Answer from what you actually know. Return JSON:\n"
+            + (f"RETRIEVED SOURCES — this text was fetched for this round. "
+               f"Prefer it over memory, and cite the ones you actually used:\n"
+               f"{material}\n\n" if material else "")
+            + ("Answer from the retrieved sources where they cover the question, "
+               "and from what you know where they do not. Say which is which.\n"
+               if material else "Answer from what you actually know.\n")
+            + "Return JSON:\n"
             "{\n"
             '  "answer": "the substantive answer, with concrete names, algorithms, '
             'complexities, formats or numbers where they exist",\n'
             '  "confidence": "verified|inferred|uncertain",\n'
-            '  "implications": ["what this means for the implementation"],\n'
+            + ('  "sources": ["url or [n] of a retrieved source you actually used"],\n'
+               if material else "")
+            + '  "implications": ["what this means for the implementation"],\n'
             '  "alternatives": [{"option": "name", "pros": "", "cons": ""}],\n'
             '  "recommendation": "which alternative to take and why",\n'
             '  "experiment": "a measurable experiment that would settle this, or '
@@ -114,6 +125,7 @@ def investigate(agents, root: Path, topic: str, context: str, *,
             "question": question,
             "answer": answer.get("answer", ""),
             "confidence": answer.get("confidence", "uncertain"),
+            "sources": _cited(answer.get("sources"), sources),
             "implications": answer.get("implications", []),
             "alternatives": answer.get("alternatives", []),
             "recommendation": answer.get("recommendation", ""),
@@ -141,14 +153,56 @@ def investigate(agents, root: Path, topic: str, context: str, *,
         "what_we_know": plan.get("what_we_know", []),
         "assumptions_challenged": plan.get("assumptions_to_challenge", []),
         "findings": findings,
+        "sources": as_records(sources),
+        "unreachable": librarian.refusals[refused_from:] if librarian else [],
         **{k: synthesis.get(k, []) for k in
            ("conclusions", "decisions", "hypotheses", "tickets", "remaining_unknowns")},
     }
     record.add(topic, payload)
     _write_notes(root, topic, payload)
     log.info("research.done", topic=topic[:60], findings=len(findings),
-             tickets=len(payload.get("tickets", [])))
+             sources=len(sources), tickets=len(payload.get("tickets", [])))
     return payload
+
+
+def _consult(researcher, librarian, topic: str, unknowns: list, context: str,
+             log: Logger) -> list:
+    """Ask what is worth reading, then have the sandbox fetch it."""
+    questions = "\n".join(
+        f"- {u.get('question') if isinstance(u, dict) else u}" for u in unknowns)
+    wanted = researcher.ask_json(
+        f"{context}\n\nTOPIC: {topic}\n\nQUESTIONS TO ANSWER:\n{questions}\n\n"
+        f"Name at most {librarian.remaining} pages worth retrieving to answer "
+        "these. Prefer primary sources: official documentation, a specification "
+        "or RFC, a project's own repository or reference manual, a paper. Give a "
+        "URL only if you are confident it exists and is publicly reachable — an "
+        "invented URL spends part of the budget and returns nothing. Return JSON:\n"
+        '{"sources": [{"url": "https://...", "why": "what it should settle"}]}'
+    )
+    found = librarian.gather((wanted.get("sources") or [])[:librarian.remaining])
+    log.info("research.consulted", topic=topic[:60], retrieved=len(found),
+             refused=len(librarian.refusals))
+    return found
+
+
+def _cited(claimed, sources: list) -> list[str]:
+    """Keep only citations naming something that was actually retrieved.
+
+    A model asked for citations supplies plausible ones whether or not it
+    read anything, which is the failure networked research exists to remove.
+    Excerpts are numbered in the prompt, so ``[2]`` is accepted as a
+    reference to the second source and resolved to its URL.
+    """
+    urls = {s.url for s in sources}
+    kept = []
+    for claim in claimed or []:
+        value = str(claim.get("url", "") if isinstance(claim, dict) else claim).strip()
+        index = value.strip("[]")
+        if index.isdigit() and 1 <= int(index) <= len(sources):
+            value = sources[int(index) - 1].url
+        if value in urls and value not in kept:
+            kept.append(value)
+    return kept
 
 
 def _write_notes(root: Path, topic: str, payload: dict) -> None:
@@ -171,6 +225,8 @@ def _write_notes(root: Path, topic: str, payload: dict) -> None:
         + block("Findings", payload.get("findings"), lambda f:
                 f"### {f['question']}\n"
                 f"**Confidence:** {f['confidence']}\n\n{f['answer']}\n\n"
+                + ("**Sources:** " + ", ".join(f"<{u}>" for u in f["sources"]) + "\n\n"
+                   if f.get("sources") else "")
                 + ("**Implications:**\n" + "\n".join(f"- {i}" for i in f.get("implications", []))
                    + "\n" if f.get("implications") else "")
                 + (f"\n**Recommendation:** {f['recommendation']}\n" if f.get("recommendation") else ""))
@@ -179,6 +235,11 @@ def _write_notes(root: Path, topic: str, payload: dict) -> None:
                 f"- {h.get('statement', h)} — _test:_ {h.get('test', 'n/a')}"
                 if isinstance(h, dict) else f"- {h}")
         + block("Still open", payload.get("remaining_unknowns"), lambda i: f"- {i}")
+        + block("Sources retrieved", payload.get("sources"), lambda s:
+                f"- [{s.get('title') or s.get('url')}]({s.get('url')}) — "
+                f"retrieved copy: `{s.get('path')}`")
+        + block("Could not be retrieved", payload.get("unreachable"), lambda r:
+                f"- {r.get('url')} — {r.get('reason')}")
     )
     out = Path(root) / "docs" / "research" / f"{stamp}-{slug}.md"
     out.parent.mkdir(parents=True, exist_ok=True)

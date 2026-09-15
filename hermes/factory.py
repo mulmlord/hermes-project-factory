@@ -25,6 +25,7 @@ from .planning import architect, decompose, generate_tickets, intake
 from .research import investigate, topics_for
 from .resources import Governor
 from .sandbox import Sandbox
+from .sources import Librarian
 from .state import State, checkpoint
 from .tickets import Board
 from .verify import record_evaluation, scan_unsafe, verify_project
@@ -131,12 +132,23 @@ class Factory:
             payload = investigate(
                 self.agents, self.root, topic, self.context(),
                 max_unknowns=int(self.config.get("research.max_unknowns", 6)),
-                log=self.log)
+                log=self.log, librarian=self._librarian())
             self._record_decisions(payload.get("decisions", []))
             self._queue_research_tickets(payload.get("tickets", []))
         self.save("research")
         self.commit("docs: record research findings and decisions", kind="docs")
         self.state.transition("SPECIFICATION", f"{len(topics)} research topic(s)")
+
+    def _librarian(self) -> Librarian | None:
+        """A fetcher, only where the operator enabled a network budget.
+
+        One per round, so the page budget is per round rather than per run,
+        and None by default: research reaches the network only on purpose.
+        """
+        if not self.config.get("research.network", False):
+            return None
+        return Librarian(self.sandbox, self.root, self.config.get("research", {}),
+                         self.log)
 
     def _record_decisions(self, decisions: list) -> None:
         for decision in decisions:
@@ -329,7 +341,7 @@ class Factory:
         elif action == "research":
             topic = diagnosis.get("research_topic") or f"How to correctly implement: {ticket.title}"
             payload = investigate(self.agents, self.root, topic, self.context(),
-                                  log=self.log)
+                                  log=self.log, librarian=self._librarian())
             self._record_decisions(payload.get("decisions", []))
             ticket.context = (ticket.context + "\n\nRESEARCH:\n" +
                               "\n".join(f"- {c}" for c in payload.get("conclusions", []))[:2000])

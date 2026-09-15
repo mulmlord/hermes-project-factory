@@ -56,6 +56,10 @@ DEFAULTS: dict[str, Any] = {
         "network": False,             # allow network during research stage
         "max_rounds": 3,
         "max_unknowns": 6,
+        "max_fetches": 6,             # pages one research round may retrieve
+        "fetch_bytes": 250000,        # cap on a single retrieved page
+        "fetch_timeout": 30,          # seconds one fetch may take
+        "allow_private": False,       # reach a LAN/loopback documentation server
     },
     "evolution": {
         "enabled": True,
@@ -251,8 +255,12 @@ sandbox:
 
 research:
   enabled: true
-  network: false
+  network: false         # off: findings come from what the local model knows.
+                         # on: the sandbox retrieves and cites real pages.
   max_rounds: 3
+  max_fetches: 6         # pages one research round may retrieve
+  fetch_bytes: 250000    # cap on a single page
+  allow_private: false   # only set for a documentation server you host
 
 execution:
   candidates: 1          # samples raced through the gates per ticket; >1 costs

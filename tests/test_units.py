@@ -16,9 +16,11 @@ from hermes.journal import Entry, Journal
 from hermes.log import NULL
 from hermes.models import ModelError, Router, extract_json, strip_reasoning
 from hermes.openhands import OpenHands
+from hermes.research import investigate
 from hermes.resources import Governor
 from hermes import harness
 from hermes.sandbox import Sandbox, SandboxError
+from hermes.sources import Librarian
 from hermes.state import State, StateError, checkpoint, restore
 from hermes.tickets import Board, split_validation
 from hermes.verify import scan_unsafe, verify_project
@@ -597,6 +599,173 @@ def test_the_router_registers_every_call_with_the_governor():
     router.complete("coding", "sys", "prompt")
     assert seen["inflight"] == 1
     assert governor.status()["inflight"] == 0
+
+
+# -- networked research ------------------------------------------------------
+
+GUIDE = ("<html><head><title>Ring Buffer Guide</title>"
+         "<script>var noise = 'script text must not be quoted back';</script>"
+         "</head><body><h1>Ring buffers</h1><p>A power-of-two capacity lets the "
+         "index wrap with a bitmask instead of a modulo.</p></body></html>")
+
+
+@pytest.fixture
+def served():
+    """A real HTTP server on loopback, so a fetch is an actual fetch.
+
+    Its document root sits outside every project directory: a test that scans
+    a project must find the retrieved copy, never the server's own files.
+    """
+    import functools
+    import http.server
+    import tempfile
+
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+    with tempfile.TemporaryDirectory() as pages:
+        for name, body in (
+                ("guide.html", GUIDE),
+                ("second.html", "<html><body>another page</body></html>"),
+                ("setup.py", 'import os\nos.system("rm -rf " + target)\n')):
+            with open(f"{pages}/{name}", "w") as handle:
+                handle.write(body)
+        server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), functools.partial(Quiet, directory=pages))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+def _librarian(root, **cfg):
+    """A librarian over the local sandbox runtime, which needs no docker."""
+    sandbox = Sandbox(root, {"runtime": "local", "timeout": 60}, NULL)
+    return Librarian(sandbox, root, cfg, NULL)
+
+
+class _Researcher:
+    """Answers the three research prompts, citing whatever it was handed."""
+
+    def __init__(self, url):
+        self.url = url
+        self.saw_material = False
+
+    def ask_json(self, prompt, **kw):
+        if "Step 1 of the Feynman method" in prompt:
+            return {"simple_explanation": "how a ring buffer wraps its index",
+                    "what_we_know": [],
+                    "unknowns": [{"question": "How should the index wrap?",
+                                  "why_it_matters": "it decides the per-op cost"}]}
+        if "Name at most" in prompt:
+            return {"sources": [{"url": self.url, "why": "the reference guide"}]}
+        if "QUESTION:" in prompt:
+            self.saw_material = "power-of-two capacity" in prompt
+            return {"answer": "Mask the index.", "confidence": "verified",
+                    "sources": ["[1]", "https://invented.example/never-fetched"],
+                    "implications": ["choose a power-of-two capacity"]}
+        return {"conclusions": ["mask, do not modulo"], "decisions": [],
+                "hypotheses": [], "tickets": [], "remaining_unknowns": []}
+
+
+def test_a_retrieved_page_is_stored_as_evidence_and_reduced_to_text(tmp_path, served):
+    workspace.create(tmp_path, "a ring buffer")
+    librarian = _librarian(tmp_path, allow_private=True)
+
+    source = librarian.fetch(f"{served}/guide.html", why="how the index wraps")
+
+    assert source is not None, librarian.refusals
+    assert source.path.startswith("research/sources/")
+    assert (tmp_path / source.path).read_bytes()      # the bytes as they arrived
+    assert source.title == "Ring Buffer Guide"
+    text = librarian.text(source, 4000)
+    assert "power-of-two capacity" in text
+    assert "must not be quoted back" not in text      # script stripped, not fed back
+
+
+def test_a_private_address_is_refused_unless_deliberately_allowed(tmp_path, served):
+    """The model names the URL; it does not get to name the operator's LAN."""
+    workspace.create(tmp_path, "a ring buffer")
+    librarian = _librarian(tmp_path)                  # allow_private defaults off
+
+    assert librarian.fetch(f"{served}/guide.html") is None
+    assert "non-public" in librarian.refusals[0]["reason"]
+    assert not list((tmp_path / "research" / "sources").glob("*"))
+
+
+def test_a_non_http_url_never_reaches_the_sandbox(tmp_path):
+    workspace.create(tmp_path, "a ring buffer")
+    librarian = _librarian(tmp_path, allow_private=True)
+    librarian.sandbox = None                          # running anything would raise
+
+    assert librarian.fetch("file:///etc/passwd") is None
+    assert librarian.spent == 0
+    assert "scheme" in librarian.refusals[0]["reason"]
+
+
+def test_the_page_budget_bounds_one_round(tmp_path, served):
+    workspace.create(tmp_path, "a ring buffer")
+    librarian = _librarian(tmp_path, allow_private=True, max_fetches=1)
+
+    found = librarian.gather([{"url": f"{served}/guide.html"},
+                              {"url": f"{served}/second.html"}])
+
+    assert len(found) == 1 and librarian.remaining == 0
+
+
+def test_the_same_page_is_retrieved_once(tmp_path, served):
+    workspace.create(tmp_path, "a ring buffer")
+    librarian = _librarian(tmp_path, allow_private=True)
+    url = f"{served}/guide.html"
+
+    assert librarian.fetch(url) is librarian.fetch(url)
+    assert librarian.spent == 1
+
+
+def test_retrieved_material_cannot_fail_the_security_scan(tmp_path, served):
+    """A fetched page is evidence, not code, and is never stored as source."""
+    workspace.create(tmp_path, "a ring buffer")
+    librarian = _librarian(tmp_path, allow_private=True)
+
+    source = librarian.fetch(f"{served}/setup.py")   # unsafe patterns inside
+
+    assert source is not None, librarian.refusals
+    assert not source.path.endswith(".py")
+    assert not scan_unsafe(tmp_path)
+
+
+def test_research_answers_from_what_it_retrieved_and_cites_it(tmp_path, served):
+    workspace.create(tmp_path, "a ring buffer")
+    url = f"{served}/guide.html"
+    researcher = _Researcher(url)
+
+    payload = investigate({"researcher": researcher}, tmp_path, "ring buffers",
+                          "CONTEXT", librarian=_librarian(tmp_path, allow_private=True))
+
+    assert researcher.saw_material, "the retrieved text never reached the prompt"
+    # "[1]" resolves to the page that was actually fetched; the invented URL goes.
+    assert payload["findings"][0]["sources"] == [url]
+    assert payload["sources"][0]["path"].startswith("research/sources/")
+
+    notes = next((tmp_path / "docs" / "research").glob("*.md")).read_text()
+    assert url in notes and "Sources retrieved" in notes
+
+
+def test_research_without_a_network_budget_fetches_nothing(tmp_path):
+    """The default: findings come from the model, and say so."""
+    assert Config.load().get("research.network") is False
+    workspace.create(tmp_path, "a ring buffer")
+    researcher = _Researcher("http://never.example/")
+
+    payload = investigate({"researcher": researcher}, tmp_path, "ring buffers",
+                          "CONTEXT")
+
+    assert payload["sources"] == []
+    assert payload["findings"][0]["sources"] == []
+    assert not (tmp_path / "research" / "sources").exists()
 
 
 # -- verification ------------------------------------------------------------

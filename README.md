@@ -34,7 +34,11 @@ everything you did not say and recording each inference as an assumption.
 **Research** runs a Feynman loop only when the problem warrants it: explain
 the problem plainly, name the unknowns, attack them, challenge the answers,
 then convert what survives into decision records, hypotheses and tickets. A
-research round that changes nothing is treated as a failed round.
+research round that changes nothing is treated as a failed round. Enable
+`research.network` and the round also reads: the researcher names the pages
+worth consulting, the sandbox fetches them, the bytes are kept under
+`research/` as evidence, and a finding may cite only a page that was
+actually retrieved.
 
 **Planning** decomposes the architecture into tickets small enough for one
 agent to implement, test and verify in a single pass. Dependency cycles are
@@ -178,6 +182,13 @@ and a protected-path list, so generated code cannot reach Hermes state, the
 git directory, or anything on the host. In the local fallback runtime the
 environment is stripped of anything resembling a key, token or credential.
 
+Research fetches, where you enable them, are the one thing that reaches the
+network, and they run in a one-shot container rather than the project's own.
+Only public addresses are fetched: the host is resolved and the *address* is
+judged, since a public hostname is free to point at `127.0.0.1`, and every
+redirect hop is judged again. That is what stops a model-supplied URL from
+reaching your inference server, your LAN, or a cloud metadata endpoint.
+
 A static scan runs over generated sources on every ticket and again at
 release, and it blocks completion regardless of whether the tests pass.
 
@@ -276,8 +287,11 @@ promoted.
   `LLM_*` variables are what OpenHands 1.21 accepts, and a run reaches only the
   endpoint Hermes names. What a full multi-file ticket costs there, against a
   real local model, is still unmeasured.
-- Research works from what the model knows. Network research is not enabled
-  by default.
+- Research works from what the model knows until you set
+  `research.network: true`, which buys it real sources within a page, byte
+  and time budget. The retrieval path is exercised against a real server on
+  every commit; which URLs a given local model actually names, and how often
+  they exist, is unmeasured.
 
 ## License
 

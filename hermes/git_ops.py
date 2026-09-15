@@ -127,29 +127,73 @@ class GitHub:
             return False
         return True
 
-    def create_and_push(self, root: Path, name: str, description: str) -> str | None:
+    def _slug(self, name: str) -> str:
+        owner = self.cfg.get("owner")
+        return f"{owner}/{name}" if owner else name
+
+    def _url(self, slug: str, root: Path) -> str | None:
+        view = self._gh("repo", "view", slug, "--json", "url", cwd=root)
+        if view.returncode != 0:
+            return None
+        try:
+            return json.loads(view.stdout or "{}").get("url")
+        except json.JSONDecodeError:
+            return None
+
+    def create(self, root: Path, name: str, description: str) -> str | None:
+        """Create the repository and wire up the remote, pushing nothing.
+
+        Creation and push answer different questions, so they are separate
+        calls. An issue cannot be opened against a repository that does not
+        exist, and the board is worth watching from the moment it exists; the
+        code is worth showing only once a ticket has passed its gates.
+        Creating early and pushing late is what makes a running project
+        observable without publishing a scaffold nobody has validated.
+        """
         if not self.ready():
             return None
-        visibility = "--private" if self.cfg.get("private", True) else "--public"
-        owner = self.cfg.get("owner")
-        slug = f"{owner}/{name}" if owner else name
-        existing = self._gh("repo", "view", slug, "--json", "url", cwd=root)
-        if existing.returncode == 0:
-            url = json.loads(existing.stdout).get("url")
-            self._gh("repo", "sync", cwd=root)
-            push = subprocess.run(["git", "push", "-u", "origin", "HEAD"], cwd=root,
-                                  capture_output=True, text=True)
-            self.log.info("github.pushed", repo=slug, ok=push.returncode == 0)
+        slug = self._slug(name)
+        url = self._url(slug, root)
+        if url is not None:
+            self._ensure_remote(root, url)
             return url
+        visibility = "--private" if self.cfg.get("private", True) else "--public"
         proc = self._gh("repo", "create", slug, visibility, "--source", ".",
-                        "--remote", "origin", "--push",
-                        "--description", description[:250], cwd=root)
+                        "--remote", "origin", "--description", description[:250],
+                        cwd=root)
         if proc.returncode != 0:
             self.log.warn("github.create_failed", error=proc.stderr.strip()[:300])
             return None
-        view = self._gh("repo", "view", slug, "--json", "url", cwd=root)
-        url = json.loads(view.stdout).get("url") if view.returncode == 0 else None
-        self.log.info("github.created", repo=slug, url=url)
+        url = self._url(slug, root)
+        self.log.info("github.created", repo=slug, url=url, pushed=False)
+        return url
+
+    def _ensure_remote(self, root: Path, url: str) -> None:
+        """Point origin at an existing repository, if it is not already."""
+        if subprocess.run(["git", "remote", "get-url", "origin"], cwd=root,
+                          capture_output=True, text=True).returncode == 0:
+            return
+        subprocess.run(["git", "remote", "add", "origin", f"{url}.git"], cwd=root,
+                       capture_output=True, text=True)
+
+    def push(self, root: Path) -> bool:
+        proc = subprocess.run(["git", "push", "-u", "origin", "HEAD"], cwd=root,
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            self.log.warn("github.push_failed", error=proc.stderr.strip()[:300])
+            return False
+        self.log.info("github.pushed")
+        return True
+
+    def create_and_push(self, root: Path, name: str, description: str) -> str | None:
+        """Publish the repository and its code in one step, as release does.
+
+        Nothing is pulled back: the board is the source of truth, and §3
+        settled that an edit made on GitHub is never read into the project.
+        """
+        url = self.create(root, name, description)
+        if url:
+            self.push(root)
         return url
 
     def release(self, root: Path, tag: str, title: str, notes: str) -> str | None:

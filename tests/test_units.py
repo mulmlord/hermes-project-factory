@@ -775,9 +775,10 @@ def test_research_without_a_network_budget_fetches_nothing(tmp_path):
 class _Gh:
     """Stands in for the gh CLI, recording what it was asked to do."""
 
-    def __init__(self):
+    def __init__(self, exists=False):
         self.calls: list[list[str]] = []
         self.opened = 0
+        self.exists = exists      # whether the remote repository is there yet
 
     def __call__(self, *args, cwd=None):
         self.calls.append(list(args))
@@ -785,6 +786,13 @@ class _Gh:
             self.opened += 1
             return subprocess.CompletedProcess(
                 args, 0, f"https://github.com/o/r/issues/{self.opened}\n", "")
+        if args[:2] == ("repo", "view"):
+            if not self.exists:
+                return subprocess.CompletedProcess(args, 1, "", "not found")
+            return subprocess.CompletedProcess(
+                args, 0, '{"url": "https://github.com/o/r"}', "")
+        if args[:2] == ("repo", "create"):
+            self.exists = True
         return subprocess.CompletedProcess(args, 0, "", "")
 
     def verbs(self) -> list[str]:
@@ -810,6 +818,42 @@ def _sync(root, batch=20, enabled=True):
     github = GitHub({"enabled": enabled}, NULL)
     github.available = True          # gh need not be installed to test the logic
     return Issues(github, root, NULL, batch)
+
+
+def _github(**cfg):
+    github = GitHub({"enabled": True, **cfg}, NULL)
+    github.available = True          # gh need not be installed to test the logic
+    return github
+
+
+def test_creating_the_repository_publishes_no_code(tmp_path, gh):
+    """The repository must exist before an issue can be opened; the code waits."""
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    url = _github().create(tmp_path, "proj", "a description")
+
+    assert url == "https://github.com/o/r"
+    assert "repo create" in gh.verbs()
+    flat = [arg for call in gh.calls for arg in call]
+    assert "--push" not in flat and "--private" in flat
+    assert gh.exists
+
+
+def test_an_existing_repository_is_adopted_rather_than_recreated(tmp_path):
+    """Resuming a project must not try to create the repository a second time."""
+    fake = _Gh(exists=True)
+    original = GitHub._gh
+    GitHub._gh = lambda self, *args, cwd=None: fake(*args, cwd=cwd)
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        url = _github().create(tmp_path, "proj", "d")
+    finally:
+        GitHub._gh = original
+
+    assert url == "https://github.com/o/r"
+    assert "repo create" not in fake.verbs()
+    remote = subprocess.run(["git", "remote", "get-url", "origin"], cwd=tmp_path,
+                            capture_output=True, text=True)
+    assert remote.stdout.strip() == "https://github.com/o/r.git"
 
 
 def test_each_ticket_becomes_an_issue(tmp_path, gh):

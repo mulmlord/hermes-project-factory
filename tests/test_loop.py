@@ -220,6 +220,61 @@ def test_state_survives_interruption(factory):
     assert second.run(max_iterations=40).phase == "COMPLETED"
 
 
+def test_the_board_is_published_while_there_is_still_something_to_watch(factory,
+                                                                       monkeypatch):
+    """A repository that arrives at release is a repository nobody can observe.
+
+    The issue projection cannot act before a remote exists, so the repository
+    is created where the board first exists. The code follows the first ticket
+    that passes its gates, so the first thing anyone sees is not a scaffold.
+    """
+    from hermes.git_ops import GitHub
+
+    events = []
+
+    def created(self, root, name, description):
+        events.append(("create", factory.board.progress()))
+        return "https://github.com/o/r"
+
+    def pushed(self, root):
+        events.append(("push", factory.board.progress()))
+        return True
+
+    monkeypatch.setattr(GitHub, "create", created)
+    monkeypatch.setattr(GitHub, "push", pushed)
+    monkeypatch.setattr(GitHub, "release", lambda self, *a, **k: None)
+    factory.config.data["github"]["enabled"] = True
+
+    assert factory.run(max_iterations=40).phase == "COMPLETED"
+
+    assert events, "the repository was never created"
+    # Created while the whole board was still outstanding, not after the fact.
+    assert events[0] == ("create", 0.0)
+    first_push = next(p for name, p in events if name == "push")
+    assert 0.0 < first_push < 1.0, "pushed a scaffold, or pushed only at the end"
+
+
+def test_a_project_without_github_publishes_nothing(factory, monkeypatch):
+    """Off must mean the gh CLI is never invoked at all, not merely never pushed.
+
+    Asserted at the process boundary on purpose: stubbing the publishing
+    methods themselves would stub out the guard that is under test.
+    """
+    import subprocess
+
+    from hermes.git_ops import GitHub
+
+    calls = []
+
+    def never(self, *args, cwd=None):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 1, "", "")
+
+    monkeypatch.setattr(GitHub, "_gh", never)
+    assert factory.run(max_iterations=40).phase == "COMPLETED"
+    assert not calls
+
+
 def test_networked_research_records_what_becomes_of_retrieved_pages(factory):
     """A project that reaches the network says, in itself, what it keeps."""
     factory.config.data["research"]["network"] = True

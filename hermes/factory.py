@@ -218,7 +218,38 @@ class Factory:
         workspace.write_plan(self.root, self.state.plan, self.board.summary())
         self.save("planning")
         self.commit(f"chore: plan {len(self.board.tickets)} tickets")
+        self._publish_board()
         self.state.transition("IMPLEMENTATION", f"{len(self.board.tickets)} tickets")
+
+    def _publish_board(self) -> None:
+        """Create the repository as soon as there is a board worth watching.
+
+        The issue projection can only act once a remote exists, and the remote
+        used to arrive in phase_release -- by which point every ticket is
+        already closed and there is nothing left to observe. So the repository
+        is created here, where the board first exists, and the code is held
+        back until a ticket has passed its gates: repositories are private by
+        default, and a scaffold nobody has validated is not worth showing.
+        """
+        if not (self.config.get("github.enabled", False)
+                and self.config.get("github.early", True)):
+            return
+        url = self.github.create(
+            self.root, self.config.get("github.name") or self.state.name,
+            (self.state.spec.get("objective") or self.state.idea)[:200])
+        if url:
+            self.state.metrics["github_url"] = url
+
+    def _push_first_green(self) -> None:
+        """Push the code once something has actually passed, and only once."""
+        if not self.config.get("github.enabled", False):
+            return
+        if self.state.metrics.get("github_pushed"):
+            return
+        if not self.state.metrics.get("github_url"):
+            return
+        if self.github.push(self.root):
+            self.state.metrics["github_pushed"] = True
 
     def phase_implementation(self) -> None:
         """Execute one ticket per call so the outer loop can checkpoint."""
@@ -257,6 +288,7 @@ class Factory:
             self.journal.record(ticket, outcome, commit=sha or "")
             self.log.info("ticket.completed", ticket=ticket.id,
                           progress=f"{self.board.progress():.0%}")
+            self._push_first_green()
         else:
             self._handle_ticket_failure(ticket, outcome)
         self.save(f"ticket-{ticket.id}")

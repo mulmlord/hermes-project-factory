@@ -65,9 +65,12 @@ candidate that fails the tests is discarded before its score is read.
 and builds and tests it there, proving the repository is reproducible from a
 clean checkout rather than from leftover build state.
 
-With GitHub enabled, the board is projected onto issues as tickets move: one
-issue per ticket, closed when the ticket is, so a running project is
-observable without shell access to the host. The projection is one way. The
+With GitHub enabled, the repository is created as soon as planning produces a
+board, and the board is projected onto issues as tickets move: one issue per
+ticket, closed when the ticket is, so a running project is observable without
+shell access to the host. The code itself waits for the first ticket to pass
+its gates — repositories are private by default, and a scaffold nobody has
+validated is not worth showing. The projection is one way. The
 board is the source of truth, an edit made on GitHub is never read back, and
 each issue says so — a loop specified to run unattended should not have a
 text box a human can steer it from.

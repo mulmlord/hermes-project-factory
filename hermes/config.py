@@ -94,6 +94,9 @@ DEFAULTS: dict[str, Any] = {
     "git": {"enabled": True, "author": "Hermes Factory <hermes@localhost>"},
     "github": {
         "enabled": False, "private": True, "owner": None, "name": None,
+        "early": True,        # create the repository once the board exists, so
+                              # the projection can watch a running project. The
+                              # code is pushed on the first ticket that passes.
         "issues": True,       # project the ticket board onto issues, one way
         "issue_batch": 20,    # issues touched per save, so a freshly planned
                               # board spreads over iterations instead of
@@ -286,6 +289,9 @@ evolution:
 github:
   enabled: false
   private: true
+  early: true            # create the repository when planning produces a board,
+                         # so the issues track a project that is still running.
+                         # The code is pushed on the first ticket that passes.
   issues: true           # mirror the ticket board onto issues. One way: the
                          # board is the source of truth and an edit made on
                          # GitHub is never read back.

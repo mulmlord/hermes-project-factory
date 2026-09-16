@@ -122,6 +122,13 @@ weights you already have. Nothing else is asked, and nothing is downloaded
 behind your back — run it without a terminal and it tells you which flag to
 pass rather than fetching gigabytes unattended.
 
+The slow steps report progress. Where the underlying tool already prints real
+byte counts — `uv` and `hf download`, which together account for most of the
+wait — that output is left to speak for itself; the silent steps get a
+spinner with elapsed time, and the wait for vLLM to load the weights gets a
+bar against its timeout. Piped to a file it degrades to one line per step
+instead of a megabyte of carriage returns.
+
 Nothing is installed for the Feynman research workflow, because it is part of
 Hermes itself rather than a package.
 
@@ -202,18 +209,24 @@ $ ./uninstall.sh
 
 It stops and removes the `hermes-vllm.service` unit, the virtualenvs for the
 factory, vLLM and OpenHands, the `hpf` and `hermes` links, and the
-editable-install leftovers in this repository. It keeps your config, because
-the model routing in it is yours rather than something the installer wrote; it
-keeps the sandbox image, because `python:3.11-slim` is a stock image other
-containers may share; and it keeps the downloaded weights, because those are
-gigabytes you would have to fetch again. A link on your PATH that points
+editable-install leftovers in this repository. It keeps the sandbox image,
+because `python:3.11-slim` is a stock image other containers may share, and it
+keeps the downloaded weights, because those are gigabytes you would have to
+fetch again. A link on your PATH that points
 somewhere other than the environments being removed is left alone, and
 lingering is left enabled, since other user services of yours may now rely on
 it.
 
+Your config is kept — the routing in it is yours — but the endpoint of the
+removed server is retired in place: the model name is emptied and the dead
+`base_url` is marked as such, so Hermes fails with "no model name/path
+configured" rather than advising you to start a server that no longer exists.
+The original is saved as `config.yaml.bak`. A config pointing somewhere other
+than a local vLLM is left untouched.
+
 | Flag | Effect |
 |---|---|
-| `--config` | also delete `~/.config/hermes/config.yaml` |
+| `--config` | delete `~/.config/hermes/config.yaml` instead of retiring the endpoint in it |
 | `--docker-image` | also delete the pre-pulled sandbox image |
 | `--models` | also delete the downloaded model weights |
 | `--all` | `--config` and `--docker-image`, but not `--models` |

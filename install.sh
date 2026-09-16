@@ -70,6 +70,69 @@ note() { printf '==> %s\n' "$*"; }
 warn() { printf ' !  %s\n' "$*" >&2; }
 die()  { printf 'XX  %s\n' "$*" >&2; exit 1; }
 
+# -- progress ----------------------------------------------------------------
+
+# Several steps here take minutes, and a silent terminal during a 4 GB
+# download is indistinguishable from a hang. Two indicators cover the two
+# cases: `spin` for work of unknown length, `bar` for a wait with a deadline.
+#
+# Steps whose own tooling already prints real byte-level progress — uv and
+# `hf download` — are deliberately left to print it, because a spinner that
+# replaced "1.2/4.0 GB" with a twirling stick would be less information, not
+# more.
+#
+# Both degrade to a single plain line when stdout is not a terminal, so piping
+# the install to a file does not produce a megabyte of carriage returns.
+BAR_FULL='############################'
+BAR_EMPTY='............................'
+BAR_WIDTH=28
+
+progress_tty() { [ -t 1 ]; }
+
+bar() {  # bar <done> <total> <label>
+  progress_tty || return 0
+  local done=$1 total=$2 label=$3 filled pct
+  [ "$total" -gt 0 ] || total=1
+  filled=$(( done * BAR_WIDTH / total ))
+  [ "$filled" -gt "$BAR_WIDTH" ] && filled=$BAR_WIDTH
+  pct=$(( done * 100 / total ))
+  [ "$pct" -gt 100 ] && pct=100
+  printf '\r    [%s%s] %3d%%  %s\033[K' \
+    "${BAR_FULL:0:filled}" "${BAR_EMPTY:0:$((BAR_WIDTH - filled))}" "$pct" "$label"
+}
+
+bar_clear() { progress_tty && printf '\r\033[K' || true; }
+
+spin() {  # spin <label> <command...>
+  local label="$1"; shift
+  local log pid start i=0 frames='|/-\'
+  log="$(mktemp)"
+  "$@" >"$log" 2>&1 &
+  pid=$!
+  start=$SECONDS
+  if progress_tty; then
+    while kill -0 "$pid" 2>/dev/null; do
+      i=$(( (i + 1) % 4 ))
+      printf '\r    %s %s  %ds\033[K' "${frames:i:1}" "$label" "$((SECONDS - start))"
+      sleep 0.2
+    done
+    printf '\r\033[K'
+  else
+    printf '    %s ...\n' "$label"
+  fi
+  # The output is shown only on failure: on success it is noise, and on
+  # failure it is the only thing that explains what happened.
+  if wait "$pid"; then
+    note "$label: done in $((SECONDS - start))s"
+    rm -f "$log"
+    return 0
+  fi
+  warn "$label: failed after $((SECONDS - start))s"
+  tail -n 20 "$log" >&2
+  rm -f "$log"
+  return 1
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --dev)             DEV=1 ;;
@@ -113,14 +176,17 @@ else
     || die "could not create a virtualenv. On Debian/Ubuntu: sudo apt install python3-venv"
 fi
 
-"$VENV/bin/python" -m pip install --quiet --upgrade pip \
+spin "upgrading pip" "$VENV/bin/python" -m pip install --quiet --upgrade pip \
   || warn "could not upgrade pip; continuing with the bundled version"
 
-note "installing hermes${DEV:+ }$([ "$DEV" -eq 1 ] && echo 'with test dependencies')"
+# A function because spin runs its argument list as one command, and this one
+# needs a subshell to keep the directory change local.
+install_hermes() { (cd "$REPO" && "$VENV/bin/python" -m pip install --quiet -e "$1"); }
 if [ "$DEV" -eq 1 ]; then
-  (cd "$REPO" && "$VENV/bin/python" -m pip install --quiet -e ".[dev]")
+  spin "installing hermes with test dependencies" install_hermes ".[dev]" \
+    || die "could not install hermes"
 else
-  (cd "$REPO" && "$VENV/bin/python" -m pip install --quiet -e ".")
+  spin "installing hermes" install_hermes "." || die "could not install hermes"
 fi
 
 # -- commands ----------------------------------------------------------------
@@ -182,8 +248,7 @@ if docker info >/dev/null 2>&1; then
   if [ "$PULL_IMAGE" -eq 1 ]; then
     IMAGE="$("$VENV/bin/python" -c \
       'from hermes.config import DEFAULTS; print(DEFAULTS["sandbox"]["image"])')"
-    note "pulling the sandbox image $IMAGE"
-    docker pull -q "$IMAGE" >/dev/null \
+    spin "pulling the sandbox image $IMAGE" docker pull -q "$IMAGE" \
       || warn "could not pull $IMAGE; Hermes will pull it on first run"
   fi
 elif command -v docker >/dev/null; then
@@ -213,12 +278,15 @@ if [ "$OPENHANDS" -eq 1 ]; then
   elif command -v uv >/dev/null 2>&1; then
     # uv fetches CPython 3.12 itself, so this succeeds even on a host whose
     # only interpreter is too new for the package.
-    uv tool install -q --python 3.12 openhands \
+    spin "installing openhands" uv tool install -q --python 3.12 openhands \
       || warn "uv could not install openhands; Hermes will use its own implementer"
   elif command -v python3.12 >/dev/null 2>&1; then
-    if python3.12 -m venv "$OH_VENV" \
-       && "$OH_VENV/bin/python" -m pip install --quiet --upgrade pip \
-       && "$OH_VENV/bin/python" -m pip install --quiet openhands; then
+    build_openhands() {
+      python3.12 -m venv "$OH_VENV" \
+        && "$OH_VENV/bin/python" -m pip install --quiet --upgrade pip \
+        && "$OH_VENV/bin/python" -m pip install --quiet openhands
+    }
+    if spin "installing openhands into $OH_VENV" build_openhands; then
       if [ -w "$BIN_DIR" ]; then
         ln -sf "$OH_VENV/bin/openhands" "$BIN_DIR/openhands"
       else
@@ -312,13 +380,16 @@ serve_model() {
   # it, and it does not belong in the factory's own virtualenv. It also has no
   # wheels for this host's CPython 3.14 yet, so the interpreter is pinned to
   # 3.12 the same way the OpenHands layer is.
-  note "installing vLLM into $VLLM_VENV (this downloads a few GB)"
+  # Left unquiet on purpose: this is the single longest step of the install,
+  # and both uv and pip report bytes and packages as they go. That is better
+  # progress information than anything this script could draw over the top.
+  note "installing vLLM into $VLLM_VENV (a few GB; progress below)"
   if [ -x "$VLLM_VENV/bin/vllm" ]; then
     note "reusing the vLLM environment at $VLLM_VENV"
   elif command -v uv >/dev/null 2>&1; then
     uv venv --quiet --python 3.12 "$VLLM_VENV" \
       || die "uv could not create a CPython 3.12 environment for vLLM"
-    uv pip install --quiet --python "$VLLM_VENV/bin/python" vllm "huggingface_hub[cli]" \
+    uv pip install --python "$VLLM_VENV/bin/python" vllm "huggingface_hub[cli]" \
       || die "could not install vLLM into $VLLM_VENV"
   else
     local py=""
@@ -327,14 +398,17 @@ serve_model() {
     done
     [ -n "$py" ] || die "vLLM needs CPython 3.10-3.12; install uv (https://docs.astral.sh/uv/) and re-run"
     "$py" -m venv "$VLLM_VENV" || die "could not create $VLLM_VENV"
-    "$VLLM_VENV/bin/python" -m pip install --quiet --upgrade pip || true
-    "$VLLM_VENV/bin/python" -m pip install --quiet vllm "huggingface_hub[cli]" \
+    spin "upgrading pip in $VLLM_VENV" \
+      "$VLLM_VENV/bin/python" -m pip install --quiet --upgrade pip || true
+    "$VLLM_VENV/bin/python" -m pip install --progress-bar on vllm "huggingface_hub[cli]" \
       || die "could not install vLLM into $VLLM_VENV"
   fi
 
   if [ -z "$MODEL_PATH" ]; then
     MODEL_PATH="$MODELS_DIR/$(basename "$MODEL_REPO")"
-    note "downloading $MODEL_REPO into $MODEL_PATH"
+    # hf draws a per-file progress bar with real byte counts, so it is left to
+    # speak for itself rather than being wrapped in a spinner.
+    note "downloading $MODEL_REPO into $MODEL_PATH (progress below)"
     mkdir -p "$MODEL_PATH" || die "cannot write to $MODEL_PATH"
     "$VLLM_VENV/bin/hf" download "$MODEL_REPO" --local-dir "$MODEL_PATH" \
       || die "could not download $MODEL_REPO. Check the name, or pass --model-path."
@@ -402,22 +476,31 @@ EOF
 
   # Loading several gigabytes onto the GPU takes minutes, and every command
   # after this one assumes the server answers, so wait rather than race it.
-  note "waiting for the server to load the model (up to 10 minutes)"
-  if "$VENV/bin/python" - "$PORT" <<'PY'
-import sys, time, urllib.error, urllib.request
-url = f"http://127.0.0.1:{sys.argv[1]}/v1/models"
-deadline = time.time() + 600
-while time.time() < deadline:
-    try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            if resp.status == 200:
-                raise SystemExit(0)
-    except (urllib.error.URLError, OSError):
-        pass
-    time.sleep(5)
-raise SystemExit(1)
+  # The bar runs against the timeout rather than against real progress: vLLM
+  # reports nothing over HTTP until it is ready to serve, so elapsed-against-
+  # deadline is the only honest total available. It is labelled as such.
+  local waited=0 timeout=600 ready=0
+  note "waiting for the server to load the model (up to $((timeout / 60)) minutes)"
+  while [ "$waited" -lt "$timeout" ]; do
+    if "$VENV/bin/python" - "$PORT" <<'PY'
+import sys, urllib.error, urllib.request
+try:
+    with urllib.request.urlopen(
+            f"http://127.0.0.1:{sys.argv[1]}/v1/models", timeout=5) as resp:
+        raise SystemExit(0 if resp.status == 200 else 1)
+except (urllib.error.URLError, OSError):
+    raise SystemExit(1)
 PY
-  then
+    then
+      ready=1
+      break
+    fi
+    sleep 5
+    waited=$((waited + 5))
+    bar "$waited" "$timeout" "loading $MODEL_NAME (${waited}s of ${timeout}s)"
+  done
+  bar_clear
+  if [ "$ready" -eq 1 ]; then
     note "vLLM is serving $MODEL_NAME on http://localhost:$PORT/v1"
   else
     warn "the server did not answer on port $PORT within 10 minutes."

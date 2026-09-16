@@ -256,6 +256,44 @@ def cmd_eval(args) -> int:
     return 0 if trials and all(t.completed for t in trials) else 2
 
 
+def cmd_improve(args) -> int:
+    """Section 35: improve one of Hermes' own components, under gates."""
+    from .improve import Improvement, TARGETS
+    from .log import NULL
+
+    if args.list:
+        for name, files in TARGETS.items():
+            print(f"{name:<14} {', '.join(files)}")
+        return 0
+    if not args.target:
+        print("name a component with --target, or list them with --list",
+              file=sys.stderr)
+        return 1
+    root = Path(__file__).resolve().parent.parent
+    if not (root / ".git").is_dir():
+        print(f"{root} is not a git checkout of Hermes. Self-modification "
+              "happens on a branch, so it needs one.", file=sys.stderr)
+        return 1
+
+    proposal, agents = None, {}
+    if args.proposal:
+        proposal = json.loads(Path(args.proposal).read_text())
+    else:
+        from .agents import build as build_agents
+        from .models import Router
+        agents = build_agents(Router(_config(args), NULL), NULL)
+
+    work = Improvement(root, agents, NULL)
+    record = work.attempt(args.target, proposal=proposal,
+                          before=args.before, after=args.after)
+    print(record.report())
+    if args.promote and record.passed:
+        print("promoted" if work.promote(record) else "promotion refused")
+    if record.branch and not record.promoted:
+        work.discard(record.branch)
+    return 0 if record.passed else 2
+
+
 def cmd_release(args) -> int:
     from .factory import Factory
     root = _project_root(args)
@@ -396,6 +434,19 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--compare", nargs=2, metavar=("BEFORE", "AFTER"),
                     help="compare two results.json files")
     ev.set_defaults(func=cmd_eval)
+
+    imp = sub.add_parser("improve", help="improve Hermes itself, under gates")
+    imp.add_argument("-t", "--target", help="component to improve")
+    imp.add_argument("--list", action="store_true", help="show targets and exit")
+    imp.add_argument("--proposal", metavar="FILE",
+                     help="a change as JSON, instead of asking a model for one")
+    imp.add_argument("--before", metavar="FILE",
+                     help="results.json measured before the change")
+    imp.add_argument("--after", metavar="FILE",
+                     help="results.json measured after the change")
+    imp.add_argument("--promote", action="store_true",
+                     help="merge the candidate, but only if every gate passes")
+    imp.set_defaults(func=cmd_improve)
 
     release = sub.add_parser("release", help="clean-room validate and release")
     release.add_argument("--github", action="store_true")

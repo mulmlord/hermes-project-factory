@@ -1162,6 +1162,153 @@ def test_eval_compare_refuses_to_read_meaning_into_an_unmoved_pair(tmp_path):
     assert "compares two stubs" in stubs
 
 
+# -- self-improvement --------------------------------------------------------
+
+def _repo(root):
+    """A git repository shaped like Hermes, small enough to branch in a test."""
+    (root / "hermes").mkdir(parents=True, exist_ok=True)
+    (root / "tests").mkdir(parents=True, exist_ok=True)
+    (root / "hermes" / "planning.py").write_text("VERSION = 1\n")
+    (root / "tests" / "test_units.py").write_text("def test_ok():\n    assert True\n")
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=root,
+                   check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=root, check=True)
+
+
+def test_a_change_to_what_judges_it_is_refused_unevaluated():
+    """The cheapest way to pass a suite is to delete it, so this is refused."""
+    from hermes.improve import admissible
+
+    assert "judges it" in admissible(["tests/test_units.py"])
+    assert "judges it" in admissible(["hermes/harness.py"])
+    assert "judges it" in admissible(["hermes/improve.py"])
+    assert "judges it" in admissible(["pyproject.toml"])
+    assert admissible(["hermes/planning.py"]) == ""
+    assert "no files" in admissible([])
+    # Hermes improves Hermes, not the README or the installer.
+    assert "outside the hermes package" in admissible(["README.md"])
+
+
+def test_an_unmeasured_change_is_never_promotable(tmp_path):
+    """Section 35 permits promotion on demonstrated benefit, nothing less."""
+    from hermes.improve import Improvement
+
+    gate = Improvement(tmp_path).benefit(None, None)
+    assert not gate.passed
+    assert "demonstrated" in gate.detail
+
+
+def test_measured_gain_reads_two_evaluations_strictly(tmp_path):
+    from hermes import harness
+    from hermes.improve import measured_gain
+
+    def report(name, **over):
+        trial = harness.Trial(name="json-diff", completed=True, seconds=60.0,
+                              tickets_completed=2, first_pass=0.5, model_calls=9)
+        for key, value in over.items():
+            setattr(trial, key, value)
+        harness.write_report(tmp_path / name, [trial])
+        return tmp_path / name / "results.json"
+
+    base = report("base")
+    assert measured_gain(base, report("better", first_pass=1.0))[0]
+    assert not measured_gain(base, report("same"))[0]
+    assert not measured_gain(base, report("worse", completed=False))[0]
+    # Two stub runs describe the stub, not the factory.
+    stub_a, stub_b = report("sa", model_calls=0), report("sb", model_calls=0)
+    ok, why = measured_gain(stub_a, stub_b)
+    assert not ok and "stubs" in why
+
+
+def test_a_candidate_is_built_beside_the_live_tree_not_in_it(tmp_path):
+    """Hermes runs from its checkout; a candidate must not rewrite it."""
+    from hermes.improve import Improvement
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    _repo(root)
+    work = Improvement(root)
+
+    worktree = work.worktree("hermes/improve-planner-1")
+    written = work.apply(worktree, [{"path": "hermes/planning.py",
+                                     "content": "VERSION = 2\n"}])
+
+    assert written == ["hermes/planning.py"]
+    assert (worktree / "hermes" / "planning.py").read_text() == "VERSION = 2\n"
+    # The tree Hermes is executing from is untouched.
+    assert (root / "hermes" / "planning.py").read_text() == "VERSION = 1\n"
+
+    work.discard("hermes/improve-planner-1")
+    assert not worktree.exists()
+
+
+def test_the_suite_that_judges_a_candidate_is_always_ours(tmp_path):
+    """A candidate that reached the tests by any route has them taken back."""
+    from hermes.improve import Improvement
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    _repo(root)
+    work = Improvement(root)
+    worktree = work.worktree("hermes/improve-planner-2")
+
+    (worktree / "tests" / "test_units.py").write_text("def test_ok():\n    pass\n")
+    work.restore_trusted(worktree)
+
+    assert (worktree / "tests" / "test_units.py").read_text() == \
+        (root / "tests" / "test_units.py").read_text()
+    work.discard("hermes/improve-planner-2")
+
+
+def test_an_escape_from_the_worktree_is_refused(tmp_path):
+    from hermes.improve import Improvement
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    _repo(root)
+    work = Improvement(root)
+    worktree = work.worktree("hermes/improve-planner-3")
+
+    written = work.apply(worktree, [
+        {"path": "../escaped.py", "content": "nope"},
+        {"path": "/etc/escaped.py", "content": "nope"},
+        {"path": "hermes/planning.py", "content": "VERSION = 3\n"}])
+
+    assert written == ["hermes/planning.py"]
+    assert not (tmp_path / "escaped.py").exists()
+    work.discard("hermes/improve-planner-3")
+
+
+def test_nothing_is_promoted_without_passing_every_gate(tmp_path):
+    from hermes.improve import Attempt, Improvement
+    from hermes.verify import Gate
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    _repo(root)
+    work = Improvement(root)
+
+    failed = Attempt(target="planner", branch="hermes/improve-planner-4",
+                     gates=[Gate("suite", True), Gate("benefit", False, "unmeasured")])
+    assert not work.promote(failed)
+    assert not failed.promoted
+
+    never_evaluated = Attempt(target="planner")
+    assert not never_evaluated.passed
+    assert not work.promote(never_evaluated)
+
+
+def test_an_unknown_target_is_rejected(tmp_path):
+    from hermes.improve import Improvement
+
+    record = Improvement(tmp_path).attempt("the whole thing")
+    assert "unknown target" in record.refusal
+    assert not record.passed
+
+
 # -- released tree -----------------------------------------------------------
 
 def _with_retrieved_pages(root):

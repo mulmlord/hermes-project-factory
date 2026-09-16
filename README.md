@@ -222,6 +222,7 @@ release, and it blocks completion regardless of whether the tests pass.
 | `hermes benchmark` | run the project's benchmark and report the score |
 | `hermes evolve -g 30` | run evolutionary optimisation |
 | `hermes eval` | build a fixed suite of ideas and report what the factory cost |
+| `hermes improve --target planner` | improve Hermes itself, under gates |
 | `hermes release --github` | clean-room validate, tag, and publish |
 | `hermes checkpoint` | list, create or restore a checkpoint |
 | `hermes doctor` | verify models, sandbox and tooling |
@@ -300,6 +301,33 @@ model and the machine. The first-pass rate and the GPU/CPU split are the two
 numbers that say which. It is also the precondition for the factory improving
 its own components: a self-modification that cannot be measured cannot be
 promoted.
+
+## Improving the factory
+
+`hermes improve --target planner` lets Hermes change one of its own
+components. Section 35 permits that only under conditions, and each one is
+enforced here rather than asked for in a prompt:
+
+- The candidate is built as a git worktree on its own branch. The checkout
+  Hermes is running from is never switched, so a candidate cannot rewrite the
+  source of the process that is evaluating it.
+- A change touching the test suite, the evaluation harness or the promotion
+  gate itself is refused before it is evaluated, and the trusted copies are
+  restored into the worktree before the suite runs. The cheapest way to pass
+  a suite is to delete it, and a loop able to do that eventually will.
+- Promotion needs the Hermes suite to pass *and* a measured benefit — `hermes
+  eval` on each side, handed over as `--before` and `--after`. Without that
+  evidence the gate refuses, so on a machine with no local model nothing is
+  promotable. That is the correct answer rather than an obstacle.
+- A promoted change is merged and then the suite is run again on the live
+  tree, because a change can pass alone and fail in company. A failure there
+  resets it.
+
+Benchmark infrastructure is deliberately absent from the target list: it
+lives in the harness, which is protected, so the factory cannot rewrite the
+instrument it is judged by. None of this runs inside the autonomous project
+loop — a factory building someone's project has no business rewriting itself
+halfway through.
 
 ## Limitations
 

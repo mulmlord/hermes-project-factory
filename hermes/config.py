@@ -30,14 +30,18 @@ TASK_ROLES = (
 DEFAULTS: dict[str, Any] = {
     "models": {
         "default": {
-            "backend": "ollama",
-            "base_url": "http://localhost:11434",
-            "model": "qwen3:30b-a3b",
-            "context": 32768,
+            "backend": "vllm",
+            # install.sh serves one model here under a systemd user unit.
+            "base_url": "http://localhost:6767/v1",
+            "model": "qwen2.5-coder-7b-instruct-awq",
+            # vLLM reserves the KV cache for the full context at startup, so
+            # this is a VRAM commitment rather than a limit, and it must match
+            # the --max-model-len the server was started with.
+            "context": 16384,
             "temperature": 0.2,
             "timeout": 900,
             "structured_output": True,   # constrained decoding where supported
-            "keep_alive": "30m",         # survive a long build without a reload
+            "keep_alive": "30m",         # ollama only; vLLM never evicts
         },
     },
     "routing": {role: "default" for role in TASK_ROLES},
@@ -116,14 +120,15 @@ class ModelConfig:
     role: str
     backend: str
     model: str
-    base_url: str = "http://localhost:11434"
-    context: int = 32768
+    base_url: str = "http://localhost:6767/v1"
+    context: int = 16384
     temperature: float = 0.2
     timeout: int = 900
     allow_remote: bool = False
     #: Ask the server to constrain decoding to JSON where it supports it.
     structured_output: bool = True
-    #: How long ollama should hold the weights between calls.
+    #: How long ollama should hold the weights between calls. Ignored by vLLM,
+    #: which keeps the model resident for the lifetime of the process.
     keep_alive: str = "30m"
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -204,10 +209,10 @@ class Config:
                  "timeout", "allow_remote", "structured_output", "keep_alive"}
         cfg = ModelConfig(
             role=name,
-            backend=spec.get("backend", "ollama"),
+            backend=spec.get("backend", "vllm"),
             model=spec.get("model", ""),
-            base_url=spec.get("base_url", "http://localhost:11434"),
-            context=int(spec.get("context", 32768)),
+            base_url=spec.get("base_url", "http://localhost:6767/v1"),
+            context=int(spec.get("context", 16384)),
             temperature=float(spec.get("temperature", 0.2)),
             timeout=int(spec.get("timeout", 900)),
             allow_remote=bool(spec.get("allow_remote", False)),
@@ -232,19 +237,24 @@ class Config:
 
 SAMPLE_CONFIG = """\
 # Hermes Project Factory configuration. Local models only.
+#
+# install.sh serves one model with vLLM on port 6767, as a systemd user unit
+# that starts at boot: `systemctl --user status hermes-vllm.service`. The
+# model name below must be the one the server answers to, which is what
+# `curl localhost:6767/v1/models` reports.
 models:
   default:
-    backend: ollama                  # ollama | openai | llamacpp | vllm
-    base_url: http://localhost:11434
-    model: qwen3:30b-a3b
-    context: 32768
+    backend: vllm                    # vllm | openai | llamacpp | ollama
+    base_url: http://localhost:6767/v1
+    model: qwen2.5-coder-7b-instruct-awq
+    context: 16384                   # must match the server's --max-model-len
     temperature: 0.2
     structured_output: true          # constrain decoding to JSON server-side
-    keep_alive: 30m                   # do not evict the model during a build
+    keep_alive: 30m                  # ollama only; vLLM never evicts
   # coder:
-  #   backend: openai                # llama.cpp / vLLM OpenAI-compatible server
-  #   base_url: http://localhost:8080/v1
-  #   model: /models/qwen2.5-coder-32b.gguf
+  #   backend: ollama                # a second server, if you run one
+  #   base_url: http://localhost:11434
+  #   model: qwen2.5-coder:32b
 
 routing:
   research: default

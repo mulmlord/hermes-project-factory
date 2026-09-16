@@ -4,6 +4,9 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+# The vLLM and OpenHands layers get environments of their own beside the
+# factory's, so the `.venv/` pattern above does not cover them.
+.venv-*/
 build/
 dist/
 projects/

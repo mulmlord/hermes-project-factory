@@ -59,6 +59,31 @@ def test_deep_merge_keeps_untouched_defaults():
     assert merged == {"a": {"b": 9, "c": 2}}
 
 
+def test_defaults_address_the_server_install_sh_starts():
+    """install.sh serves vLLM on 6767; the built-in defaults must agree.
+
+    Three files describe that endpoint — the defaults, the sample config and
+    the installer's sed patch — and a project run with no hermes.yaml of its
+    own reaches the server through these.
+    """
+    from hermes.config import DEFAULTS, SAMPLE_CONFIG
+    from hermes.models import BACKENDS, OpenAICompatBackend
+
+    cfg = Config(deep_merge(DEFAULTS, {})).model_for("coding")
+    assert cfg.backend == "vllm"
+    assert cfg.base_url == "http://localhost:6767/v1"
+    assert is_local_url(cfg.base_url)
+    # vLLM speaks the OpenAI protocol; nothing else would reach it.
+    assert BACKENDS[cfg.backend] is OpenAICompatBackend
+    assert OpenAICompatBackend(cfg)._base() == "http://localhost:6767/v1"
+
+    # The installer rewrites these three keys in the sample by anchoring on
+    # four leading spaces, so they have to stay exactly one level deep.
+    for key in ("base_url", "model", "context"):
+        assert f"\n    {key}: " in SAMPLE_CONFIG
+    assert "6767" in SAMPLE_CONFIG
+
+
 # -- openhands ---------------------------------------------------------------
 
 def test_openhands_delegation_stays_headless_and_local(tmp_path, monkeypatch):

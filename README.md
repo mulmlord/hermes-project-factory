@@ -114,7 +114,9 @@ It builds a virtualenv for the factory, installs it, links `hpf` and `hermes`
 into `~/.local/bin`, pre-pulls the sandbox image, installs the OpenHands agent
 layer beside Hermes, sets up the vLLM model server described below, writes a
 config matching the model it is serving, and finishes by running
-`hermes doctor`.
+`hermes doctor`. The server is started once so that the install proves the
+model loads on this GPU, then stopped again: from there on Hermes starts it
+when a project starts and stops it when the run ends.
 
 It asks exactly one question, once: which model to serve. Either a Hugging
 Face repository to download and where to keep the weights, or a directory of
@@ -148,26 +150,51 @@ Hermes itself rather than a package.
 | `--max-model-len N` | context vLLM serves (default `16384`) |
 | `--gpu-util F` | fraction of VRAM vLLM may use (default `0.90`) |
 | `--no-server` | install nothing for vLLM and start no server |
-| `--no-boot` | install the unit but do not start it at boot |
+| `--boot` | also run the server at boot, not just during a run |
 
 ## Model server
 
 The factory talks to one vLLM server on `http://localhost:6767/v1`, installed
-as a **systemd user unit** called `hermes-vllm.service`. It starts at boot and
-restarts on failure, so the server is simply always up — a run that lasts
-hours cannot depend on someone remembering to start a model first.
+as a **systemd user unit** called `hermes-vllm.service`. A unit rather than a
+command you remember to type, because something has to own restarts across a
+run that lasts hours.
+
+The unit is installed but **not enabled**. vLLM pins the whole model in VRAM
+for as long as it lives — it has no CPU offload and never evicts — so a server
+running since boot is gigabytes of GPU given to an idle process. Hermes
+instead starts the unit itself when a project starts or continues, waits for
+the weights to load, and stops it when the run ends. A server you started by
+hand is left running, because you did that for a reason.
 
 ```console
 $ systemctl --user status hermes-vllm.service
 $ journalctl --user -u hermes-vllm.service -f
-$ systemctl --user restart hermes-vllm.service
+$ systemctl --user start hermes-vllm.service    # bring it up by hand
 ```
 
+`hermes doctor` reports an installed-but-stopped unit as `inactive` and does
+not count it against the setup, since the next run brings it up. A config
+fault still fails: an empty model name or a hosted `base_url` is not excused
+by a server that happens to be down.
+
+```yaml
+server:
+  autostart: true              # start the unit when a run begins
+  unit: hermes-vllm.service
+  wait: 600                    # seconds allowed for the weights to load
+  stop_after_run: true         # false keeps the model resident between runs
+```
+
+Set `stop_after_run: false` to pay the load once and keep the model in VRAM,
+which is also what you want when two projects share one server — Hermes only
+ever stops a server it started itself, but it cannot tell that another run is
+still using one. `./install.sh --boot` restores the always-up arrangement:
+the unit is enabled, and lingering (`loginctl enable-linger`) is turned on,
+which is the part that makes "at boot" true rather than "at next login" for a
+user unit.
+
 A user unit, not a system one, so nothing runs as root and the weights stay
-readable by you alone. User units normally stop at logout, so the installer
-also enables lingering (`loginctl enable-linger`) — that is the part that
-makes "at boot" true rather than "at next login". Pass `--no-boot` to install
-the unit without starting or enabling it.
+readable by you alone.
 
 Serving is offline: the unit sets `HF_HUB_OFFLINE=1` and points vLLM at a
 directory on disk, so the server never reaches the network once the weights

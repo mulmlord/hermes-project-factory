@@ -17,6 +17,12 @@ routing:
   simple: default
   evolution: default
 
+server:
+  autostart: true
+  unit: hermes-vllm.service
+  wait: 600
+  stop_after_run: true
+
 sandbox:
   runtime: docker
   image: python:3.11-slim

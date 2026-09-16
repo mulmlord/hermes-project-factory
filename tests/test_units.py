@@ -1618,3 +1618,201 @@ def test_hpf_places_global_and_subcommand_flags_correctly(tmp_path, monkeypatch,
     cli.hpf(["an idea", "-q", "-n", "5"])
     assert captured_main["argv"] == ["-q", "new", "an idea", "--into",
                                      str(tmp_path), "-n", "5"]
+
+
+# -- model server ------------------------------------------------------------
+
+class _Systemctl:
+    """Stands in for `systemctl --user`, recording what was asked of it."""
+
+    def __init__(self, *, unit_exists=True, start_ok=True):
+        self.calls: list[list[str]] = []
+        self.unit_exists = unit_exists
+        self.start_ok = start_ok
+        self.active = False
+
+    def __call__(self, args):
+        self.calls.append(args)
+        verb = args[0]
+        if verb == "cat":
+            return (0, "[Unit]\n") if self.unit_exists else (1, "No files found")
+        if verb == "start":
+            if not self.start_ok:
+                return 1, "Job for hermes-vllm.service failed"
+            self.active = True
+            return 0, ""
+        if verb == "stop":
+            self.active = False
+            return 0, ""
+        if verb == "is-active":
+            return (0, "active\n") if self.active else (3, "inactive\n")
+        return 0, ""
+
+    @property
+    def verbs(self):
+        return [call[0] for call in self.calls]
+
+
+def _router_on(base_url, up):
+    """A Router stand-in: two roles behind one endpoint, up when *up* says so."""
+    def available_models():
+        if not up():
+            raise ModelError(f"{base_url}: connection refused")
+        return ["qwen2.5-coder-7b-instruct-awq"]
+    backend = SimpleNamespace(cfg=SimpleNamespace(base_url=base_url),
+                              available_models=available_models)
+    return SimpleNamespace(routed_tasks=lambda: ["coding", "review"],
+                           backend=lambda task: backend)
+
+
+def _server(sysctl, **kw):
+    from hermes.server import ModelServer
+    kw.setdefault("wait", 60)
+    return ModelServer("hermes-vllm.service", log=NULL, run=sysctl,
+                       sleep=lambda _s: None, **kw)
+
+
+def test_the_server_runs_for_the_length_of_a_run():
+    """Started when the project starts, stopped when it ends.
+
+    vLLM pins the whole model in VRAM, so "up all the time" costs gigabytes of
+    GPU while nothing is building. The unit install.sh writes is therefore not
+    enabled, and this is what brings it up instead.
+    """
+    sysctl = _Systemctl()
+    server = _server(sysctl)
+    server.ensure(_router_on("http://localhost:6767/v1", lambda: sysctl.active))
+    assert server.started and sysctl.active
+    assert sysctl.verbs == ["cat", "start"]
+    server.release()
+    assert not sysctl.active
+    assert sysctl.verbs == ["cat", "start", "stop"]
+
+
+def test_a_server_hermes_did_not_start_is_left_running():
+    """Someone who started the server by hand did it for a reason."""
+    sysctl = _Systemctl()
+    sysctl.active = True
+    server = _server(sysctl)
+    server.ensure(_router_on("http://localhost:6767/v1", lambda: sysctl.active))
+    assert sysctl.calls == [] and not server.started
+    server.release()
+    assert sysctl.calls == [] and sysctl.active
+
+
+def test_a_remote_endpoint_is_not_ours_to_start():
+    sysctl = _Systemctl()
+    server = _server(sysctl)
+    server.ensure(_router_on("http://gpu.example.com/v1", lambda: False))
+    assert sysctl.calls == [] and not server.started
+
+
+def test_a_missing_unit_is_not_an_error_here():
+    """preflight reports the unreachable server; this stays quiet."""
+    sysctl = _Systemctl(unit_exists=False)
+    server = _server(sysctl)
+    server.ensure(_router_on("http://localhost:6767/v1", lambda: False))
+    assert sysctl.verbs == ["cat"] and not server.started
+    server.release()
+    assert sysctl.verbs == ["cat"]
+
+
+def test_a_failed_start_is_not_followed_by_a_stop():
+    sysctl = _Systemctl(start_ok=False)
+    server = _server(sysctl)
+    server.ensure(_router_on("http://localhost:6767/v1", lambda: sysctl.active))
+    assert sysctl.verbs == ["cat", "start"] and not server.started
+    server.release()
+    assert sysctl.verbs == ["cat", "start"]
+
+
+def test_a_server_that_never_answers_is_still_released():
+    """The weights may never load; the process is ours either way."""
+    sysctl = _Systemctl()
+    server = _server(sysctl, wait=0)
+    server.ensure(_router_on("http://localhost:6767/v1", lambda: False))
+    assert server.started
+    server.release()
+    assert sysctl.verbs == ["cat", "start", "stop"] and not sysctl.active
+
+
+def test_stop_after_run_false_keeps_the_model_resident():
+    sysctl = _Systemctl()
+    server = _server(sysctl, stop_after_run=False)
+    server.ensure(_router_on("http://localhost:6767/v1", lambda: sysctl.active))
+    server.release()
+    assert sysctl.verbs == ["cat", "start"] and sysctl.active
+
+
+def test_autostart_off_means_no_server_object_at_all():
+    from hermes.config import DEFAULTS
+    from hermes.server import ModelServer
+    assert DEFAULTS["server"]["autostart"] is True
+    assert ModelServer.from_config(Config(deep_merge(DEFAULTS, {}))).unit \
+        == "hermes-vllm.service"
+    off = Config(deep_merge(DEFAULTS, {"server": {"autostart": False}}))
+    assert ModelServer.from_config(off) is None
+    unitless = Config(deep_merge(DEFAULTS, {"server": {"unit": ""}}))
+    assert ModelServer.from_config(unitless) is None
+
+
+def test_unit_state_calls_an_idle_unit_inactive_not_missing():
+    """`hermes doctor` must tell "installed, down between runs" from "absent"."""
+    from hermes.server import unit_state
+    sysctl = _Systemctl()
+    assert unit_state("hermes-vllm.service", run=sysctl) == "inactive"
+    sysctl.active = True
+    assert unit_state("hermes-vllm.service", run=sysctl) == "active"
+    assert unit_state("x.service", run=_Systemctl(unit_exists=False)) == "not installed"
+
+
+def test_doctor_excuses_an_idle_server_but_never_a_bad_config(tmp_path, monkeypatch, capsys):
+    """An installed unit that is down between runs is the normal resting state.
+
+    Port 1 stands in for "nothing listening": the point is that doctor decides
+    on the config first, so the local-only rule and an empty model name still
+    fail while the server is stopped.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("hermes.server.unit_state", lambda unit, run=None: "inactive")
+    config = tmp_path / "hermes.yaml"
+    base = ("models:\n  default:\n    backend: vllm\n"
+            "    base_url: {url}\n    model: {model}\n"
+            "server:\n  autostart: {autostart}\n  unit: hermes-vllm.service\n")
+    args = SimpleNamespace(config=None)
+
+    config.write_text(base.format(url="http://127.0.0.1:1/v1", model="served",
+                                  autostart="true"))
+    assert cli.cmd_doctor(args) == 0
+    assert "the next run starts it" in capsys.readouterr().out
+
+    # Off: nothing will start it for you, so an unreachable server is a fault.
+    config.write_text(base.format(url="http://127.0.0.1:1/v1", model="served",
+                                  autostart="false"))
+    assert cli.cmd_doctor(args) == 1
+
+    config.write_text(base.format(url="http://127.0.0.1:1/v1", model='""',
+                                  autostart="true"))
+    assert cli.cmd_doctor(args) == 1
+
+    config.write_text(base.format(url="https://api.openai.com/v1", model="gpt-4",
+                                  autostart="true"))
+    assert cli.cmd_doctor(args) == 1
+    assert "not a local endpoint" in capsys.readouterr().err
+
+
+def test_running_holds_the_server_for_exactly_one_block(monkeypatch):
+    """The contextmanager every generating entry point wraps its work in."""
+    from hermes.config import DEFAULTS
+    from hermes.server import running
+    sysctl = _Systemctl()
+    monkeypatch.setattr("hermes.server._systemctl", sysctl)
+    router = _router_on("http://localhost:6767/v1", lambda: sysctl.active)
+    with running(Config(deep_merge(DEFAULTS, {})), router) as server:
+        assert sysctl.active and server.started
+    assert not sysctl.active
+    assert sysctl.verbs == ["cat", "start", "stop"]
+
+    off = Config(deep_merge(DEFAULTS, {"server": {"autostart": False}}))
+    with running(off, router) as server:
+        assert server is None

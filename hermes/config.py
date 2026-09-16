@@ -45,6 +45,15 @@ DEFAULTS: dict[str, Any] = {
         },
     },
     "routing": {role: "default" for role in TASK_ROLES},
+    "server": {
+        # install.sh writes this unit but leaves it disabled: the server pins
+        # the whole model in VRAM, so it runs while a project runs and not
+        # while the machine merely happens to be on.
+        "autostart": True,
+        "unit": "hermes-vllm.service",
+        "wait": 600,             # seconds allowed for the weights to load
+        "stop_after_run": True,  # only ever stops a server Hermes started
+    },
     "sandbox": {
         "runtime": "docker",          # docker | local
         "image": "python:3.11-slim",
@@ -257,10 +266,11 @@ class Config:
 SAMPLE_CONFIG = """\
 # Hermes Project Factory configuration. Local models only.
 #
-# install.sh serves one model with vLLM on port 6767, as a systemd user unit
-# that starts at boot: `systemctl --user status hermes-vllm.service`. The
-# model name below must be the one the server answers to, which is what
-# `curl localhost:6767/v1/models` reports.
+# install.sh serves one model with vLLM on port 6767, as a systemd user unit:
+# `systemctl --user status hermes-vllm.service`. Hermes starts that unit when
+# a project starts or continues and stops it when the run ends, so the model
+# does not sit in VRAM between runs. The model name below must be the one the
+# server answers to, which is what `curl localhost:6767/v1/models` reports.
 models:
   default:
     backend: vllm                    # vllm | openai | llamacpp | ollama
@@ -282,6 +292,14 @@ routing:
   review: default
   simple: default
   evolution: default
+
+server:
+  autostart: true              # start the unit below when a run begins
+  unit: hermes-vllm.service    # systemd *user* unit, so `systemctl --user`
+  wait: 600                    # seconds allowed for the weights to load
+  stop_after_run: true         # set false to leave the model resident between
+                               # runs, or when two projects share one server:
+                               # Hermes only ever stops one it started itself
 
 sandbox:
   runtime: docker                    # docker | local

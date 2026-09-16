@@ -31,6 +31,16 @@ def _config(args) -> Config:
     return Config.load(getattr(args, "config", None))
 
 
+def _server_for(factory):
+    """Keep the local model server up for a phase run outside `Factory.run`.
+
+    `evolve` and `release` drive a single phase directly, and a phase that
+    generates needs the server as much as a whole run does.
+    """
+    from .server import running
+    return running(factory.config, factory.router, factory.log)
+
+
 # -- commands ----------------------------------------------------------------
 
 def cmd_new(args) -> int:
@@ -227,7 +237,7 @@ def cmd_evolve(args) -> int:
     factory = Factory(root, _config(args), quiet=args.quiet)
     if args.generations:
         factory.config.data["evolution"]["max_generations"] = args.generations
-    with factory.sandbox:
+    with _server_for(factory), factory.sandbox:
         factory.phase_optimization()
     factory.save("evolve")
     metrics = factory.state.metrics.get("optimization")
@@ -275,17 +285,25 @@ def cmd_improve(args) -> int:
               "happens on a branch, so it needs one.", file=sys.stderr)
         return 1
 
+    from contextlib import nullcontext
     proposal, agents = None, {}
+    # A proposal read from a file needs no model, and therefore no server.
+    server = nullcontext()
     if args.proposal:
         proposal = json.loads(Path(args.proposal).read_text())
     else:
         from .agents import build as build_agents
         from .models import Router
-        agents = build_agents(Router(_config(args), NULL), NULL)
+        from .server import running
+        config = _config(args)
+        router = Router(config, NULL)
+        agents = build_agents(router, NULL)
+        server = running(config, router, NULL)
 
     work = Improvement(root, agents, NULL)
-    record = work.attempt(args.target, proposal=proposal,
-                          before=args.before, after=args.after)
+    with server:
+        record = work.attempt(args.target, proposal=proposal,
+                              before=args.before, after=args.after)
     print(record.report())
     if args.promote and record.passed:
         print("promoted" if work.promote(record) else "promotion refused")
@@ -300,7 +318,7 @@ def cmd_release(args) -> int:
     factory = Factory(root, _config(args), quiet=args.quiet)
     if args.github:
         factory.github.enabled = True
-    with factory.sandbox:
+    with _server_for(factory), factory.sandbox:
         factory.phase_release()
     factory.save("release")
     criteria = factory.state.metrics.get("completion", {})
@@ -336,12 +354,36 @@ def cmd_doctor(args) -> int:
     print(f"config    {config.path or 'built-in defaults'}")
     resources = probe_resources()
     print(f"resources {resources}")
+    from .server import unit_state
+    unit = str(config.get("server.unit") or "")
+    autostart = bool(config.get("server.autostart", True))
+    state = unit_state(unit) if unit else "not configured"
+    router = Router(config)
+    # Resolved in its own pass, and before any endpoint is probed, so that a
+    # config fault — an empty model name, a hosted base_url — can never be
+    # excused below as a server that has merely not been started yet. Only
+    # routed roles, so an unused role nothing would ever call cannot fail this.
     try:
-        for line in Router(config).preflight():
-            print(f"model     {line}")
+        for task in router.routed_tasks():
+            config.model_for(task)
     except ConfigError as exc:
         print(f"model     FAIL {exc}", file=sys.stderr)
         ok = False
+    else:
+        try:
+            for line in router.preflight():
+                print(f"model     {line}")
+        except ConfigError as exc:
+            if autostart and state in ("inactive", "activating", "deactivating"):
+                # Not a fault: the run that needs the server is what starts
+                # it, and between runs it is meant to be down.
+                print(f"model     {unit} is {state}; the next run starts it")
+            else:
+                print(f"model     FAIL {exc}", file=sys.stderr)
+                ok = False
+    if unit:
+        print(f"server    {unit} {state}"
+              f"{'' if autostart else ' (autostart off: start it yourself)'}")
     sandbox_cfg = config.get("sandbox", {})
     probe = Sandbox(Path.cwd(), sandbox_cfg)
     print(f"sandbox   runtime={probe.runtime} image={sandbox_cfg.get('image')} "

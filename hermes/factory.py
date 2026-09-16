@@ -25,6 +25,7 @@ from .planning import architect, decompose, generate_tickets, intake
 from .research import investigate, topics_for
 from .resources import Governor
 from .sandbox import Sandbox
+from .server import running as server_running
 from .sources import STORE as SOURCE_STORE, Librarian
 from .state import State, checkpoint
 from .tickets import Board
@@ -634,6 +635,15 @@ class Factory:
                       resources=self.resources)
         if self.config.get("git.enabled", True):
             self.repo.init()
+        # The inference server is needed for exactly as long as this call runs,
+        # which is why it is started here instead of at boot. Leaving the block
+        # releases it, so neither a preflight failure nor a crash in the loop
+        # leaves a model sitting in VRAM.
+        with server_running(self.config, self.router, self.log):
+            self._loop(limit, deadline)
+        return self.state
+
+    def _loop(self, limit: int, deadline: float | None) -> None:
         self.router.preflight()
         started = time.time()
         with self.sandbox:
@@ -668,7 +678,6 @@ class Factory:
         self.log.info("factory.stop", phase=self.state.phase,
                       iterations=self.state.iteration,
                       elapsed=self.state.metrics["elapsed_seconds"])
-        return self.state
 
     def _recover_phase(self, phase: str, exc: Exception) -> None:
         count = self.state.record_failure(f"phase:{phase}")

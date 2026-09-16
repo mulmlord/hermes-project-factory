@@ -7,16 +7,18 @@
 # agent layer is installed alongside it, in an environment of its own.
 #
 # It then sets up the model server Hermes talks to: vLLM, serving one local
-# model on port 6767, under a systemd user unit that starts at boot and
-# restarts on failure. You are asked once where the model is — a directory you
-# already have, or a Hugging Face repository to download and where to keep it.
-# Nothing is guessed silently and no hosted API is ever contacted.
+# model on port 6767, under a systemd user unit that restarts on failure.
+# Hermes starts that unit when a project starts or continues and stops it when
+# the run ends, so the model is not holding VRAM while nothing is using it.
+# You are asked once where the model is — a directory you already have, or a
+# Hugging Face repository to download and where to keep it. Nothing is guessed
+# silently and no hosted API is ever contacted.
 #
 # Usage: ./install.sh [--dev] [--system] [--bin DIR] [--venv DIR]
 #                     [--no-docker-image] [--no-config] [--no-openhands]
 #                     [--model REPO_OR_NAME] [--model-path DIR] [--models-dir DIR]
 #                     [--port N] [--max-model-len N] [--gpu-util F]
-#                     [--no-server] [--no-boot] [--force-config]
+#                     [--no-server] [--boot] [--force-config]
 #
 #   --dev              also install the test dependencies
 #   --system           link into /usr/local/bin instead of ~/.local/bin (sudo)
@@ -32,7 +34,7 @@
 #   --max-model-len N  context length vLLM serves (default: 16384)
 #   --gpu-util F       fraction of VRAM vLLM may use (default: 0.90)
 #   --no-server        install nothing for vLLM and start no server
-#   --no-boot          install the unit but do not start it at boot
+#   --boot             also run the server at boot, not just during a run
 #   --force-config     rewrite an existing config to point at this server
 set -euo pipefail
 
@@ -49,7 +51,7 @@ OPENHANDS=1
 # -- model server defaults ---------------------------------------------------
 
 SERVER=1
-BOOT=1
+BOOT=0          # --boot: run the server whether or not a project is running
 FORCE_CONFIG=0
 PORT=6767
 MODEL_REPO=""
@@ -149,9 +151,9 @@ while [ $# -gt 0 ]; do
     --max-model-len)   MAX_MODEL_LEN="${2:?--max-model-len needs a number}"; shift ;;
     --gpu-util)        GPU_UTIL="${2:?--gpu-util needs a fraction}"; shift ;;
     --no-server)       SERVER=0 ;;
-    --no-boot)         BOOT=0 ;;
+    --boot)            BOOT=1 ;;
     --force-config)    FORCE_CONFIG=1 ;;
-    -h|--help)         sed -n '3,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)         sed -n '3,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)                 die "unknown option: $1 (try --help)" ;;
   esac
   shift
@@ -310,12 +312,18 @@ fi
 
 # vLLM, one model, port 6767, under a systemd user unit. A unit rather than a
 # shell command because the factory runs for hours and every agent call needs
-# the server already up: an operator who has to remember to start it by hand is
-# a dependency the autonomous loop cannot satisfy at 04:00.
+# the server up: something has to own restarts, and an operator who must
+# remember to start it by hand is a dependency the loop cannot satisfy at 04:00.
+#
+# The unit is installed but *not* enabled. vLLM pins the whole model in VRAM
+# for as long as it lives, so a server running since boot is gigabytes of GPU
+# given to an idle process. Hermes starts the unit when a project starts or
+# continues and stops it when the run ends (server.autostart in the config).
+# This install starts it once, so you can see it work. --boot opts into the
+# old behaviour: enabled, plus lingering so it survives logout.
 #
 # A *user* unit, not a system one, so nothing here needs root and the weights
-# stay readable by you alone. The catch is that user units die with the last
-# session unless lingering is on, which is what BOOT turns on below.
+# stay readable by you alone.
 serve_model() {
   if [ "$SERVER" -eq 0 ]; then
     note "skipping the model server (--no-server)"
@@ -452,9 +460,9 @@ EOF
   systemctl --user daemon-reload || warn "could not reload the user systemd manager"
 
   if [ "$BOOT" -eq 1 ]; then
-    # Without lingering a user unit stops at logout and never comes back until
-    # the next interactive login, which is exactly the "start it by hand every
-    # time" problem the unit exists to remove.
+    # --boot: the server runs whether or not a project does. Lingering is the
+    # piece that makes that true at boot rather than at next login, because a
+    # user unit otherwise stops with the last session.
     if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" = "yes" ]; then
       note "lingering is already enabled for $USER"
     elif loginctl enable-linger "$USER" 2>/dev/null; then
@@ -465,13 +473,17 @@ EOF
       warn "could not enable lingering: the server will start when you log in,"
       warn "not at boot. Run: sudo loginctl enable-linger $USER"
     fi
-    note "starting $UNIT_NAME"
+    note "enabling $UNIT_NAME at boot and starting it now"
     systemctl --user enable --now "$UNIT_NAME" \
       || warn "could not start $UNIT_NAME; see: systemctl --user status $UNIT_NAME"
   else
-    note "installed $UNIT_NAME but left it stopped (--no-boot)"
-    note "start it with: systemctl --user enable --now $UNIT_NAME"
-    return 0
+    # Left disabled deliberately: Hermes starts it per run. Started once here
+    # so the install proves the model actually loads on this GPU, rather than
+    # deferring that discovery to the first project.
+    note "starting $UNIT_NAME once to check the model loads"
+    note "it is not enabled at boot: Hermes starts it when a project starts"
+    systemctl --user start "$UNIT_NAME" \
+      || warn "could not start $UNIT_NAME; see: systemctl --user status $UNIT_NAME"
   fi
 
   # Loading several gigabytes onto the GPU takes minutes, and every command
@@ -521,6 +533,15 @@ note "checking the local inference server"
      that the config names the model it serves. Hermes will not fall back to
      a cloud API."
 
+# The check above is the only reason the server was started, and it is done.
+# Handing the VRAM back now is what "runs while a project runs" means; the
+# alternative is a model resident until the next reboot on the chance that a
+# project follows the install.
+if [ "$SERVER" -eq 1 ] && [ "$BOOT" -eq 0 ] && [ -f "$UNIT_DIR/$UNIT_NAME" ]; then
+  note "stopping $UNIT_NAME; Hermes starts it when a project starts"
+  systemctl --user stop "$UNIT_NAME" || warn "could not stop $UNIT_NAME"
+fi
+
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) warn "$BIN_DIR is not on your PATH. Add this to your shell profile:"
@@ -531,11 +552,16 @@ cat <<EOF
 
 ==> installed.
 
-The model server runs as a systemd user unit and comes back on boot:
+The model server runs as a systemd user unit, started by the run that needs
+it and stopped when that run ends, so no model sits in VRAM in between:
 
     systemctl --user status $UNIT_NAME
     journalctl --user -u $UNIT_NAME -f     # what it is doing
-    systemctl --user restart $UNIT_NAME    # after editing the unit
+    systemctl --user start $UNIT_NAME      # bring it up by hand
+
+A server you started yourself is left alone at the end of a run. To keep it
+resident between runs, set 'stop_after_run: false' under 'server'; to have it
+running at boot regardless, re-run with --boot.
 
 Start a project from any directory:
 

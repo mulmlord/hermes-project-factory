@@ -100,6 +100,10 @@ class StubRouter:
     def preflight(self):
         return ["stub ok"]
 
+    def routed_tasks(self):
+        # No endpoint at all, so the loop starts no inference server.
+        return []
+
     def complete(self, task, system, prompt, **kw):
         return json.dumps(self._answer(prompt))
 
@@ -426,3 +430,42 @@ def test_failed_gates_send_ticket_back(tmp_path, monkeypatch):
                for t in calc.values()), built.board.summary()
     assert built.state.phase != "COMPLETED" or not all(
         built.state.metrics.get("completion", {}).values())
+
+
+def test_a_run_starts_the_model_server_and_stops_it_afterwards(factory, monkeypatch):
+    """Nothing else brings the server up: the unit is installed but not enabled.
+
+    So the wiring matters as much as the mechanism — a run that forgot to
+    start it would fail preflight on a machine where everything is installed
+    correctly, and one that forgot to stop it would leave the model in VRAM.
+    """
+    from types import SimpleNamespace
+
+    calls = []
+    up = {"now": False}
+
+    def systemctl(args):
+        calls.append(args[0])
+        if args[0] == "cat":
+            return 0, "[Unit]\n"
+        if args[0] == "start":
+            up["now"] = True
+        if args[0] == "stop":
+            up["now"] = False
+        return 0, ""
+
+    def available_models():
+        if not up["now"]:
+            raise RuntimeError("connection refused")
+        return ["stub:model"]
+
+    monkeypatch.setattr("hermes.server._systemctl", systemctl)
+    monkeypatch.setattr(factory.router, "routed_tasks", lambda: ["coding"],
+                        raising=False)
+    monkeypatch.setattr(factory.router, "backend", lambda task: SimpleNamespace(
+        cfg=SimpleNamespace(base_url="http://localhost:6767/v1"),
+        available_models=available_models), raising=False)
+
+    factory.run(max_iterations=1)
+    assert calls == ["cat", "start", "stop"]
+    assert not up["now"]

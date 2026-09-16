@@ -122,9 +122,9 @@ unlink_command hermes
 # Stopped before the environment it runs from is deleted, or systemd keeps
 # restarting a unit whose ExecStart has just vanished.
 #
-# Lingering is deliberately left enabled: install.sh may have turned it on,
-# but other user services of yours may now depend on it, and silently
-# switching it off would stop them at your next logout.
+# Lingering is deliberately left enabled where it is on: only `install.sh
+# --boot` turns it on, but other user services of yours may depend on it by
+# now, and silently switching it off would stop them at your next logout.
 if [ "$SERVER" -eq 1 ]; then
   if [ -f "$UNIT_DIR/$UNIT_NAME" ]; then
     note "stopping and removing $UNIT_NAME"

@@ -157,6 +157,25 @@ def is_local_url(url: str) -> bool:
     return addr.is_loopback or addr.is_private or addr.is_link_local
 
 
+def user_config_paths() -> list[Path]:
+    """Where a per-user config may live, in precedence order.
+
+    install.sh and uninstall.sh both address this file as
+    ``${XDG_CONFIG_HOME:-$HOME/.config}/hermes/config.yaml``. Honouring only
+    the second half of that would mean the installer writes the name of the
+    model it is serving into a file Hermes never reads. ``~/.config`` stays in
+    the list regardless, because installs predating this wrote there.
+    """
+    paths = []
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        paths.append(Path(xdg) / "hermes" / "config.yaml")
+    fallback = Path.home() / ".config" / "hermes" / "config.yaml"
+    if fallback not in paths:
+        paths.append(fallback)
+    return paths
+
+
 def deep_merge(base: dict, override: dict) -> dict:
     out = copy.deepcopy(base)
     for key, value in (override or {}).items():
@@ -176,7 +195,7 @@ class Config:
     def load(cls, path: str | os.PathLike | None = None) -> "Config":
         candidates = [Path(path)] if path else [
             Path.cwd() / "hermes.yaml",
-            Path.home() / ".config" / "hermes" / "config.yaml",
+            *user_config_paths(),
         ]
         for candidate in candidates:
             if candidate.is_file():

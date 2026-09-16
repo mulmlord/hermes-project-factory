@@ -240,9 +240,10 @@ installer never created. To finish, delete this repository.
 
 ## Configuration
 
-Hermes reads `hermes.yaml` from the working directory, or
-`~/.config/hermes/config.yaml`. Print a starter file with
-`hermes config --sample`.
+Hermes reads `hermes.yaml` from the working directory, then
+`$XDG_CONFIG_HOME/hermes/config.yaml` if that variable is set, then
+`~/.config/hermes/config.yaml` — the same file the installer writes. Print a
+starter file with `hermes config --sample`.
 
 ```yaml
 models:

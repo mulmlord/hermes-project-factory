@@ -59,6 +59,33 @@ def test_deep_merge_keeps_untouched_defaults():
     assert merged == {"a": {"b": 9, "c": 2}}
 
 
+def test_config_is_read_from_where_the_installer_writes_it(tmp_path, monkeypatch):
+    """Both scripts write to $XDG_CONFIG_HOME/hermes/config.yaml when it is set.
+
+    Reading only ~/.config would mean the installer records the served model's
+    name somewhere Hermes never looks, and the factory would silently run on
+    built-in defaults naming a model the server does not serve.
+    """
+    from pathlib import Path
+    from hermes.config import user_config_paths
+
+    cfg = tmp_path / "hermes" / "config.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("models:\n  default:\n    backend: vllm\n"
+                   "    base_url: http://localhost:6767/v1\n    model: served-model\n")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)  # no hermes.yaml here, so the user config wins
+
+    loaded = Config.load()
+    assert loaded.path == cfg
+    assert loaded.model_for("coding").model == "served-model"
+
+    # Unset, the historical location is still the one used.
+    monkeypatch.delenv("XDG_CONFIG_HOME")
+    assert cfg not in user_config_paths()
+    assert user_config_paths() == [Path.home() / ".config" / "hermes" / "config.yaml"]
+
+
 def test_defaults_address_the_server_install_sh_starts():
     """install.sh serves vLLM on 6767; the built-in defaults must agree.
 

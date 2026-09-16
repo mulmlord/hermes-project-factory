@@ -1334,6 +1334,35 @@ def test_an_escape_from_the_worktree_is_refused(tmp_path):
     work.discard("hermes/improve-planner-3")
 
 
+def test_a_candidate_that_changed_nothing_is_never_judged(tmp_path):
+    """A proposal whose every path is refused leaves the tree as it was.
+
+    `admissible` lets it through -- the paths name the hermes package -- and
+    `apply` then drops each one, so the suite would be passing the code that
+    is already live. Scored, that is a free pass: hand in a before/after pair
+    and an empty commit gets promoted as the change those numbers measured.
+    """
+    from hermes.improve import Improvement
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    _repo(root)
+    work = Improvement(root)
+
+    record = work.attempt("planner", {"rationale": "sneak", "files": [
+        {"path": "hermes/../pytest.ini", "content": "[pytest]\ntestpaths = none\n"},
+        {"path": "hermes/../../escaped.py", "content": "nope"}]})
+
+    assert "the current tree" in record.refusal
+    assert not record.passed and not record.gates
+    assert not (root / "pytest.ini").exists()
+    # The refused attempt leaves no branch or worktree behind either.
+    assert record.branch == ""
+    branches = subprocess.run(["git", "branch", "--list", "hermes/improve-*"],
+                              cwd=root, capture_output=True, text=True)
+    assert branches.stdout.strip() == ""
+
+
 def test_nothing_is_promoted_without_passing_every_gate(tmp_path):
     from hermes.improve import Attempt, Improvement
     from hermes.verify import Gate

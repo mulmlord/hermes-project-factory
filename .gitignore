@@ -4,9 +4,15 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+# The vLLM and OpenHands layers get environments of their own beside the
+# factory's, so the `.venv/` pattern above does not cover them.
+.venv-*/
 build/
 dist/
 projects/
+# Worktrees holding candidate self-modifications, one per attempt. Only a
+# promoted change survives, and it survives as a commit rather than as this.
+.hermes-improve/
 .headroom/
 .serena/
 .claude/.headroom_wrap_*

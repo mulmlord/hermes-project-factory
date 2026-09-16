@@ -78,8 +78,14 @@ text box a human can steer it from.
 ## Requirements
 
 - Python 3.10 or newer
-- A local inference server: Ollama, or anything OpenAI-compatible such as
-  `llama.cpp`'s server or vLLM
+- An NVIDIA GPU with current drivers. `install.sh` sets up the model server
+  for you — vLLM, one model, port 6767 — and the published vLLM wheels are
+  CUDA builds. Without a GPU the installer skips the server and leaves you to
+  point `models.default` at a server you run yourself; Ollama, `llama.cpp` and
+  any other OpenAI-compatible endpoint stay fully supported in config.
+- VRAM enough for the model you choose. vLLM keeps the entire model resident
+  and has no CPU offload, so an 8 GiB card means a 7B 4-bit model, not a 30B
+  one. The default is a 7B AWQ coder at roughly 5 GiB.
 - Docker, strongly recommended. Without it Hermes falls back to local
   subprocess execution, which is a much weaker isolation guarantee.
 - A project directory the Docker engine can actually bind-mount. Under Docker
@@ -91,9 +97,12 @@ text box a human can steer it from.
 - Optionally the OpenHands agent layer. Its CLI pins CPython 3.12, so
   `install.sh` gives it an environment of its own rather than sharing Hermes';
   `uv` provisions that interpreter for you if you have it.
+- `uv` is also how vLLM gets a supported interpreter, since it has no wheels
+  for the newest CPython releases yet.
 
-Hermes itself needs one third-party package: PyYAML. OpenHands, when you
-install it, keeps its own dependency tree out of Hermes' virtualenv.
+Hermes itself needs one third-party package: PyYAML. vLLM and OpenHands each
+get an environment of their own, so neither drags torch nor a hosted-provider
+SDK into the factory's virtualenv.
 
 ## Install
 
@@ -102,10 +111,23 @@ $ ./install.sh
 ```
 
 It builds a virtualenv for the factory, installs it, links `hpf` and `hermes`
-into `~/.local/bin`, writes a starter config to `~/.config/hermes/config.yaml`
-if you have none, pre-pulls the sandbox image, installs the OpenHands agent
-layer beside Hermes, and finishes by running `hermes doctor`. It installs no
-model: Hermes is local-model-only and will not guess which one you want.
+into `~/.local/bin`, pre-pulls the sandbox image, installs the OpenHands agent
+layer beside Hermes, sets up the vLLM model server described below, writes a
+config matching the model it is serving, and finishes by running
+`hermes doctor`.
+
+It asks exactly one question, once: which model to serve. Either a Hugging
+Face repository to download and where to keep the weights, or a directory of
+weights you already have. Nothing else is asked, and nothing is downloaded
+behind your back — run it without a terminal and it tells you which flag to
+pass rather than fetching gigabytes unattended.
+
+The slow steps report progress. Where the underlying tool already prints real
+byte counts — `uv` and `hf download`, which together account for most of the
+wait — that output is left to speak for itself; the silent steps get a
+spinner with elapsed time, and the wait for vLLM to load the weights gets a
+bar against its timeout. Piped to a file it degrades to one line per step
+instead of a megabyte of carriage returns.
 
 Nothing is installed for the Feynman research workflow, because it is part of
 Hermes itself rather than a package.
@@ -117,7 +139,48 @@ Hermes itself rather than a package.
 | `--bin DIR`, `--venv DIR` | choose where the commands and the virtualenv go |
 | `--no-docker-image` | skip pre-pulling the sandbox image |
 | `--no-config` | leave `~/.config/hermes/config.yaml` alone |
+| `--force-config` | rewrite an existing config to point at this server |
 | `--no-openhands` | skip the optional OpenHands agent layer |
+| `--model REPO` | Hugging Face repository to download and serve |
+| `--model-path DIR` | serve a directory of weights you already have |
+| `--models-dir DIR` | where downloaded weights are stored |
+| `--port N` | port vLLM listens on (default `6767`) |
+| `--max-model-len N` | context vLLM serves (default `16384`) |
+| `--gpu-util F` | fraction of VRAM vLLM may use (default `0.90`) |
+| `--no-server` | install nothing for vLLM and start no server |
+| `--no-boot` | install the unit but do not start it at boot |
+
+## Model server
+
+The factory talks to one vLLM server on `http://localhost:6767/v1`, installed
+as a **systemd user unit** called `hermes-vllm.service`. It starts at boot and
+restarts on failure, so the server is simply always up — a run that lasts
+hours cannot depend on someone remembering to start a model first.
+
+```console
+$ systemctl --user status hermes-vllm.service
+$ journalctl --user -u hermes-vllm.service -f
+$ systemctl --user restart hermes-vllm.service
+```
+
+A user unit, not a system one, so nothing runs as root and the weights stay
+readable by you alone. User units normally stop at logout, so the installer
+also enables lingering (`loginctl enable-linger`) — that is the part that
+makes "at boot" true rather than "at next login". Pass `--no-boot` to install
+the unit without starting or enabling it.
+
+Serving is offline: the unit sets `HF_HUB_OFFLINE=1` and points vLLM at a
+directory on disk, so the server never reaches the network once the weights
+are downloaded. The name vLLM answers to is the weights directory's name, and
+the config is written with that same string, because `hermes doctor` compares
+what is configured against what `/v1/models` reports.
+
+To change model later, re-run `./install.sh --model REPO` (or `--model-path`),
+or edit the unit and `systemctl --user restart` it. Keep `context` in the
+config equal to the server's `--max-model-len`: vLLM reserves the KV cache for
+the full context at startup, which makes it a VRAM commitment rather than a
+ceiling, and it is the usual reason a server installs cleanly and then fails
+to load.
 
 A virtualenv rather than a `--user` install, because most distributions now
 mark the system interpreter externally managed and `pip` refuses to write to
@@ -131,6 +194,9 @@ $ pip install -e .
 $ hermes doctor
 ```
 
+That installs the factory only — no model server — so you would be pointing
+`models.default` at a server you start yourself.
+
 `hermes doctor` checks that every routed model is actually installed on your
 local server, that the sandbox runtime works, and that the tooling is present.
 It refuses to guess.
@@ -141,19 +207,31 @@ It refuses to guess.
 $ ./uninstall.sh
 ```
 
-It removes the virtualenv, the `hpf` and `hermes` links, the editable-install
-leftovers in this repository and the OpenHands agent layer. It keeps your
-config, because the model routing in it is yours rather than something the
-installer wrote, and it keeps the sandbox image, because `python:3.11-slim` is
-a stock image other containers may share. A link on your PATH that points
-somewhere other than the environments being removed is left alone.
+It stops and removes the `hermes-vllm.service` unit, the virtualenvs for the
+factory, vLLM and OpenHands, the `hpf` and `hermes` links, and the
+editable-install leftovers in this repository. It keeps the sandbox image,
+because `python:3.11-slim` is a stock image other containers may share, and it
+keeps the downloaded weights, because those are gigabytes you would have to
+fetch again. A link on your PATH that points
+somewhere other than the environments being removed is left alone, and
+lingering is left enabled, since other user services of yours may now rely on
+it.
+
+Your config is kept — the routing in it is yours — but the endpoint of the
+removed server is retired in place: the model name is emptied and the dead
+`base_url` is marked as such, so Hermes fails with "no model name/path
+configured" rather than advising you to start a server that no longer exists.
+The original is saved as `config.yaml.bak`. A config pointing somewhere other
+than a local vLLM is left untouched.
 
 | Flag | Effect |
 |---|---|
-| `--config` | also delete `~/.config/hermes/config.yaml` |
+| `--config` | delete `~/.config/hermes/config.yaml` instead of retiring the endpoint in it |
 | `--docker-image` | also delete the pre-pulled sandbox image |
-| `--all` | both of the above |
+| `--models` | also delete the downloaded model weights |
+| `--all` | `--config` and `--docker-image`, but not `--models` |
 | `--keep-openhands` | leave the OpenHands agent layer installed |
+| `--keep-server` | leave the vLLM unit and environment installed |
 | `--system`, `--bin DIR`, `--venv DIR` | mirror the install flags |
 | `--dry-run` | report what would be removed, remove nothing |
 
@@ -162,25 +240,32 @@ installer never created. To finish, delete this repository.
 
 ## Configuration
 
-Hermes reads `hermes.yaml` from the working directory, or
-`~/.config/hermes/config.yaml`. Print a starter file with
-`hermes config --sample`.
+Hermes reads `hermes.yaml` from the working directory, then
+`$XDG_CONFIG_HOME/hermes/config.yaml` if that variable is set, then
+`~/.config/hermes/config.yaml` — the same file the installer writes. Print a
+starter file with `hermes config --sample`.
 
 ```yaml
 models:
   default:
-    backend: ollama
+    backend: vllm                    # vllm | openai | llamacpp | ollama
+    base_url: http://localhost:6767/v1
+    model: qwen2.5-coder-7b-instruct-awq
+    context: 16384                   # must match the server's --max-model-len
+  reasoner:
+    backend: ollama                  # a second server, if you run one
     base_url: http://localhost:11434
     model: qwen3:30b-a3b
-  coder:
-    backend: openai
-    base_url: http://localhost:8080/v1
-    model: qwen2.5-coder-32b
 
 routing:
-  coding: coder
-  evolution: coder
+  architecture: reasoner
+  research: reasoner
 ```
+
+Routing every role to one model is usually right on a single GPU: two models
+that are not co-resident turn every role switch into a full model load, and
+the loop switches roles several times per ticket. `hermes doctor` warns when
+the config asks for more than one.
 
 Any endpoint that is not loopback or a private address is refused unless you
 set `allow_remote: true` on that model, which exists for a server you host
@@ -222,6 +307,7 @@ release, and it blocks completion regardless of whether the tests pass.
 | `hermes benchmark` | run the project's benchmark and report the score |
 | `hermes evolve -g 30` | run evolutionary optimisation |
 | `hermes eval` | build a fixed suite of ideas and report what the factory cost |
+| `hermes improve --target planner` | improve Hermes itself, under gates |
 | `hermes release --github` | clean-room validate, tag, and publish |
 | `hermes checkpoint` | list, create or restore a checkpoint |
 | `hermes doctor` | verify models, sandbox and tooling |
@@ -300,6 +386,33 @@ model and the machine. The first-pass rate and the GPU/CPU split are the two
 numbers that say which. It is also the precondition for the factory improving
 its own components: a self-modification that cannot be measured cannot be
 promoted.
+
+## Improving the factory
+
+`hermes improve --target planner` lets Hermes change one of its own
+components. Section 35 permits that only under conditions, and each one is
+enforced here rather than asked for in a prompt:
+
+- The candidate is built as a git worktree on its own branch. The checkout
+  Hermes is running from is never switched, so a candidate cannot rewrite the
+  source of the process that is evaluating it.
+- A change touching the test suite, the evaluation harness or the promotion
+  gate itself is refused before it is evaluated, and the trusted copies are
+  restored into the worktree before the suite runs. The cheapest way to pass
+  a suite is to delete it, and a loop able to do that eventually will.
+- Promotion needs the Hermes suite to pass *and* a measured benefit — `hermes
+  eval` on each side, handed over as `--before` and `--after`. Without that
+  evidence the gate refuses, so on a machine with no local model nothing is
+  promotable. That is the correct answer rather than an obstacle.
+- A promoted change is merged and then the suite is run again on the live
+  tree, because a change can pass alone and fail in company. A failure there
+  resets it.
+
+Benchmark infrastructure is deliberately absent from the target list: it
+lives in the harness, which is protected, so the factory cannot rewrite the
+instrument it is judged by. None of this runs inside the autonomous project
+loop — a factory building someone's project has no business rewriting itself
+halfway through.
 
 ## Limitations
 

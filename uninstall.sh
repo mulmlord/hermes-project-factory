@@ -2,21 +2,31 @@
 #
 # Uninstall the Hermes Project Factory.
 #
-# Undoes ./install.sh: removes the factory virtualenv, the `hpf` and `hermes`
-# commands, the editable-install leftovers in this repository, and the optional
-# OpenHands agent layer. It leaves your config and the sandbox image alone
-# unless you ask for them, because the config holds the model routing you wrote
-# by hand and the image is a stock one other containers may share.
+# Undoes ./install.sh: stops and removes the vLLM model server unit, removes
+# the factory and vLLM virtualenvs, the `hpf` and `hermes` commands, the
+# editable-install leftovers in this repository, and the optional OpenHands
+# agent layer. It leaves the sandbox image and the downloaded model weights
+# alone unless you ask for them: the image is a stock one other containers
+# may share, and the weights are gigabytes you would have to fetch again.
+#
+# Your config is kept, because the model routing in it is yours, but the
+# endpoint of the server being removed is retired in place so the file stops
+# describing a server that no longer exists. The original is saved as
+# config.yaml.bak.
 #
 # It never touches generated projects. Those are ordinary directories you own.
 #
-# Usage: ./uninstall.sh [--config] [--docker-image] [--all] [--keep-openhands]
+# Usage: ./uninstall.sh [--config] [--docker-image] [--models] [--all]
+#                       [--keep-openhands] [--keep-server]
 #                       [--system] [--bin DIR] [--venv DIR] [--dry-run]
 #
-#   --config           also delete ~/.config/hermes/config.yaml
+#   --config           delete ~/.config/hermes/config.yaml instead of
+#                      retiring the endpoint inside it
 #   --docker-image     also delete the pre-pulled sandbox image
-#   --all              --config and --docker-image together
+#   --models           also delete the downloaded model weights
+#   --all              --config and --docker-image together (not --models)
 #   --keep-openhands   leave the OpenHands agent layer installed
+#   --keep-server      leave the vLLM server unit and environment installed
 #   --system           unlink from /usr/local/bin instead of ~/.local/bin (sudo)
 #   --bin DIR          unlink the commands from DIR
 #   --venv DIR         remove the virtualenv in DIR (default: <repo>/.venv)
@@ -26,10 +36,16 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$REPO/.venv"
 OH_VENV="$REPO/.venv-openhands"
+VLLM_VENV="$REPO/.venv-vllm"
 BIN_DIR="$HOME/.local/bin"
+UNIT_NAME="hermes-vllm.service"
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+MODELS_DIR="${HERMES_MODELS_DIR:-$HOME/.local/share/hermes/models}"
 CONFIG=0
 IMAGE=0
+MODELS=0
 OPENHANDS=1
+SERVER=1
 DRY=0
 
 note() { printf '==> %s\n' "$*"; }
@@ -40,13 +56,15 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --config)         CONFIG=1 ;;
     --docker-image)   IMAGE=1 ;;
+    --models)         MODELS=1 ;;
     --all)            CONFIG=1; IMAGE=1 ;;
     --keep-openhands) OPENHANDS=0 ;;
+    --keep-server)    SERVER=0 ;;
     --system)         BIN_DIR="/usr/local/bin" ;;
     --bin)            BIN_DIR="${2:?--bin needs a directory}"; shift ;;
     --venv)           VENV="${2:?--venv needs a directory}"; shift ;;
     --dry-run)        DRY=1 ;;
-    -h|--help)        sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)        sed -n '3,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)                die "unknown option: $1 (try --help)" ;;
   esac
   shift
@@ -98,6 +116,40 @@ unlink_command() {
 note "unlinking commands from $BIN_DIR"
 unlink_command hpf
 unlink_command hermes
+
+# -- model server ------------------------------------------------------------
+
+# Stopped before the environment it runs from is deleted, or systemd keeps
+# restarting a unit whose ExecStart has just vanished.
+#
+# Lingering is deliberately left enabled: install.sh may have turned it on,
+# but other user services of yours may now depend on it, and silently
+# switching it off would stop them at your next logout.
+if [ "$SERVER" -eq 1 ]; then
+  if [ -f "$UNIT_DIR/$UNIT_NAME" ]; then
+    note "stopping and removing $UNIT_NAME"
+    if [ "$DRY" -eq 1 ]; then
+      note "would run: systemctl --user disable --now $UNIT_NAME"
+    else
+      systemctl --user disable --now "$UNIT_NAME" 2>/dev/null \
+        || warn "could not stop $UNIT_NAME; removing the unit file anyway"
+    fi
+    remove "$UNIT_DIR/$UNIT_NAME"
+    [ "$DRY" -eq 0 ] && systemctl --user daemon-reload 2>/dev/null || true
+  else
+    note "no $UNIT_NAME unit installed"
+  fi
+
+  if [ -f "$VLLM_VENV/pyvenv.cfg" ]; then
+    note "removing the vLLM environment"
+    remove "$VLLM_VENV"
+  fi
+
+  if command -v loginctl >/dev/null 2>&1 \
+     && [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" = "yes" ]; then
+    note "leaving lingering enabled for $USER (disable: loginctl disable-linger $USER)"
+  fi
+fi
 
 # -- virtualenv --------------------------------------------------------------
 
@@ -154,6 +206,47 @@ if [ "$CONFIG" -eq 1 ]; then
   fi
 elif [ -f "$CONFIG_FILE" ]; then
   note "keeping your config at $CONFIG_FILE (--config removes it)"
+  # A kept config that still names the server just deleted is worse than no
+  # config: Hermes would report the endpoint as unreachable and advise
+  # starting it, which is bad advice once the unit and the weights are gone.
+  # So the endpoint is retired rather than left to lie. The model name is
+  # emptied, which makes Hermes fail at load with "no model name/path
+  # configured" — the accurate complaint — instead of blaming the network.
+  #
+  # Only when this run actually removed the server, and only for a config
+  # pointing at a local vLLM. The original is kept beside it either way.
+  if [ "$SERVER" -eq 1 ] \
+     && grep -q '^[[:space:]]*backend:[[:space:]]*vllm' "$CONFIG_FILE" \
+     && grep -qE '^[[:space:]]*base_url:.*(localhost|127\.0\.0\.1)' "$CONFIG_FILE"; then
+    if [ "$DRY" -eq 1 ]; then
+      note "would retire the vLLM endpoint in $CONFIG_FILE (backup: .bak)"
+    elif cp "$CONFIG_FILE" "$CONFIG_FILE.bak" \
+         && awk -v today="$(date -I 2>/dev/null || date +%Y-%m-%d)" '
+           /^models:/ && !banner {
+             print "# The local vLLM server this config pointed at was removed by"
+             print "# uninstall.sh on " today ". Hermes is local-model-only, so name"
+             print "# the model and endpoint of a server you run, or re-run"
+             print "# install.sh to set one up again."
+             banner = 1
+           }
+           !done_model && /^[[:space:]]*model:[[:space:]]/ {
+             print "    model: \"\"                       # set me: no server is installed"
+             done_model = 1
+             next
+           }
+           !done_base && /^[[:space:]]*base_url:[[:space:]]/ {
+             print $0 "   # dead: this server was uninstalled"
+             done_base = 1
+             next
+           }
+           { print }
+         ' "$CONFIG_FILE.bak" > "$CONFIG_FILE"; then
+      note "retired the vLLM endpoint in $CONFIG_FILE"
+      note "the previous version is at $CONFIG_FILE.bak"
+    else
+      warn "could not rewrite $CONFIG_FILE; it still names the removed server"
+    fi
+  fi
 fi
 
 # -- sandbox image -----------------------------------------------------------
@@ -178,6 +271,21 @@ if [ "$IMAGE" -eq 1 ]; then
   else
     warn "docker is not usable by this user; leaving the sandbox image"
   fi
+fi
+
+# -- model weights -----------------------------------------------------------
+
+# Not part of --all: re-downloading several gigabytes is a slow way to learn
+# that a flag was broader than it looked.
+if [ "$MODELS" -eq 1 ]; then
+  if [ -d "$MODELS_DIR" ]; then
+    note "removing downloaded model weights from $MODELS_DIR"
+    remove "$MODELS_DIR"
+  else
+    note "no downloaded weights at $MODELS_DIR"
+  fi
+elif [ -d "$MODELS_DIR" ]; then
+  note "keeping the model weights in $MODELS_DIR (--models removes them)"
 fi
 
 # -- what is left ------------------------------------------------------------

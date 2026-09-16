@@ -1,14 +1,13 @@
 # Hermes Project Factory configuration. Local models only.
 models:
   default:
-    backend: ollama
-    base_url: http://localhost:11434
-    model: qwen3:30b-a3b
-    context: 32768
+    backend: vllm
+    base_url: http://localhost:6767/v1
+    model: qwen2.5-coder-7b-instruct-awq
+    context: 16384
     temperature: 0.2
     timeout: 1200
     structured_output: true
-    keep_alive: 30m
 
 routing:
   research: default

@@ -334,6 +334,20 @@ class Improvement:
         record.branch = branch
         try:
             record.files = self.apply(worktree, proposal.get("files") or [])
+            if not record.files:
+                # Every path was dropped by apply() -- an escape, an absolute
+                # path, a protected file -- so the candidate is byte for byte
+                # the current tree. Judging it would pass the suite on the
+                # strength of code nobody changed, and a before/after pair
+                # handed in by the operator would then promote an empty commit
+                # as though it were the improvement those numbers measured.
+                record.refusal = ("no proposed file survived path checking, "
+                                  "so the candidate is the current tree")
+                self.log.warn("improve.refused", target=target,
+                              reason=record.refusal)
+                self.discard(branch)
+                record.branch = ""
+                return record
             self.restore_trusted(worktree)
             record.gates = [self.suite(worktree), self.benefit(before, after)]
             if record.passed:

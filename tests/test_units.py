@@ -8,13 +8,12 @@ import pytest
 
 from types import SimpleNamespace
 
-from hermes.agents import Prompt
+from hermes.agents import Prompt, build as build_agents, escalate
 from hermes.config import Config, ConfigError, DEFAULTS, deep_merge, is_local_url
 from hermes.evolve import Bandit, Candidate, Evolution, Objective, parse_score
-from hermes.implement import (Change, _protected, _race, apply_change, execute_ticket,
-                             generate,
-                              relevant_files, restore as restore_files,
-                              snapshot as snapshot_files)
+from hermes.implement import (Change, Ladder, Rung, _protected, _race, apply_change,
+                              execute_ticket, generate, relevant_files,
+                              restore as restore_files, snapshot as snapshot_files)
 from hermes.git_ops import GitHub, Issues
 from hermes.journal import Entry, Journal
 from hermes.log import NULL, Logger, current_scope, scope
@@ -624,7 +623,7 @@ def _agent(answer, task: str = "coding", context: int | None = None,
     router = Router(Config.load()) if context is None else _router(context)
     return SimpleNamespace(ask_json=lambda prompt, **kw: answer(prompt),
                            allowance=lambda: router.allowance(task),
-                           name=name, system="", log=NULL)
+                           name=name, system="", task=task, router=router, log=NULL)
 
 
 #: One attempt each for the review cycle below: the change that clears the
@@ -696,6 +695,137 @@ def test_a_restored_snapshot_does_not_satisfy_the_review(tmp_path):
     assert outcome["status"] == "failed"
     assert sandbox.read("src/a.py") == "value = 'good'\n"  # restored, not the retry's
     assert ticket.status != "completed"
+
+
+# -- escalation --------------------------------------------------------------
+
+def test_the_default_ladder_climbs_and_then_holds():
+    """Each rung inherits the one below it; past the top, effort stops growing."""
+    ladder = Ladder.from_config(Config(deep_merge(DEFAULTS, {})))
+
+    assert ladder.rung(1) == Rung(candidates=1, files=6, role="")
+    assert ladder.rung(2) == Rung(candidates=2, files=10, role="")
+    # The third rung names only a role, and keeps the samples and the files the
+    # second one bought: a ladder never quietly de-escalates.
+    assert ladder.rung(3) == Rung(candidates=2, files=10, role="architect")
+    assert ladder.rung(9) == ladder.rung(3)
+
+
+def test_escalation_can_be_turned_off_entirely():
+    """An operator who wants identical retries must be able to say so."""
+    ladder = Ladder.from_config(Config(deep_merge(
+        DEFAULTS, {"execution": {"candidates": 2, "escalation": []}})))
+
+    assert not ladder.escalates
+    assert ladder.rung(3) == Rung(candidates=2, files=6, role="")
+
+
+def test_a_stronger_role_is_asked_of_the_model_already_resident(tmp_path):
+    """A rung climbs roles, not models: a reload mid-ticket costs more than it buys."""
+    config = Config(deep_merge(DEFAULTS, {
+        "models": {"big": {"backend": "vllm", "base_url": "http://localhost:6868/v1",
+                           "model": "reasoner-70b", "context": 16384}},
+        "routing": {"architecture": "big"}}))
+    agents = build_agents(Router(config))
+
+    escalated = escalate(agents, agents["implementer"], "architect")
+
+    assert escalated.system == agents["architect"].system      # the harder ask
+    assert escalated.task == "coding"                          # the loaded weights
+    assert escalated.router.describe("coding") == "vllm:qwen2.5-coder-7b-instruct-awq"
+
+
+def test_a_stronger_role_on_one_model_is_simply_that_role():
+    """With everything routed to one server there is nothing to pin."""
+    agents = build_agents(Router(Config(deep_merge(DEFAULTS, {}))))
+
+    assert escalate(agents, agents["implementer"], "architect") is agents["architect"]
+    # A ladder naming a role the factory does not have costs a log line.
+    assert escalate(agents, agents["implementer"], "oracle") is agents["implementer"]
+
+
+def _escalating_ticket(tmp_path):
+    """A ticket whose gates only pass on the value 'good', with ten sources."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 30})
+    sandbox.write("src/a.py", "value = 'bad'\n")
+    for index in range(9):
+        sandbox.write(f"src/mod{index}.py", f"# module {index}\n")
+    board = Board(tmp_path)
+    ticket = board.add(title="carry a value", status="ready",
+                       artifacts=["src/a.py"] + [f"src/mod{i}.py" for i in range(9)],
+                       validation=["grep -q good src/a.py"])
+    state = State(idea="carry a value",
+                  plan={"commands": {"build": "true", "test": "true"}})
+    return sandbox, board, ticket, state
+
+
+def test_a_repeated_failure_is_asked_harder_rather_than_asked_again(tmp_path):
+    """Three identical asks are one ask three times over; the ladder changes the ask."""
+    sandbox, board, ticket, state = _escalating_ticket(tmp_path)
+    asked: list[tuple[str, int]] = []
+    prompts: list[str] = []
+
+    def writer(role, value):
+        def reply(prompt):
+            # How many of the ten existing sources this attempt was shown.
+            asked.append((role, prompt.count("--- src/mod")))
+            prompts.append(prompt)
+            return {"summary": "carry the value",
+                    "files": [{"path": "src/a.py", "content": f"value = '{value}'\n"}]}
+        return reply
+
+    agents = {"implementer": _agent(writer("implementer", "bad"), name="implementer"),
+              "tester": _agent(writer("implementer", "bad"), name="tester"),
+              "architect": _agent(writer("architect", "good"), task="architecture",
+                                  name="architect"),
+              "reviewer": _agent(lambda _p: {"approved": True, "advisory": [],
+                                             "security": [], "blocking": []}),
+              "triager": _agent(lambda _p: {"diagnosis": "wrong value",
+                                            "classification": "implementation",
+                                            "action": "repair",
+                                            "instructions": "write the right value"})}
+
+    outcome = execute_ticket(agents, sandbox, state, board, ticket,
+                             lambda: "src/a.py", max_attempts=3,
+                             ladder=Ladder.from_config(Config(deep_merge(DEFAULTS, {}))))
+
+    assert outcome["status"] == "completed"
+    assert sandbox.read("src/a.py") == "value = 'good'\n"
+    # One sample on the first attempt, two raced on the second, and the third
+    # put to the reasoning role instead of the implementer.
+    assert [role for role, _ in asked] == [
+        "implementer", "implementer", "implementer", "architect", "architect"]
+    # And each attempt after the first was shown more of the existing code.
+    assert [files for _, files in asked] == [5, 9, 9, 9, 9]
+    # The role that was swapped in is told why it was, or it reads the same
+    # failure the implementer read and sends the same small patch back.
+    assert "EARLIER ATTEMPTS AT THIS TICKET FAILED" not in prompts[1]
+    assert "decide how the ticket should be implemented instead" in prompts[3]
+
+
+def test_without_a_ladder_every_attempt_is_the_cheapest_ask(tmp_path):
+    """The loop before escalation existed, unchanged."""
+    sandbox, board, ticket, state = _escalating_ticket(tmp_path)
+    asked: list[int] = []
+
+    def reply(prompt):
+        asked.append(prompt.count("--- src/mod"))
+        return {"summary": "carry the value",
+                "files": [{"path": "src/a.py", "content": "value = 'bad'\n"}]}
+
+    agents = {"implementer": _agent(reply), "tester": _agent(reply),
+              "architect": _agent(reply, task="architecture", name="architect"),
+              "reviewer": _agent(lambda _p: {"approved": True, "advisory": [],
+                                             "security": [], "blocking": []}),
+              "triager": _agent(lambda _p: {"diagnosis": "wrong value",
+                                            "classification": "implementation",
+                                            "action": "repair", "instructions": ""})}
+
+    outcome = execute_ticket(agents, sandbox, state, board, ticket,
+                             lambda: "src/a.py", max_attempts=3)
+
+    assert outcome["status"] == "failed"
+    assert asked == [5, 5, 5]   # one sample, six files, three times over
 
 
 # -- workspace lookups -------------------------------------------------------
@@ -2357,6 +2487,26 @@ def test_doctor_excuses_an_idle_server_but_never_a_bad_config(tmp_path, monkeypa
                                   autostart="true"))
     assert cli.cmd_doctor(args) == 1
     assert "not a local endpoint" in capsys.readouterr().err
+
+
+def test_doctor_reports_the_escalation_ladder_and_a_role_that_does_not_exist(
+        tmp_path, monkeypatch, capsys):
+    """A typo in a rung is otherwise found on some ticket's third attempt at 3am."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("hermes.server.unit_state", lambda unit, run=None: "inactive")
+    (tmp_path / "hermes.yaml").write_text(
+        "models:\n  default:\n    backend: vllm\n"
+        "    base_url: http://127.0.0.1:1/v1\n    model: served\n"
+        "execution:\n  escalation:\n    - {candidates: 3}\n    - {role: oracle}\n")
+
+    assert cli.cmd_doctor(SimpleNamespace(config=None)) == 0
+
+    out, err = capsys.readouterr()
+    assert "attempt 1: 1 sample(s), 6 files, implementer" in out
+    assert "attempt 2: 3 sample(s), 6 files, implementer" in out
+    assert "attempt 3+: 3 sample(s), 6 files, oracle" in out
+    # A rung Hermes cannot honour is a warning, not a dead run: it falls back.
+    assert "names no role 'oracle'" in err
 
 
 def test_running_holds_the_server_for_exactly_one_block(monkeypatch):

@@ -40,6 +40,11 @@ research:
 
 execution:
   candidates: 1
+  files: 6
+  escalation:                      # how attempt 2, 3, ... are asked differently
+    - {candidates: 2, files: 10}   # race more samples, show more of the code
+    - {role: architect}            # then ask the reasoning role, on the same
+                                   # model: a rung never reloads weights
   edit_protocol: true
   prefetch: true
   tool_calls: 6

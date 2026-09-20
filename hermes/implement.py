@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .agents import Prompt, context_block, file_protocol, ticket_block
+from .agents import Prompt, context_block, escalate, file_protocol, ticket_block
 from .log import Logger, NULL, scope
 from .sandbox import Sandbox, SandboxError
 from .tools import Lookup, Toolbox
@@ -13,6 +13,61 @@ from .verify import Verification, review, triage, verify_ticket
 
 #: Files an agent may never write, regardless of what it asks for.
 PROTECTED = (".hermes/", ".git/", "hermes.yaml")
+
+
+@dataclass(frozen=True)
+class Rung:
+    """How hard one attempt at a ticket tries.
+
+    *candidates* is how many samples are raced through the gates, *files* how
+    many existing sources the prompt may show, and *role* which agent is
+    asked -- empty meaning the ticket's own implementer or tester.
+    """
+
+    candidates: int = 1
+    files: int = 6
+    role: str = ""
+
+    def harder(self, spec: dict) -> "Rung":
+        """This rung with whatever *spec* names overridden, nothing else."""
+        return Rung(candidates=max(1, int(spec.get("candidates", self.candidates))),
+                    files=max(1, int(spec.get("files", self.files))),
+                    role=str(spec.get("role", self.role)))
+
+
+@dataclass
+class Ladder:
+    """What each successive attempt at a ticket is allowed to spend.
+
+    A failure that is retried identically is a retry, not an escalation: the
+    same model, the same prompt and the same decoding produce the same answer
+    often enough that three attempts cost three times one attempt's chance.
+    So attempt two races more samples and is shown more of the code, and
+    attempt three is asked of a reasoning role rather than the implementer.
+
+    Later rungs inherit the one below them, so a ladder never quietly
+    de-escalates, and the top rung repeats once the list runs out: effort
+    stops growing rather than dropping back to the cheapest ask.
+    """
+
+    rungs: list[Rung] = field(default_factory=lambda: [Rung()])
+
+    def rung(self, attempt: int) -> Rung:
+        return self.rungs[min(max(attempt, 1), len(self.rungs)) - 1]
+
+    @property
+    def escalates(self) -> bool:
+        return len(self.rungs) > 1
+
+    @classmethod
+    def from_config(cls, config) -> "Ladder":
+        """Build the ladder from ``execution.candidates/files/escalation``."""
+        rungs = [Rung(candidates=max(1, int(config.get("execution.candidates", 1))),
+                      files=max(1, int(config.get("execution.files", 6))))]
+        for spec in config.get("execution.escalation") or []:
+            if isinstance(spec, dict):
+                rungs.append(rungs[-1].harder(spec))
+        return cls(rungs)
 
 
 @dataclass
@@ -221,8 +276,12 @@ def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
              instructions: str = "", failure: str = "", prior: str = "",
              hints: list[str] | None = None, *, allow_edits: bool = True,
              temperature: float | None = None, toolbox: Toolbox | None = None,
-             log: Logger = NULL) -> dict:
+             role: str = "", files: int = 6, log: Logger = NULL) -> dict:
     """Ask the right agent for the code that satisfies *ticket*.
+
+    *role* overrides which agent is asked, which is how a repeated failure
+    escalates onto a reasoning role; see :func:`~hermes.agents.escalate`.
+    *files* is how many existing sources the prompt may show it.
 
     *toolbox* lets the agent read the rest of the workspace before it answers.
     The sources below are a guess at what the ticket needs, made from a list
@@ -239,12 +298,24 @@ def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
     the journal, which outranks the file listing.
     """
     agent = agents["tester"] if ticket.kind == "test" else agents["implementer"]
+    if role:
+        agent = escalate(agents, agent, role, log)
     prompt = Prompt(agent, log=log)
     prompt.add("context", context_block(state), required=True)
     prompt.add("ticket", ticket_block(ticket), required=True)
     prompt.add("journal", prior, priority=40, floor=1200)
     prompt.add("tree", f"FILES:\n{tree}", priority=50, floor=400)
     sources = prompt.add("sources", priority=30, floor=2000)
+    if role:
+        # Swapping the role without saying why buys little: the failure text is
+        # the same one the last attempt read, and it argues for the same small
+        # patch. Asking a reasoning role to reconsider the approach is the
+        # strategy change; the role alone is only who is asked.
+        prompt.add("escalation",
+                   "EARLIER ATTEMPTS AT THIS TICKET FAILED. Do not resend the last "
+                   "approach with small edits: work out why it cannot be made to "
+                   "work, decide how the ticket should be implemented instead, and "
+                   "write that.", priority=15)
     if instructions:
         prompt.add("repair", f"REPAIR INSTRUCTIONS:\n{instructions}", priority=10)
     if failure:
@@ -260,13 +331,15 @@ def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
     # what broke is worth more than a sixth file the ticket may not touch.
     header = "EXISTING FILES RELEVANT TO THIS TICKET:\n"
     sources.fill(header + relevant_files(sandbox, ticket, state.plan, hints,
+                                         limit=files,
                                          budget=max(0, sources.room() - len(header))))
     extra = {} if temperature is None else {"temperature": temperature}
     return lookup.ask(**extra)
 
 
 def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
-                   *, journal=None, max_attempts: int = 3, candidates: int = 1,
+                   *, journal=None, max_attempts: int = 3,
+                   ladder: Ladder | None = None,
                    allow_edits: bool = True, prefetched: dict | None = None,
                    tool_calls: int = 6, tool_rounds: int = 3,
                    on_apply=None, log: Logger = NULL) -> dict:
@@ -275,10 +348,14 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
     Returns ``{"status": completed|failed, "action": ..., "verification": ...}``.
     The caller owns board transitions beyond the active/review moves here.
 
+    *ladder* says how each attempt is asked; without one every attempt is the
+    cheapest ask, which is what the loop did before escalation existed.
+
     *tool_calls* and *tool_rounds* bound the workspace lookups each generation
     and each review may make. Every one of them is a fresh toolbox: the budget
     is what one answer may spend, not what the ticket may.
     """
+    ladder = ladder or Ladder()
     def toolbox() -> Toolbox:
         return Toolbox(sandbox, budget=tool_calls, rounds=tool_rounds, log=log)
 
@@ -322,10 +399,13 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
         # belongs to this attempt at this ticket, and says so.
         with scope(ticket=ticket.id, attempt=attempt):
             ticket.attempts += 1
-            log.info("ticket.attempt", title=ticket.title[:60])
+            rung = ladder.rung(attempt)
+            log.info("ticket.attempt", title=ticket.title[:60],
+                     candidates=rung.candidates, files=rung.files,
+                     role=rung.role or "default")
             payloads = _propose(agents, sandbox, state, ticket, tree_fn, instructions,
                                 failure, prior, hints, allow_edits=allow_edits,
-                                wanted=max(1, candidates) if attempt == 1 else 1,
+                                rung=rung,
                                 prefetched=prefetched if attempt == 1 else None,
                                 toolbox=toolbox, log=log)
             if not payloads:
@@ -411,7 +491,7 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
 
 
 def _propose(agents, sandbox, state, ticket, tree_fn, instructions, failure, prior,
-             hints, *, allow_edits: bool, wanted: int, prefetched: dict | None,
+             hints, *, allow_edits: bool, rung: Rung, prefetched: dict | None,
              toolbox, log: Logger) -> list[dict]:
     """Collect the candidate changes to race through the gates.
 
@@ -421,13 +501,13 @@ def _propose(agents, sandbox, state, ticket, tree_fn, instructions, failure, pri
     payloads: list[dict] = []
     if prefetched:
         payloads.append(prefetched)
-    while len(payloads) < wanted:
+    while len(payloads) < rung.candidates:
         try:
             payloads.append(generate(
                 agents, sandbox, state, ticket, tree_fn(), instructions, failure,
                 prior, hints, allow_edits=allow_edits,
                 temperature=None if not payloads else 0.6, toolbox=toolbox(),
-                log=log))
+                role=rung.role, files=rung.files, log=log))
         except Exception as exc:  # model returned nothing usable
             log.error("ticket.generate_failed", ticket=ticket.id, error=str(exc)[:200])
             break

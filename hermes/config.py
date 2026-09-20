@@ -95,6 +95,17 @@ DEFAULTS: dict[str, Any] = {
         "max_loop_iterations": 400,
         "checkpoint_every": 1,
         "candidates": 1,        # independent samples raced through the gates
+        "files": 6,             # existing sources shown to the implementer
+        # How a repeated failure is asked differently. One entry per attempt
+        # after the first; each inherits the rung below it and changes only
+        # what it names, and the top rung repeats once the list runs out.
+        # Roles are deliberately the knob rather than models: routing a retry
+        # to a second model reloads weights, which costs more than the retry
+        # saves. [] disables escalation.
+        "escalation": [
+            {"candidates": 2, "files": 10},   # attempt 2: race more, read more
+            {"role": "architect"},            # attempt 3: ask the reasoning role
+        ],
         "edit_protocol": True,  # let agents patch a file instead of rewriting it
         "prefetch": True,       # generate the next ticket while this one verifies
         "tool_calls": 6,        # read-only workspace lookups one answer may make
@@ -325,6 +336,14 @@ execution:
   candidates: 1          # samples raced through the gates per ticket; >1 costs
                          # a whole extra verification pass, so raise it only if
                          # the gates are cheap relative to generation
+  files: 6               # existing sources shown to the implementer
+  escalation:            # how attempt 2, 3, ... are asked differently, each
+                         # rung inheriting the one below it. The top rung
+                         # repeats; [] retries identically instead
+    - {candidates: 2, files: 10}   # attempt 2: race more samples, read more code
+    - {role: architect}            # attempt 3: ask the reasoning role instead,
+                                   # on the model already resident -- a rung
+                                   # never reloads weights mid-ticket
   edit_protocol: true    # let agents patch a file instead of rewriting it whole
   prefetch: true         # generate the next ticket while this one verifies
   tool_calls: 6          # read-only lookups (read_file, grep, list_dir) the

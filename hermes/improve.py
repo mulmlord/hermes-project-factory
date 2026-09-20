@@ -41,6 +41,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .agents import Prompt
 from .log import Logger, NULL
 from .verify import Gate
 
@@ -366,22 +367,26 @@ class Improvement:
         agent = self.agents.get("implementer")
         if agent is None:
             return {}
-        sources = []
-        for relative in TARGETS[target]:
-            path = self.root / relative
-            if path.is_file():
-                sources.append(f"--- {relative} ---\n{path.read_text()[:24000]}")
-        answer = agent.ask_json(
-            f"You are improving Hermes itself: the {target} component.\n\n"
-            "Propose one concrete, self-contained improvement. It must keep "
-            "every existing test passing, change only the files shown, and be "
-            "justified by something measurable -- fewer model calls, a higher "
-            "first-attempt gate pass rate, less wall clock. Do not change "
-            "tests, the evaluation harness, or packaging: those judge your "
-            "change and are rejected on sight.\n\n"
-            "Return JSON: {\"rationale\": str, \"files\": [{\"path\": str, "
-            "\"content\": str}]} with each file complete.\n\n"
-            + "\n\n".join(sources))
+        prompt = Prompt(agent, log=self.log)
+        prompt.add("task",
+                   f"You are improving Hermes itself: the {target} component.\n\n"
+                   "Propose one concrete, self-contained improvement. It must keep "
+                   "every existing test passing, change only the files shown, and be "
+                   "justified by something measurable -- fewer model calls, a higher "
+                   "first-attempt gate pass rate, less wall clock. Do not change "
+                   "tests, the evaluation harness, or packaging: those judge your "
+                   "change and are rejected on sight.\n\n"
+                   "Return JSON: {\"rationale\": str, \"files\": [{\"path\": str, "
+                   "\"content\": str}]} with each file complete.", required=True)
+        sources = prompt.add("sources", priority=10, floor=2000)
+        # A component is several files and the answer must return them whole,
+        # so each gets an equal share of what is left rather than the first
+        # one taking the budget and the rest arriving as stubs.
+        share = sources.room() // max(1, len(TARGETS[target]))
+        sources.fill("\n\n".join(
+            f"--- {relative} ---\n{(self.root / relative).read_text()[:share]}"
+            for relative in TARGETS[target] if (self.root / relative).is_file()))
+        answer = agent.ask_json(prompt.render())
         return answer if isinstance(answer, dict) else {}
 
     def promote(self, record: Attempt) -> bool:

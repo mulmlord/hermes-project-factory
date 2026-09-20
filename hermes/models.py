@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .config import Config, ConfigError, ModelConfig
@@ -23,6 +24,14 @@ _FENCE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
 
 class ModelError(RuntimeError):
     pass
+
+
+class PromptTooLarge(ModelError):
+    """A prompt refused here, before a server had to refuse it.
+
+    Raised locally so the failure names the budget and the blocks that blew
+    it, rather than arriving as an HTTP 400 after a round trip.
+    """
 
 
 def _post(url: str, payload: dict, timeout: int) -> dict:
@@ -191,6 +200,80 @@ def _match(text: str, start: int, opener: str, closer: str) -> int:
     return -1
 
 
+#: Characters per token assumed by every budget in the factory. Real
+#: tokenizers give roughly 3.5-4 for prose and a little under that for dense
+#: code; assuming 3 over-counts on purpose, because the two ways of being
+#: wrong cost very different amounts. A prompt refused here costs a log line
+#: and a smaller prompt. A prompt the server refuses costs a round trip, a
+#: generation, and -- before this existed -- a whole phase. Hermes ships no
+#: tokenizer: one per model family would be a dependency for a number that
+#: only has to be right to a few percent.
+CHARS_PER_TOKEN = 3
+
+#: Tokens the chat template, role markers and BOS add on top of the text.
+TEMPLATE_OVERHEAD = 200
+
+#: What each task kind keeps back for its answer: a fraction of the configured
+#: context, with a floor and a ceiling. This describes the shape of the answer
+#: the role is asked for, not the model: the implementer returns whole files,
+#: the reviewer returns a verdict and a few sentences.
+RESERVE = {
+    "coding": (0.35, 1024, 8192),
+    "evolution": (0.35, 1024, 8192),
+    "architecture": (0.30, 1024, 6144),
+    "research": (0.30, 1024, 6144),
+    "review": (0.20, 512, 3072),
+    "simple": (0.20, 512, 2048),
+}
+DEFAULT_RESERVE = (0.25, 512, 4096)
+
+
+def estimate_tokens(text: str) -> int:
+    """Pessimistic token count for *text*. See :data:`CHARS_PER_TOKEN`."""
+    return -(-len(text) // CHARS_PER_TOKEN)
+
+
+@dataclass(frozen=True)
+class Allowance:
+    """How many tokens one task kind may spend, and on what.
+
+    Produced only by :meth:`Router.allowance`, which is the single place
+    ``models.<role>.context`` becomes a number the rest of the factory is
+    allowed to use. Raising a model's configured context to match the server
+    it actually runs on is therefore the only thing an operator has to do to
+    give every agent more room.
+    """
+
+    task: str
+    model: str
+    context: int
+    reserve: int
+    overhead: int = TEMPLATE_OVERHEAD
+
+    @property
+    def prompt_tokens(self) -> int:
+        """What the prompt may spend once the answer has its room."""
+        return max(0, self.context - self.reserve - self.overhead)
+
+    @property
+    def prompt_chars(self) -> int:
+        return self.prompt_tokens * CHARS_PER_TOKEN
+
+    def check(self, *parts: str) -> int:
+        """Token cost of *parts* together, or raise if they do not fit."""
+        used = sum(estimate_tokens(part) for part in parts)
+        if used > self.prompt_tokens:
+            raise PromptTooLarge(
+                f"task {self.task!r}: prompt is about {used} tokens but only "
+                f"{self.prompt_tokens} fit -- {self.model} is configured with a "
+                f"{self.context}-token context, of which {self.reserve} is held "
+                f"back for the answer and {self.overhead} for the chat template. "
+                "Shorten the prompt, or raise models.<role>.context if the "
+                "server's --max-model-len is larger than the config says."
+            )
+        return used
+
+
 class Router:
     """Resolves a task kind to a backend, with a small usage ledger."""
 
@@ -214,15 +297,33 @@ class Router:
         cfg = self.config.model_for(task)
         return f"{cfg.backend}:{cfg.model}"
 
+    def allowance(self, task: str) -> Allowance:
+        """The token budget for *task*, derived from its configured context."""
+        cfg = self.backend(task).cfg
+        fraction, floor, ceiling = RESERVE.get(task, DEFAULT_RESERVE)
+        reserve = min(max(int(cfg.context * fraction), floor), ceiling)
+        # The floor is what a useful answer needs, but on a small context it
+        # would leave the prompt nothing; half the window is the hard cap.
+        return Allowance(task, cfg.model, cfg.context,
+                         min(reserve, max(1, cfg.context // 2)))
+
     def complete(self, task: str, system: str, prompt: str, **kw: Any) -> str:
         backend = self.backend(task)
+        allowance = self.allowance(task)
+        used = allowance.check(system, prompt)
+        # Tell the server how much room the answer gets. Left unsaid, a server
+        # whose default max_tokens is small truncates every answer into
+        # unparseable JSON, and one with no default lets a looping generation
+        # run to the request timeout -- minutes of GPU for nothing.
+        kw.setdefault("max_tokens", allowance.reserve)
         started = time.time()
         with self.governor.inference() if self.governor else nullcontext():
             text = backend.complete(system, prompt, **kw)
         elapsed = time.time() - started
         self.usage.append(
             {"task": task, "model": backend.cfg.model, "seconds": round(elapsed, 2),
-             "chars_in": len(system) + len(prompt), "chars_out": len(text)}
+             "chars_in": len(system) + len(prompt), "chars_out": len(text),
+             "tokens_in": used}
         )
         self.log.debug("model.complete", task=task, model=backend.cfg.model,
                        seconds=round(elapsed, 1), chars_out=len(text))

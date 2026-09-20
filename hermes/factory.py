@@ -12,7 +12,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 from . import workspace
-from .agents import build as build_agents, context_block
+from .agents import Prompt, build as build_agents, context_block
 from .config import Config
 from .evolve import Evolution, objective_from_spec
 from .git_ops import GitHub, Issues, Repo
@@ -106,13 +106,22 @@ class Factory:
         This is the one job in the factory that wants the small fast model,
         and it is what `routing.simple` is for.
         """
+        summariser = self.agents["summariser"]
+        prompt = Prompt(summariser, log=self.log)
+        findings_block = prompt.add("findings", priority=10, floor=2000)
+        prompt.add("instructions",
+                   f"Compress this to at most {limit // 12} words for an architect who "
+                   "must choose a design from it. Keep every decision, constraint, "
+                   "measured number, named technology and rejected alternative. "
+                   'Return JSON: {"findings": ["one finding per entry"]}', required=True)
+        # More findings than one pass can hold is a real possibility late in a
+        # long project; the oldest are the ones already folded into the spec,
+        # so what is kept here is the tail.
+        head = f"RESEARCH FINDINGS ({len(text)} characters):\n"
+        keep = max(0, findings_block.room() - len(head))
+        findings_block.fill(head + (text[-keep:] if keep else ""))
         try:
-            payload = self.agents["summariser"].ask_json(
-                f"RESEARCH FINDINGS ({len(text)} characters):\n{text[:40000]}\n\n"
-                f"Compress this to at most {limit // 12} words for an architect who "
-                "must choose a design from it. Keep every decision, constraint, "
-                "measured number, named technology and rejected alternative. "
-                'Return JSON: {"findings": ["one finding per entry"]}')
+            payload = summariser.ask_json(prompt.render())
             findings = [f"- {item}" for item in (payload.get("findings") or []) if item]
         except Exception as exc:  # noqa: BLE001 - truncation is a valid fallback
             self.log.warn("research.compress_failed", error=str(exc)[:200])

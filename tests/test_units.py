@@ -170,22 +170,87 @@ def test_strip_reasoning():
     assert strip_reasoning("<think>a</think>b") == "b"
 
 
-def test_json_mode_downgrades_instead_of_failing(monkeypatch):
+@pytest.fixture
+def refusing_server():
+    """A loopback OpenAI-compatible server that answers 400 on demand.
+
+    The two refusals under test differ only in the words a server puts on the
+    wire, so the test has to go through HTTP: stubbing ``backend.complete``
+    would let the test author invent the message being classified.
+    """
+    import http.server
+
+    state = {"refusal": None, "requests": []}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            state["requests"].append(payload)
+            if state["refusal"] == "context":
+                # vLLM's wording when the prompt exceeds --max-model-len.
+                self.reply(400, "This model's maximum context length is 16384 tokens. "
+                                "However, you requested 21000 tokens (20000 in the "
+                                "messages, 1000 in the completion). Please reduce the "
+                                "length of the messages or completion.")
+            elif state["refusal"] == "parameter" and "response_format" in payload:
+                self.reply(400, "response_format is not supported by this server")
+            else:
+                self.reply(200, None)
+
+        def reply(self, code, message):
+            body = ({"error": {"message": message, "type": "BadRequestError"}}
+                    if message else
+                    {"choices": [{"message": {"content": '{"ok": true}'}}]})
+            raw = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    state["url"] = f"http://127.0.0.1:{server.server_port}/v1"
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _router_for(server, tmp_path):
+    path = tmp_path / "hermes.yaml"
+    path.write_text("models:\n  default:\n    backend: vllm\n"
+                    f"    base_url: {server['url']}\n    model: stub\n")
+    return Router(Config.load(path))
+
+
+def test_json_mode_downgrades_instead_of_failing(refusing_server, tmp_path):
     """A server that rejects the JSON parameter must not fail the whole task."""
-    router = Router(Config.load())
-    backend = router.backend("coding")
-    asked = []
+    refusing_server["refusal"] = "parameter"
+    router = _router_for(refusing_server, tmp_path)
 
-    def fake(system, prompt, *, json_mode=False, **kw):
-        asked.append(json_mode)
-        if json_mode:
-            raise ModelError("http://localhost:11434/api/chat: HTTP 400 bad format")
-        return '{"ok": true}'
-
-    monkeypatch.setattr(backend, "complete", fake)
     assert router.complete_json("coding", "sys", "prompt") == {"ok": True}
-    assert asked == [True, False]
-    assert backend.json_mode is False  # and it does not ask again
+    assert [("response_format" in r) for r in refusing_server["requests"]] == [True, False]
+    assert router.backend("coding").json_mode is False  # and it does not ask again
+
+
+def test_a_context_overflow_is_not_read_as_a_missing_feature(refusing_server, tmp_path):
+    """A prompt that does not fit is a 400 too, and must surface as itself.
+
+    Downgrading here would disable constrained decoding for the whole run over
+    one oversized prompt, and blame a parameter the server understands fine.
+    """
+    refusing_server["refusal"] = "context"
+    router = _router_for(refusing_server, tmp_path)
+
+    with pytest.raises(ModelError, match="maximum context length"):
+        router.complete_json("coding", "sys", "prompt")
+    assert router.backend("coding").json_mode is True
+    assert len(refusing_server["requests"]) == 1  # no retry that fails the same way
 
 
 def test_a_server_fault_is_not_mistaken_for_a_missing_feature(monkeypatch):

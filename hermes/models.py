@@ -309,14 +309,35 @@ class Router:
         return report
 
 
-def _rejects_parameter(exc: ModelError) -> bool:
-    """True when a local server refused the request as written.
+#: How local servers say the prompt does not fit the loaded context: vLLM's
+#: "maximum context length is N tokens", llama.cpp's "exceeds the available
+#: context size", and kin.
+_CONTEXT_LIMIT = re.compile(
+    r"context (?:length|size|window)|max_model_len|max_tokens|token limit"
+    r"|too many tokens", re.IGNORECASE)
 
-    The only optional field Hermes adds is the structured-output flag, so a
-    client error that appears once it is set is the server saying it does not
-    support it. A 5xx or a connection failure is a real fault and must surface.
+#: How they name the one optional field Hermes adds: ``response_format`` on an
+#: OpenAI-compatible server, ``format`` on ollama.
+_PARAMETER_REFUSAL = re.compile(
+    r"response_format|json_object|json_schema|guided[_ ]|structured output"
+    r"|\bformat\b", re.IGNORECASE)
+
+
+def _rejects_parameter(exc: ModelError) -> bool:
+    """True when a local server refused the *structured-output flag* itself.
+
+    A 4xx alone does not mean that. vLLM answers HTTP 400 when the prompt
+    exceeds ``--max-model-len``, which is a routine outcome on the repair path
+    where journal, file listing, sources and failure output share one prompt.
+    Reading that as a missing feature would disable constrained decoding for
+    the rest of the run over a prompt that was merely too long, so the refusal
+    has to name the parameter Hermes added before we believe it. A 5xx or a
+    connection failure is a real fault and must surface either way.
     """
-    return " HTTP 4" in str(exc)
+    text = str(exc)
+    if " HTTP 4" not in text or _CONTEXT_LIMIT.search(text):
+        return False
+    return bool(_PARAMETER_REFUSAL.search(text))
 
 
 def _model_present(name: str, installed: list[str]) -> bool:

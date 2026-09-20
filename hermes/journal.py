@@ -21,6 +21,11 @@ from typing import Iterator
 
 from .log import Logger, NULL
 
+#: Share of a prompt's journal budget that only failed or abandoned work may
+#: spend. Small enough that history of what was built still dominates, large
+#: enough that a dead end always reaches the agent about to walk into it.
+FAILURE_RESERVE = 0.3
+
 
 @dataclass
 class Entry:
@@ -146,15 +151,32 @@ class Journal:
                 return 3                                # a dead end worth not repeating
             return 4
 
-        chosen: list[Entry] = []
+        ranked = sorted(self.latest(), key=lambda e: (rank(e), -e.at))
+        chosen: dict[str, Entry] = {}
         used = 0
-        for entry in sorted(self.latest(), key=lambda e: (rank(e), -e.at)):
-            size = len(entry.render())
-            if chosen and used + size > budget:
-                break
-            used += size
-            chosen.append(entry)
-        return chosen
+
+        def spend(entries: list[Entry], limit: int) -> None:
+            nonlocal used
+            for entry in entries:
+                if entry.ticket in chosen:
+                    continue
+                size = len(entry.render())
+                if used + size > limit:
+                    continue   # skip it, never stop: what follows may still fit
+                used += size
+                chosen[entry.ticket] = entry
+
+        # Dead ends rank below three classes of success, so on a board with any
+        # real dependency history they are what the budget runs out before —
+        # exactly the entries this journal exists to carry forward. Hence the
+        # reserve: failures get first call on part of the budget, and the rest
+        # of the ranking then spends what they left.
+        spend([e for e in ranked if e.outcome != "completed"],
+              int(budget * FAILURE_RESERVE))
+        spend(ranked, budget)
+        if not chosen and ranked:
+            chosen[ranked[0].ticket] = ranked[0]   # one oversized entry beats none
+        return sorted(chosen.values(), key=lambda e: (rank(e), -e.at))
 
     def block(self, ticket, board, budget: int = 4000) -> str:
         """The prompt fragment. Empty until some work has actually happened."""

@@ -305,6 +305,39 @@ def test_research_without_a_network_budget_takes_no_such_decision(factory):
     assert not list((factory.root / "docs" / "decisions").glob("*retrieved-*.md"))
 
 
+def test_every_log_record_names_the_work_that_produced_it(factory):
+    """A log nobody can correlate cannot answer why one attempt failed."""
+    state = factory.run(max_iterations=40)
+    records = [json.loads(line)
+               for path in sorted((factory.root / ".hermes" / "logs").glob("*.jsonl"))
+               for line in path.read_text().splitlines()]
+
+    run = state.metrics["run"]
+    start = next(i for i, r in enumerate(records) if r["event"] == "factory.start")
+    assert run and all(r.get("run") == run for r in records[start:])
+
+    attempt = next(r for r in records if r["event"] == "ticket.attempt")
+    assert attempt["phase"] == "IMPLEMENTATION" and attempt["attempt"] == 1
+    assert attempt["ticket"] in factory.board.tickets
+
+    # implement.py knows nothing about phases or attempts; the scope does.
+    applied = next(r for r in records if r["event"] == "implement.applied")
+    assert applied["ticket"] in factory.board.tickets
+    assert applied["phase"] == "IMPLEMENTATION" and applied["attempt"] >= 1
+
+
+def test_a_second_run_is_distinguishable_in_the_same_log_file(factory):
+    """A resumed project appends to the log its earlier run wrote."""
+    first = factory.run(max_iterations=2).metrics["run"]
+    second = factory.run(max_iterations=40).metrics["run"]
+    assert first != second
+
+    records = [json.loads(line)
+               for path in sorted((factory.root / ".hermes" / "logs").glob("*.jsonl"))
+               for line in path.read_text().splitlines()]
+    assert {first, second} <= {r.get("run") for r in records}
+
+
 def test_a_wall_clock_deadline_stops_the_loop_without_damaging_it(factory):
     """Iterations bound how many phases run, not how long one takes.
 

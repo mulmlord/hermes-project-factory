@@ -5,13 +5,14 @@ import argparse
 import json
 import sys
 import time
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 
 from . import workspace
 from .config import Config, ConfigError, SAMPLE_CONFIG
 from .journal import Journal
-from .log import for_workspace
+from .log import for_workspace, scope
 from .sandbox import Sandbox, probe_resources
 from .state import PHASES, State, checkpoint, restore
 from .tickets import Board
@@ -564,7 +565,11 @@ def hpf(argv: list[str] | None = None) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        return args.func(args)
+        # Every record this invocation writes says which invocation wrote it.
+        # A project's log file outlives any one command, and a one-off
+        # `hermes test` lands in the same file as the loop that preceded it.
+        with scope(run=uuid.uuid4().hex[:8], command=args.command):
+            return args.func(args)
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 1

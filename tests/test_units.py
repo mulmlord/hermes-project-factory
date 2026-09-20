@@ -17,7 +17,7 @@ from hermes.implement import (Change, _protected, _race, apply_change, execute_t
                               snapshot as snapshot_files)
 from hermes.git_ops import GitHub, Issues
 from hermes.journal import Entry, Journal
-from hermes.log import NULL
+from hermes.log import NULL, Logger, current_scope, scope
 from hermes.models import (ModelError, PromptTooLarge, Router, extract_json,
                           strip_reasoning)
 from hermes.openhands import OpenHands
@@ -728,6 +728,46 @@ def test_journal_carries_dead_ends_to_the_next_agent(tmp_path):
     assert "abandoned" in block and "deadlocked under load" in block
 
 
+def test_journal_reserves_budget_for_dead_ends(tmp_path):
+    """Successes outrank a failure, and used to spend the budget before reaching it."""
+    board, journal = Board(tmp_path), Journal(tmp_path)
+    dead = board.add(title="lock-free queue")
+    journal.record(dead, {"diagnosis": {"diagnosis": "livelocks above eight threads"}},
+                   status="abandoned")
+    deps = []
+    for index in range(20):
+        done = board.add(title=f"component {index}", artifacts=[f"src/c{index}.py"])
+        _done(journal, done, "built it", [f"src/c{index}.py"])
+        deps.append(done.id)
+
+    entries = journal.relevant(board.add(title="the next one", dependencies=deps),
+                               board, budget=600)
+
+    assert any(e.ticket == dead.id for e in entries), "the dead end never arrived"
+    assert sum(1 for e in entries if e.outcome == "completed") >= 3, "successes starved"
+    assert sum(len(e.render()) for e in entries) <= 600  # budget still honoured
+
+
+def test_journal_skips_an_oversized_entry_instead_of_stopping(tmp_path):
+    """One entry too big to fit must not end the selection behind it."""
+    board, journal = Board(tmp_path), Journal(tmp_path)
+    small = board.add(title="config loader", artifacts=["src/config.py"])
+    _done(journal, small, "reads hermes.yaml", ["src/config.py"])
+    fat = board.add(title="x" * 300, artifacts=["src/fat.py"])
+    _done(journal, fat, "y" * 200, ["src/fat.py"])   # newer, so it is ranked first
+    ticket = board.add(title="use both", dependencies=[fat.id, small.id])
+
+    assert [e.ticket for e in journal.relevant(ticket, board, budget=300)] == [small.id]
+
+
+def test_journal_returns_one_entry_even_when_nothing_fits(tmp_path):
+    board, journal = Board(tmp_path), Journal(tmp_path)
+    base = board.add(title="z" * 500, artifacts=["src/big.py"])
+    _done(journal, base, "wrote it", ["src/big.py"])
+    ticket = board.add(title="build on it", dependencies=[base.id])
+    assert [e.ticket for e in journal.relevant(ticket, board, budget=100)] == [base.id]
+
+
 def test_journal_owner_index_names_the_newest_writer(tmp_path):
     board, journal = Board(tmp_path), Journal(tmp_path)
     _done(journal, board.add(title="first"), "created it", ["src/a.py"])
@@ -768,6 +808,65 @@ def test_relevant_files_reads_journal_hints(tmp_path):
     ticket = Board(tmp_path).add(title="use the config", artifacts=["src/never_built.py"])
     text = relevant_files(sandbox, ticket, {}, ["src/config.py"])
     assert "VALUE = 1" in text
+
+
+# -- logging -----------------------------------------------------------------
+
+def _records(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def test_log_records_carry_the_work_that_produced_them(tmp_path):
+    """The question 'what did the model see on T014's third attempt' needs this."""
+    log = Logger(tmp_path / "log.jsonl", level="debug", quiet=True)
+    with scope(run="ab12cd", phase="IMPLEMENTATION"):
+        with scope(ticket="T014", attempt=3):
+            log.debug("model.complete", task="coding")
+        log.info("loop", progress="40%")
+    log.info("factory.stop")
+
+    deep, loop, after = _records(tmp_path / "log.jsonl")
+    assert deep["run"] == "ab12cd" and deep["phase"] == "IMPLEMENTATION"
+    assert deep["ticket"] == "T014" and deep["attempt"] == 3
+    assert deep["task"] == "coding"               # the call's own fields survive
+    assert "ticket" not in loop                   # the inner block ended
+    assert "run" not in after and "phase" not in after
+
+
+def test_an_explicit_field_beats_the_scope(tmp_path):
+    log = Logger(tmp_path / "log.jsonl", quiet=True)
+    with scope(ticket="T001"):
+        log.info("prefetch.start", ticket="T002")
+    assert _records(tmp_path / "log.jsonl")[0]["ticket"] == "T002"
+
+
+def test_log_scope_can_be_carried_into_a_worker_thread(tmp_path):
+    """A pool thread starts with no context, so prefetched work hands it over."""
+    log = Logger(tmp_path / "log.jsonl", quiet=True)
+    with scope(run="ab12cd", ticket="T001", attempt=2):
+        inherited = dict(current_scope(), ticket="T002", attempt=None)
+
+    def work():
+        with scope(**inherited):
+            log.info("implement.generated")
+
+    thread = threading.Thread(target=work)
+    thread.start()
+    thread.join()
+
+    record = _records(tmp_path / "log.jsonl")[0]
+    assert record["run"] == "ab12cd" and record["ticket"] == "T002"
+    assert "attempt" not in record   # the candidate has not been attempted yet
+
+
+def test_the_human_stream_stays_terse(capsys, tmp_path):
+    """stderr is watched live; the run identifier is constant noise there."""
+    log = Logger(tmp_path / "log.jsonl")
+    with scope(run="ab12cd", ticket="T014"):
+        log.info("ticket.attempt", title="parser")
+    line = capsys.readouterr().err
+    assert "ticket=T014" in line and "title=parser" in line
+    assert "ab12cd" not in line
 
 
 # -- resource governor -------------------------------------------------------

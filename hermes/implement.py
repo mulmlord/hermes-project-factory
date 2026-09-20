@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .agents import Prompt, context_block, file_protocol, ticket_block
-from .log import Logger, NULL
+from .log import Logger, NULL, scope
 from .sandbox import Sandbox, SandboxError
 from .verify import Verification, review, triage, verify_ticket
 
@@ -302,84 +302,90 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
             tests_required=bool(state.metrics.get("tests_passed")))
 
     for attempt in range(1, max_attempts + 1):
-        ticket.attempts += 1
-        log.info("ticket.attempt", ticket=ticket.id, attempt=attempt,
-                 title=ticket.title[:60])
-        payloads = _propose(agents, sandbox, state, ticket, tree_fn, instructions,
-                            failure, prior, hints, allow_edits=allow_edits,
-                            wanted=max(1, candidates) if attempt == 1 else 1,
-                            prefetched=prefetched if attempt == 1 else None, log=log)
-        if not payloads:
-            failure = "the implementer produced no usable output"
-            continue
+        # Every record from here down -- model call, sandbox command, gate --
+        # belongs to this attempt at this ticket, and says so.
+        with scope(ticket=ticket.id, attempt=attempt):
+            ticket.attempts += 1
+            log.info("ticket.attempt", title=ticket.title[:60])
+            payloads = _propose(agents, sandbox, state, ticket, tree_fn, instructions,
+                                failure, prior, hints, allow_edits=allow_edits,
+                                wanted=max(1, candidates) if attempt == 1 else 1,
+                                prefetched=prefetched if attempt == 1 else None, log=log)
+            if not payloads:
+                failure = "the implementer produced no usable output"
+                continue
 
-        # A review-driven retry is free to touch files the passing attempt never
-        # wrote, so the guard covers what *this* attempt declares it will touch
-        # rather than what the last one did; every other file is still the tree
-        # that passed and needs no copy. It is taken before anything is applied,
-        # so what it captures is the passing content.
-        guard = snapshot(sandbox, [path for payload in payloads
-                                   for path in targets_of(payload)]) if gates_held else None
+            # A review-driven retry is free to touch files the passing attempt never
+            # wrote, so the guard covers what *this* attempt declares it will touch
+            # rather than what the last one did; every other file is still the tree
+            # that passed and needs no copy. It is taken before anything is applied,
+            # so what it captures is the passing content.
+            guard = snapshot(
+                sandbox, [path for payload in payloads
+                          for path in targets_of(payload)]) if gates_held else None
 
-        change, verification = _race(sandbox, payloads, gate, ticket, log)
-        last_change = change
-        if change is None or change.empty:
-            failure = ("\n".join(change.unmatched) if change and change.unmatched
-                       else "no files were written; you must return complete file contents")
-            continue
-        last_verification = verification
-        if any(g.name == "tests" and g.passed and not g.skipped for g in verification.gates):
-            state.metrics["tests_passed"] = True
+            change, verification = _race(sandbox, payloads, gate, ticket, log)
+            last_change = change
+            if change is None or change.empty:
+                failure = ("\n".join(change.unmatched) if change and change.unmatched
+                           else "no files were written; you must return complete "
+                                "file contents")
+                continue
+            last_verification = verification
+            if any(g.name == "tests" and g.passed and not g.skipped
+                   for g in verification.gates):
+                state.metrics["tests_passed"] = True
 
-        if verification.passed:
-            verdict = review(agents, ticket, sandbox, change, verification,
-                             prior=prior, log=log)
-            if verdict.get("approved"):
-                board.move(ticket.id, "review", change.describe())
-                for note in verdict.get("advisory", [])[:3]:
-                    ticket.notes.append(f"advisory: {note}")
-                board.save()
-                return {"status": "completed", "verification": verification,
-                        "change": change, "review": verdict}
-            instructions = "Address these review findings:\n" + "\n".join(
-                f"- {b}" for b in verdict["blocking"])
-            failure = ""
-            gates_held = True
-            continue
+            if verification.passed:
+                verdict = review(agents, ticket, sandbox, change, verification,
+                                 prior=prior, log=log)
+                if verdict.get("approved"):
+                    board.move(ticket.id, "review", change.describe())
+                    for note in verdict.get("advisory", [])[:3]:
+                        ticket.notes.append(f"advisory: {note}")
+                    board.save()
+                    return {"status": "completed", "verification": verification,
+                            "change": change, "review": verdict}
+                instructions = "Address these review findings:\n" + "\n".join(
+                    f"- {b}" for b in verdict["blocking"])
+                failure = ""
+                gates_held = True
+                continue
 
-        if guard is not None:
-            # The gates passed before this attempt, so failing them now is this
-            # attempt's regression rather than the ticket's state: put the tree
-            # that passed back, so the next attempt starts from the good version
-            # instead of the worse one. Triage is deliberately skipped -- the
-            # diagnosis is already known, and its verdict could be "decompose"
-            # or "rollback", which would throw away the work just recovered.
-            # Restoring satisfies none of the review findings: they stay in
-            # *instructions*, so the ticket still cannot reach COMPLETED until
-            # one change passes the gates and the reviewer both.
-            restore(sandbox, guard)
-            log.warn("ticket.regression_restored", ticket=ticket.id,
-                     gates=", ".join(g.name for g in verification.failures))
-            failure = (
-                "Your last attempt broke gates that had already passed, so the "
-                "files have been restored to the version that passed them; the "
-                "contents shown above are that restored version. Make the "
-                "smallest change that answers the review findings without "
-                "breaking these gates again:\n" + verification.failure_output())
+            if guard is not None:
+                # The gates passed before this attempt, so failing them now is this
+                # attempt's regression rather than the ticket's state: put the tree
+                # that passed back, so the next attempt starts from the good version
+                # instead of the worse one. Triage is deliberately skipped -- the
+                # diagnosis is already known, and its verdict could be "decompose"
+                # or "rollback", which would throw away the work just recovered.
+                # Restoring satisfies none of the review findings: they stay in
+                # *instructions*, so the ticket still cannot reach COMPLETED until
+                # one change passes the gates and the reviewer both.
+                restore(sandbox, guard)
+                log.warn("ticket.regression_restored",
+                         gates=", ".join(g.name for g in verification.failures))
+                failure = (
+                    "Your last attempt broke gates that had already passed, so the "
+                    "files have been restored to the version that passed them; the "
+                    "contents shown above are that restored version. Make the "
+                    "smallest change that answers the review findings without "
+                    "breaking these gates again:\n" + verification.failure_output())
+                if change.unmatched:
+                    failure += ("\n\nEDITS THAT DID NOT APPLY:\n"
+                                + "\n".join(change.unmatched))
+                continue
+
+            diagnosis = triage(agents, ticket, verification,
+                               context_block(state, tree_fn()), attempt, log=log)
+            action = diagnosis.get("action", "repair")
+            if action in ("decompose", "reconsider", "research", "rollback"):
+                return {"status": "failed", "action": action, "diagnosis": diagnosis,
+                        "verification": verification, "change": change}
+            instructions = diagnosis.get("instructions", "")
+            failure = verification.failure_output()
             if change.unmatched:
                 failure += "\n\nEDITS THAT DID NOT APPLY:\n" + "\n".join(change.unmatched)
-            continue
-
-        diagnosis = triage(agents, ticket, verification,
-                           context_block(state, tree_fn()), attempt, log=log)
-        action = diagnosis.get("action", "repair")
-        if action in ("decompose", "reconsider", "research", "rollback"):
-            return {"status": "failed", "action": action, "diagnosis": diagnosis,
-                    "verification": verification, "change": change}
-        instructions = diagnosis.get("instructions", "")
-        failure = verification.failure_output()
-        if change.unmatched:
-            failure += "\n\nEDITS THAT DID NOT APPLY:\n" + "\n".join(change.unmatched)
 
     return {"status": "failed", "action": "decompose",
             "diagnosis": {"diagnosis": f"exhausted {max_attempts} attempts",

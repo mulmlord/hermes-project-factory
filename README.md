@@ -357,6 +357,12 @@ project/
 Everything outside `.hermes/` is meant to be readable without Hermes. The
 released repository excludes factory internals entirely.
 
+The JSONL log under `.hermes/logs/` stamps every record with the work that
+produced it — `run`, `phase`, `ticket` and `attempt` — so a line written deep
+inside a model call or a sandbox command can be traced back to the ticket
+attempt it belongs to. `run` identifies one `hermes` invocation, which is what
+separates a resumed project's records from the earlier run's in the same file.
+
 ## Completion
 
 A project is not finished because its tickets are closed. Hermes requires all

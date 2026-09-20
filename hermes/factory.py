@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from .evolve import Evolution, objective_from_spec
 from .git_ops import GitHub, Issues, Repo
 from .implement import Change, execute_ticket, generate
 from .journal import Journal
-from .log import Logger, for_workspace
+from .log import Logger, current_scope, for_workspace, scope
 from .models import Router
 from .openhands import OpenHands
 from .planning import architect, decompose, generate_tickets, intake
@@ -272,36 +273,39 @@ class Factory:
             self.state.transition("VALIDATION", "no ready tickets")
             return
 
-        if self.openhands.should_handle(ticket):
-            handled = self._run_openhands(ticket)
-            if handled:
-                return
+        # Everything below belongs to this ticket, down to the model call that
+        # generated a patch and the command that rejected it.
+        with scope(ticket=ticket.id):
+            if self.openhands.should_handle(ticket):
+                handled = self._run_openhands(ticket)
+                if handled:
+                    return
 
-        outcome = execute_ticket(
-            self.agents, self.sandbox, self.state, self.board, ticket, self.tree,
-            journal=self.journal,
-            max_attempts=int(self.config.get("execution.max_ticket_attempts", 3)),
-            candidates=int(self.config.get("execution.candidates", 1)),
-            allow_edits=bool(self.config.get("execution.edit_protocol", True)),
-            prefetched=self._take_prefetch(ticket),
-            on_apply=lambda: self._prefetch_next(ticket),
-            log=self.log)
+            outcome = execute_ticket(
+                self.agents, self.sandbox, self.state, self.board, ticket, self.tree,
+                journal=self.journal,
+                max_attempts=int(self.config.get("execution.max_ticket_attempts", 3)),
+                candidates=int(self.config.get("execution.candidates", 1)),
+                allow_edits=bool(self.config.get("execution.edit_protocol", True)),
+                prefetched=self._take_prefetch(ticket),
+                on_apply=lambda: self._prefetch_next(ticket),
+                log=self.log)
 
-        if outcome["status"] == "completed":
-            self.board.move(ticket.id, "completed", "all gates passed")
-            self.state.clear_failure(ticket.id)
-            record_evaluation(self.root, ticket.id, outcome["verification"],
-                              {"review": outcome.get("review", {})})
-            sha = self.commit(f"{_commit_kind(ticket.kind)}: {ticket.title}\n\n"
-                              f"Ticket {ticket.id}. {outcome['change'].summary}",
-                              kind=_commit_kind(ticket.kind))
-            self.journal.record(ticket, outcome, commit=sha or "")
-            self.log.info("ticket.completed", ticket=ticket.id,
-                          progress=f"{self.board.progress():.0%}")
-            self._push_first_green()
-        else:
-            self._handle_ticket_failure(ticket, outcome)
-        self.save(f"ticket-{ticket.id}")
+            if outcome["status"] == "completed":
+                self.board.move(ticket.id, "completed", "all gates passed")
+                self.state.clear_failure(ticket.id)
+                record_evaluation(self.root, ticket.id, outcome["verification"],
+                                  {"review": outcome.get("review", {})})
+                sha = self.commit(f"{_commit_kind(ticket.kind)}: {ticket.title}\n\n"
+                                  f"Ticket {ticket.id}. {outcome['change'].summary}",
+                                  kind=_commit_kind(ticket.kind))
+                self.journal.record(ticket, outcome, commit=sha or "")
+                self.log.info("ticket.completed",
+                              progress=f"{self.board.progress():.0%}")
+                self._push_first_green()
+            else:
+                self._handle_ticket_failure(ticket, outcome)
+            self.save(f"ticket-{ticket.id}")
 
     # -- pipelining ------------------------------------------------------
     def _prefetch_next(self, current) -> None:
@@ -329,12 +333,24 @@ class Factory:
         if self._pool is None:
             self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hermes-pf")
         self.log.info("prefetch.start", ticket=candidate.id, during=current.id)
-        self._prefetch = (candidate.id, self._pool.submit(
-            generate, self.agents, self.sandbox, self.state, candidate, self.tree(),
-            prior=self.journal.block(candidate, self.board),
-            hints=self.journal.suggested_files(candidate, self.board),
-            allow_edits=bool(self.config.get("execution.edit_protocol", True)),
-            log=self.log))
+        # The pool thread starts with an empty context, so the run is carried
+        # across by hand. What it does belongs to the candidate, not to the
+        # ticket whose gates are running, and to no attempt of it yet.
+        inherited = dict(current_scope(), ticket=candidate.id,
+                         attempt=None, prefetch=True)
+        # Read here, not in the worker: the journal and the tree belong to the
+        # loop thread, which goes on writing to them while this runs.
+        args = (self.agents, self.sandbox, self.state, candidate, self.tree())
+        kwargs = dict(prior=self.journal.block(candidate, self.board),
+                      hints=self.journal.suggested_files(candidate, self.board),
+                      allow_edits=bool(self.config.get("execution.edit_protocol", True)),
+                      log=self.log)
+
+        def generate_ahead() -> dict:
+            with scope(**inherited):
+                return generate(*args, **kwargs)
+
+        self._prefetch = (candidate.id, self._pool.submit(generate_ahead))
 
     def _independent_ticket(self, current):
         """The ticket that will probably run next, unless it could collide.
@@ -640,16 +656,24 @@ class Factory:
         ceiling is the deadline plus one phase.
         """
         limit = max_iterations or int(self.config.get("execution.max_loop_iterations", 400))
-        self.log.info("factory.start", project=self.state.name, phase=self.state.phase,
-                      resources=self.resources)
-        if self.config.get("git.enabled", True):
-            self.repo.init()
-        # The inference server is needed for exactly as long as this call runs,
-        # which is why it is started here instead of at boot. Leaving the block
-        # releases it, so neither a preflight failure nor a crash in the loop
-        # leaves a model sitting in VRAM.
-        with server_running(self.config, self.router, self.log):
-            self._loop(limit, deadline)
+        # One identifier for this run, on every record it produces and in the
+        # state it leaves behind: a resumed project writes into the same log
+        # file as the run before it, and only this separates them. The CLI has
+        # usually minted one already; taking it keeps a single `hermes run`
+        # from reporting two.
+        run = current_scope().get("run") or uuid.uuid4().hex[:8]
+        self.state.metrics["run"] = run
+        with scope(run=run):
+            self.log.info("factory.start", project=self.state.name, phase=self.state.phase,
+                          resources=self.resources)
+            if self.config.get("git.enabled", True):
+                self.repo.init()
+            # The inference server is needed for exactly as long as this call
+            # runs, which is why it is started here instead of at boot. Leaving
+            # the block releases it, so neither a preflight failure nor a crash
+            # in the loop leaves a model sitting in VRAM.
+            with server_running(self.config, self.router, self.log):
+                self._loop(limit, deadline)
         return self.state
 
     def _loop(self, limit: int, deadline: float | None) -> None:
@@ -668,17 +692,17 @@ class Factory:
                     break
                 self.state.iteration += 1
                 phase = self.state.phase
-                self.log.info("loop", iteration=self.state.iteration, phase=phase,
-                              progress=f"{self.board.progress():.0%}")
-                try:
-                    self.PHASES[phase](self)
-                except KeyboardInterrupt:
-                    self.log.warn("factory.interrupted")
-                    self.save("interrupt")
-                    break
-                except Exception as exc:  # a phase blowing up must not kill the run
-                    self._recover_phase(phase, exc)
-                self.save(f"iter-{self.state.iteration}")
+                with scope(phase=phase, iteration=self.state.iteration):
+                    self.log.info("loop", progress=f"{self.board.progress():.0%}")
+                    try:
+                        self.PHASES[phase](self)
+                    except KeyboardInterrupt:
+                        self.log.warn("factory.interrupted")
+                        self.save("interrupt")
+                        break
+                    except Exception as exc:  # a phase blowing up must not kill the run
+                        self._recover_phase(phase, exc)
+                    self.save(f"iter-{self.state.iteration}")
             self._stop_prefetch()
         self.state.metrics["elapsed_seconds"] = round(time.time() - started, 1)
         self.state.metrics["model_usage"] = _usage(self.router)

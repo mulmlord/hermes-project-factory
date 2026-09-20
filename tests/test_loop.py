@@ -215,6 +215,33 @@ def test_loop_reaches_completed(factory):
     assert any("docs:" in s for s in subjects), subjects
 
 
+def test_a_lookup_before_the_code_does_not_derail_the_loop(factory):
+    """The whole pipeline with an implementer that looks first: still COMPLETED.
+
+    The stub answers from marker text, so it cannot ask a question it needs the
+    answer to. What this checks is the mechanism around it: the lookup is
+    served, its result reaches the next prompt, and the ticket finishes.
+    """
+    router, prompts, looked = factory.router, [], []
+    answer = router._answer
+
+    def looks_first(prompt):
+        prompts.append(prompt)
+        if "Implement this ticket completely" in prompt and not looked:
+            looked.append(prompt)
+            return {"lookup": [{"tool": "list_dir", "path": "."},
+                               {"tool": "grep", "pattern": "def add"}]}
+        return answer(prompt)
+
+    router._answer = looks_first
+    state = factory.run(max_iterations=40)
+
+    assert state.phase == "COMPLETED", (state.phase, state.notes)
+    served = [p for p in prompts if "WHAT YOU LOOKED UP" in p]
+    assert served and "SPEC.md" in served[0]      # the listing it asked for
+    assert (factory.root / "src" / "calc.py").is_file()
+
+
 def test_state_survives_interruption(factory):
     factory.run(max_iterations=4)
     from hermes.state import State

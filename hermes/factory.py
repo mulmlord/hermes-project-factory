@@ -30,6 +30,7 @@ from .server import running as server_running
 from .sources import STORE as SOURCE_STORE, Librarian
 from .state import State, checkpoint
 from .tickets import Board
+from .tools import Toolbox
 from .verify import record_evaluation, scan_unsafe, verify_project
 
 
@@ -59,6 +60,13 @@ class Factory:
     # -- helpers ---------------------------------------------------------
     def tree(self) -> str:
         return workspace.tree(self.root)
+
+    def _toolbox(self) -> Toolbox:
+        """A workspace-lookup budget for one generation. See :mod:`hermes.tools`."""
+        return Toolbox(self.sandbox,
+                       budget=int(self.config.get("execution.tool_calls", 6)),
+                       rounds=int(self.config.get("execution.tool_rounds", 3)),
+                       log=self.log)
 
     def context(self, extra: str = "") -> str:
         return context_block(self.state, self.tree(), extra)
@@ -288,6 +296,8 @@ class Factory:
                 candidates=int(self.config.get("execution.candidates", 1)),
                 allow_edits=bool(self.config.get("execution.edit_protocol", True)),
                 prefetched=self._take_prefetch(ticket),
+                tool_calls=int(self.config.get("execution.tool_calls", 6)),
+                tool_rounds=int(self.config.get("execution.tool_rounds", 3)),
                 on_apply=lambda: self._prefetch_next(ticket),
                 log=self.log)
 
@@ -344,6 +354,7 @@ class Factory:
         kwargs = dict(prior=self.journal.block(candidate, self.board),
                       hints=self.journal.suggested_files(candidate, self.board),
                       allow_edits=bool(self.config.get("execution.edit_protocol", True)),
+                      toolbox=self._toolbox(),
                       log=self.log)
 
         def generate_ahead() -> dict:

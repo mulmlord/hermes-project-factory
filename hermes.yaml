@@ -42,6 +42,8 @@ execution:
   candidates: 1
   edit_protocol: true
   prefetch: true
+  tool_calls: 6
+  tool_rounds: 3
 
 evolution:
   enabled: true

@@ -12,6 +12,7 @@ from .agents import Prompt
 from .log import Logger, NULL
 from .sandbox import Result, Sandbox
 from .tickets import split_validation
+from .tools import Lookup, Toolbox
 
 #: Patterns that mark generated code as unsafe regardless of test results.
 UNSAFE_PATTERNS = [
@@ -243,7 +244,7 @@ def change_view(sandbox: Sandbox, change, budget: int) -> str:
 
 
 def review(agents, ticket, sandbox: Sandbox, change, verification: Verification,
-           prior: str = "", log: Logger = NULL) -> dict:
+           prior: str = "", toolbox: Toolbox | None = None, log: Logger = NULL) -> dict:
     """Reviewer verdict on a ticket's change. Blocking issues send it back.
 
     *prior* is the work journal, which lets the reviewer catch what a diff
@@ -251,6 +252,12 @@ def review(agents, ticket, sandbox: Sandbox, change, verification: Verification,
     another ticket already depends on. It is also the first thing dropped when
     the change itself does not fit: a review of code the reviewer was not
     shown is worse than one made without the history.
+
+    *toolbox* lets the reviewer read the rest of the workspace. A change is
+    shown without the code around it, so a caller the change breaks and a
+    helper it duplicates are both outside the diff; without a lookup the
+    reviewer can only guess at them, and a guessed defect blocks a ticket
+    that was correct.
     """
     reviewer = agents["reviewer"]
     prompt = Prompt(reviewer, log=log)
@@ -277,10 +284,11 @@ def review(agents, ticket, sandbox: Sandbox, change, verification: Verification,
                "criteria, stubbed-out work, security problems, or missing error "
                "handling at a trust boundary. Do not block on style or taste.",
                required=True)
+    lookup = Lookup(reviewer, prompt, toolbox, log=log)
     header = "CHANGE:\n"
     view.fill(header + change_view(sandbox, change,
                                    max(0, view.room() - len(header))))
-    verdict = reviewer.ask_json(prompt.render())
+    verdict = lookup.ask()
     blocking = [b for b in (verdict.get("blocking") or []) if str(b).strip()]
     security = [s for s in (verdict.get("security") or []) if str(s).strip()]
     verdict["approved"] = bool(verdict.get("approved")) and not blocking and not security

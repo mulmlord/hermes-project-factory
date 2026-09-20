@@ -97,6 +97,9 @@ DEFAULTS: dict[str, Any] = {
         "candidates": 1,        # independent samples raced through the gates
         "edit_protocol": True,  # let agents patch a file instead of rewriting it
         "prefetch": True,       # generate the next ticket while this one verifies
+        "tool_calls": 6,        # read-only workspace lookups one answer may make
+        "tool_rounds": 3,       # extra generations those lookups may cost; 0 for
+                                # neither, which is the single-shot prompt
     },
     "resources": {
         "reserve_ram_gb": 2,            # free RAM a host without a GPU keeps back
@@ -324,6 +327,11 @@ execution:
                          # the gates are cheap relative to generation
   edit_protocol: true    # let agents patch a file instead of rewriting it whole
   prefetch: true         # generate the next ticket while this one verifies
+  tool_calls: 6          # read-only lookups (read_file, grep, list_dir) the
+                         # implementer or reviewer may make before it answers,
+                         # so it can check a name instead of inventing one
+  tool_rounds: 3         # extra generations those lookups may cost. Set either
+                         # to 0 to go back to a single-shot prompt
 
 evolution:
   enabled: true

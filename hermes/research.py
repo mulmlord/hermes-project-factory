@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .agents import Prompt
 from .log import Logger, NULL
 from .sources import as_records
 from .workspace import slugify
@@ -43,14 +44,26 @@ class ResearchLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps({"rounds": self.rounds}, indent=2, default=str))
 
-    def known(self) -> str:
-        """Everything established so far, for feeding back into later rounds."""
+    def known(self, budget: int = 8000) -> str:
+        """Everything established so far, for feeding back into later rounds.
+
+        Newest first into the budget, oldest dropped: a finding from round one
+        has usually already become a decision in the spec, while the one from
+        the round before this is what this topic follows from.
+        """
         lines = []
         for round_ in self.rounds:
             for finding in round_.get("findings", []):
                 lines.append(f"- ({finding.get('confidence', '?')}) "
                              f"{finding.get('question')}: {finding.get('answer')}")
-        return "\n".join(lines[-40:]) or "(nothing established yet)"
+        kept: list[str] = []
+        used = 0
+        for line in reversed(lines[-40:]):
+            if kept and used + len(line) + 1 > budget:
+                break
+            used += len(line) + 1
+            kept.append(line)
+        return "\n".join(reversed(kept)) or "(nothing established yet)"
 
 
 def investigate(agents, root: Path, topic: str, context: str, *,
@@ -65,22 +78,31 @@ def investigate(agents, root: Path, topic: str, context: str, *,
     record = ResearchLog(root)
     log.info("research.round", topic=topic[:80])
 
-    plan = researcher.ask_json(
-        f"{context}\n\nRESEARCH TOPIC: {topic}\n\n"
-        f"ALREADY ESTABLISHED:\n{record.known()}\n\n"
+    plan_prompt = Prompt(researcher, log=log)
+    plan_prompt.add("context", context, priority=20, floor=600)
+    plan_prompt.add("topic", f"RESEARCH TOPIC: {topic}", required=True)
+    # What earlier rounds established is what stops this one re-asking their
+    # questions, so it outranks the project context; the tail is kept because
+    # the latest rounds are the ones this topic follows from.
+    established = plan_prompt.add("established", priority=10, floor=800, tail=True)
+    plan_prompt.add(
+        "instructions",
         "Step 1 of the Feynman method. Return JSON:\n"
         "{\n"
         '  "simple_explanation": "explain the problem as if to a smart person '
         'outside the field, in 3-5 sentences",\n'
         '  "what_we_know": ["established facts that need no research"],\n'
-        f'  "unknowns": [{{"question": "specific answerable question", '
+        '  "unknowns": [{"question": "specific answerable question", '
         '"why_it_matters": "what decision it changes", '
-        '"needs_experiment": true|false}}],\n'
+        '"needs_experiment": true|false}],\n'
         '  "assumptions_to_challenge": ["assumption that could be wrong"]\n'
         "}\n"
         f"List at most {max_unknowns} unknowns, ordered by how much each would "
-        "change the implementation. Skip anything already established."
-    )
+        "change the implementation. Skip anything already established.",
+        required=True)
+    header = "ALREADY ESTABLISHED:\n"
+    established.fill(header + record.known(max(0, established.room() - len(header))))
+    plan = researcher.ask_json(plan_prompt.render())
     unknowns = (plan.get("unknowns") or [])[:max_unknowns]
 
     refused_from = len(librarian.refusals) if librarian else 0
@@ -95,15 +117,21 @@ def investigate(agents, root: Path, topic: str, context: str, *,
         if not question:
             continue
         log.info("research.unknown", n=index, question=question[:80])
-        answer = researcher.ask_json(
-            f"{context}\n\nQUESTION: {question}\n"
-            f"WHY IT MATTERS: {unknown.get('why_it_matters', '') if isinstance(unknown, dict) else ''}\n\n"
-            + (f"RETRIEVED SOURCES — this text was fetched for this round. "
-               f"Prefer it over memory, and cite the ones you actually used:\n"
-               f"{material}\n\n" if material else "")
-            + ("Answer from the retrieved sources where they cover the question, "
-               "and from what you know where they do not. Say which is which.\n"
-               if material else "Answer from what you actually know.\n")
+        ask = Prompt(researcher, log=log)
+        ask.add("context", context, priority=20, floor=600)
+        ask.add("question", f"QUESTION: {question}\nWHY IT MATTERS: "
+                + (unknown.get("why_it_matters", "") if isinstance(unknown, dict) else ""),
+                required=True)
+        # Retrieved text is the only thing here the model does not already
+        # have, so it outranks the project context it was fetched to answer.
+        ask.add("material",
+                ("RETRIEVED SOURCES — this text was fetched for this round. "
+                 "Prefer it over memory, and cite the ones you actually used:\n"
+                 f"{material}" if material else ""), priority=10, floor=1500)
+        ask.add("instructions",
+            ("Answer from the retrieved sources where they cover the question, "
+             "and from what you know where they do not. Say which is which.\n"
+             if material else "Answer from what you actually know.\n")
             + "Return JSON:\n"
             "{\n"
             '  "answer": "the substantive answer, with concrete names, algorithms, '
@@ -119,8 +147,8 @@ def investigate(agents, root: Path, topic: str, context: str, *,
             "}\n"
             "If you are not sure, say so in confidence rather than inventing "
             "specifics. An honest 'uncertain' plus an experiment is worth more "
-            "than a confident guess."
-        )
+            "than a confident guess.", required=True)
+        answer = researcher.ask_json(ask.render())
         findings.append({
             "question": question,
             "answer": answer.get("answer", ""),
@@ -132,8 +160,11 @@ def investigate(agents, root: Path, topic: str, context: str, *,
             "experiment": answer.get("experiment", ""),
         })
 
-    synthesis = researcher.ask_json(
-        f"{context}\n\nTOPIC: {topic}\n\nFINDINGS:\n{json.dumps(findings, indent=2)[:12000]}\n\n"
+    close = Prompt(researcher, log=log)
+    close.add("context", context, priority=20, floor=600)
+    close.add("topic", f"TOPIC: {topic}", required=True)
+    answers = close.add("findings", priority=10, floor=2000)
+    close.add("instructions",
         "Challenge these findings, then convert them into action. Where two "
         "findings conflict, say which one wins and why. Return JSON:\n"
         "{\n"
@@ -145,8 +176,11 @@ def investigate(agents, root: Path, topic: str, context: str, *,
         '  "tickets": [{"title": "", "objective": "", "kind": "research|experiment|'
         'implementation|test|optimization", "acceptance": [""], "validation": [""]}],\n'
         '  "remaining_unknowns": ["what is still genuinely open"]\n'
-        "}"
-    )
+        "}", required=True)
+    header = "FINDINGS:\n"
+    answers.fill(header + json.dumps(findings, indent=2)[
+        : max(0, answers.room() - len(header))])
+    synthesis = researcher.ask_json(close.render())
 
     payload = {
         "simple_explanation": plan.get("simple_explanation", ""),

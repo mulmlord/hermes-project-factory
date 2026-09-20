@@ -12,6 +12,7 @@ from hermes import workspace
 from hermes.config import Config
 from hermes.factory import Factory
 from hermes.journal import Journal
+from hermes.models import Router
 
 CALC = '''\
 """Tiny calculator."""
@@ -96,6 +97,11 @@ class StubRouter:
 
     def describe(self, task):
         return "stub:model"
+
+    def allowance(self, task):
+        # A real 16k context, so a prompt the loop builds too large fails here
+        # exactly as it would against the configured server.
+        return Router(Config.load()).allowance(task)
 
     def preflight(self):
         return ["stub ok"]

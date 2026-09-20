@@ -4,6 +4,9 @@ models:
     backend: vllm
     base_url: http://localhost:6767/v1
     model: qwen2.5-coder-7b-instruct-awq
+    # Must match the server's --max-model-len: every prompt budget in the
+    # factory is derived from it, and a value larger than the server's is
+    # discovered as a refused request.
     context: 16384
     temperature: 0.2
     timeout: 1200

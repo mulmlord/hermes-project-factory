@@ -21,7 +21,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-from .agents import context_block
+from .agents import Prompt, context_block
 from .log import Logger, NULL
 from .sandbox import Sandbox
 from .verify import Verification, run_commands, scan_unsafe
@@ -363,36 +363,51 @@ class Evolution:
 
     # -- candidate generation --------------------------------------------
     def propose(self, generation: int, family: str, parent: Candidate) -> dict:
+        evolver = self.agents["evolver"]
+        prompt = Prompt(evolver, log=self.log)
+        prompt.add("context", context_block(self.state, ", ".join(self.targets)),
+                   priority=30, floor=600)
+        prompt.add("objective",
+                   f"OBJECTIVE: {self.objective.direction} {self.objective.metric}\n"
+                   f"MEASURED BY: {self.objective.command}\n"
+                   f"CURRENT BEST SCORE: {self.best.score if self.best else None}\n"
+                   f"SCORE OF THE CODE BELOW: {parent.score}\n"
+                   f"SMALLEST MEANINGFUL GAIN: {self.margin(parent.score):.6g} "
+                   f"(anything less is measurement noise)\n"
+                   f"GENERATION: {generation}", required=True)
+        code = prompt.add("code", priority=10, floor=2000)
+        prompt.add("history",
+                   (("CHANGES THAT HELPED HERE:\n"
+                     + "\n".join(f"- {h}" for h in self.helped[-6:]) + "\n\n")
+                    if self.helped else "")
+                   + (("CHANGES THAT DID NOT HELP HERE:\n"
+                       + "\n".join(f"- {r}" for r in self.hurt[-12:]))
+                      if self.hurt else ""), priority=20, floor=400)
+        prompt.add("direction", f"THIS GENERATION'S DIRECTION: {family}\n\n"
+                   "Propose ONE focused change in that direction that improves the "
+                   "objective while keeping every test passing. Do not repeat a change "
+                   "listed as not helping. Return JSON:\n"
+                   '{"mutation": "one line naming the change", '
+                   '"mechanism": "why this is faster/better, mechanically", '
+                   '"files": [{"path": "", "content": "COMPLETE new file contents"}], '
+                   '"risk": "what could break"}', required=True)
+        # The candidate must return complete files, so it has to be shown
+        # complete files: the code block takes what the fixed blocks leave,
+        # shared between the targets, and a target that does not fit is not
+        # offered at all rather than offered as a fragment.
+        code.fill("CURRENT CODE:\n" + self._sources(max(0, code.room() - 14)))
+        return evolver.ask_json(prompt.render())
+
+    def _sources(self, budget: int) -> str:
+        """The evolution targets, whole, within *budget* characters."""
+        targets = self.targets[:4]
+        share = budget // max(1, len(targets))
         sources = []
-        for target in self.targets[:4]:
-            text = self.sandbox.read(target, limit=12000)
+        for target in targets:
+            text = self.sandbox.read(target, limit=share)
             if text:
                 sources.append(f"--- {target} ---\n{text}")
-        return self.agents["evolver"].ask_json(
-            f"{context_block(self.state, ', '.join(self.targets))}\n\n"
-            f"OBJECTIVE: {self.objective.direction} {self.objective.metric}\n"
-            f"MEASURED BY: {self.objective.command}\n"
-            f"CURRENT BEST SCORE: {self.best.score if self.best else None}\n"
-            f"SCORE OF THE CODE BELOW: {parent.score}\n"
-            f"SMALLEST MEANINGFUL GAIN: {self.margin(parent.score):.6g} "
-            f"(anything less is measurement noise)\n"
-            f"GENERATION: {generation}\n\n"
-            f"CURRENT CODE:\n" + "\n\n".join(sources) + "\n\n"
-            + (("CHANGES THAT HELPED HERE:\n"
-                + "\n".join(f"- {h}" for h in self.helped[-6:]) + "\n\n")
-               if self.helped else "")
-            + (("CHANGES THAT DID NOT HELP HERE:\n"
-                + "\n".join(f"- {r}" for r in self.hurt[-12:]) + "\n\n")
-               if self.hurt else "")
-            + f"THIS GENERATION'S DIRECTION: {family}\n\n"
-            "Propose ONE focused change in that direction that improves the "
-            "objective while keeping every test passing. Do not repeat a change "
-            "listed as not helping. Return JSON:\n"
-            '{"mutation": "one line naming the change", '
-            '"mechanism": "why this is faster/better, mechanically", '
-            '"files": [{"path": "", "content": "COMPLETE new file contents"}], '
-            '"risk": "what could break"}'
-        )
+        return "\n\n".join(sources)
 
     def remember(self, family: str, mutation: str, improved: bool,
                  detail: str = "") -> None:

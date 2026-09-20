@@ -5,7 +5,7 @@ import json
 import time
 from pathlib import Path
 
-from .agents import context_block
+from .agents import Prompt, context_block
 from .log import Logger, NULL
 from .sandbox import Sandbox
 from .workspace import tree
@@ -24,7 +24,13 @@ def write_all(agents, sandbox: Sandbox, state, board, log: Logger = NULL) -> Non
 
 
 def _source_digest(sandbox: Sandbox, budget: int = 30000) -> str:
-    """Entry points and public surface, so docs describe real behaviour."""
+    """Entry points and public surface, so docs describe real behaviour.
+
+    *budget* is the room the caller has left in the documenter's context: the
+    README is written from whatever of the project fits here, so the files are
+    taken in glob order and each is capped, rather than the first file taking
+    everything.
+    """
     root = sandbox.root
     interesting = []
     for pattern in ("src/**/*", "*.py", "*.js", "*.ts", "*.go", "*.rs", "*.c", "*.cpp",
@@ -41,7 +47,7 @@ def _source_digest(sandbox: Sandbox, budget: int = 30000) -> str:
             text = path.read_text(errors="replace")
         except OSError:
             continue
-        slice_ = text[: min(4000, budget - used)]
+        slice_ = text[: min(max(1, budget // 8), budget - used)]
         used += len(slice_)
         chunks.append(f"--- {path.relative_to(root)} ---\n{slice_}")
     return "\n\n".join(chunks) or "(no sources found)"
@@ -54,26 +60,38 @@ def readme(agents, sandbox: Sandbox, state, board, log: Logger = NULL) -> Path:
                for t in board.by_status("abandoned", "blocked")]
     metrics = state.metrics.get("optimization")
     log.info("docs.readme")
-    result = agents["documenter"].ask_json(
-        f"{context_block(state, tree(sandbox.root))}\n\n"
-        f"SPECIFICATION:\n{json.dumps(state.spec, indent=2)[:6000]}\n\n"
-        f"SOURCE:\n{_source_digest(sandbox)}\n\n"
-        f"IMPLEMENTED:\n" + "\n".join(f"- {c}" for c in completed[:40]) + "\n\n"
-        + (f"NOT IMPLEMENTED:\n" + "\n".join(f"- {d}" for d in dropped[:20]) + "\n\n"
-           if dropped else "")
-        + (f"MEASURED PERFORMANCE: {json.dumps(metrics)}\n\n" if metrics else "")
-        + f"COMMANDS: setup=`{commands.get('setup')}` build=`{commands.get('build')}` "
-          f"test=`{commands.get('test')}` benchmark=`{commands.get('benchmark')}`\n\n"
-        "Write the project README. Document only what the source above actually "
-        "does; never invent a feature or a flag. Every command must be one a user "
-        "can really run from a clean checkout. Return JSON with a markdown string "
-        "for each key:\n"
-        "{" + ", ".join(f'"{s}": ""' for s in README_SECTIONS) + "}\n"
-        "purpose: 2-3 sentences. features: a bulleted list of what works today. "
-        "architecture: how the pieces fit, with the real file names. examples: at "
-        "least one complete runnable example with its expected output. "
-        "limitations: honest, including anything listed as not implemented."
-    )
+    documenter = agents["documenter"]
+    prompt = Prompt(documenter, log=log)
+    prompt.add("context", context_block(state), required=True)
+    prompt.add("tree", f"FILES:\n{tree(sandbox.root)}", priority=40, floor=400)
+    prompt.add("spec", f"SPECIFICATION:\n{json.dumps(state.spec, indent=2)}",
+               priority=20, floor=1000)
+    source = prompt.add("source", priority=10, floor=4000)
+    prompt.add("tickets",
+               "IMPLEMENTED:\n" + "\n".join(f"- {c}" for c in completed[:40])
+               + (("\n\nNOT IMPLEMENTED:\n"
+                   + "\n".join(f"- {d}" for d in dropped[:20])) if dropped else ""),
+               priority=30, floor=500)
+    prompt.add("commands",
+               (f"MEASURED PERFORMANCE: {json.dumps(metrics)}\n" if metrics else "")
+               + f"COMMANDS: setup=`{commands.get('setup')}` "
+                 f"build=`{commands.get('build')}` test=`{commands.get('test')}` "
+                 f"benchmark=`{commands.get('benchmark')}`", required=True)
+    prompt.add("instructions",
+               "Write the project README. Document only what the source above actually "
+               "does; never invent a feature or a flag. Every command must be one a user "
+               "can really run from a clean checkout. Return JSON with a markdown string "
+               "for each key:\n"
+               "{" + ", ".join(f'"{s}": ""' for s in README_SECTIONS) + "}\n"
+               "purpose: 2-3 sentences. features: a bulleted list of what works today. "
+               "architecture: how the pieces fit, with the real file names. examples: at "
+               "least one complete runnable example with its expected output. "
+               "limitations: honest, including anything listed as not implemented.",
+               required=True)
+    # The source outranks everything optional: a README written from the spec
+    # instead of the code is exactly the invented documentation this forbids.
+    source.fill("SOURCE:\n" + _source_digest(sandbox, max(0, source.room() - 8)))
+    result = documenter.ask_json(prompt.render())
     title = state.spec.get("name", state.name)
     body = [f"# {title}\n", result.get("purpose", state.idea).strip(), ""]
     for section in README_SECTIONS[1:]:
@@ -88,14 +106,18 @@ def readme(agents, sandbox: Sandbox, state, board, log: Logger = NULL) -> Path:
 
 
 def architecture(agents, sandbox: Sandbox, state, log: Logger = NULL) -> Path:
-    result = agents["documenter"].ask_json(
-        f"{context_block(state, tree(sandbox.root))}\n\n"
-        f"SOURCE:\n{_source_digest(sandbox, budget=20000)}\n\n"
-        "Document the architecture as built. Return JSON:\n"
-        '{"overview": "", "components": [{"name": "", "path": "", '
-        '"responsibility": "", "interfaces": ""}], "data_flow": "", '
-        '"key_decisions": [""], "extension_points": [""]}'
-    )
+    documenter = agents["documenter"]
+    prompt = Prompt(documenter, log=log)
+    prompt.add("context", context_block(state), required=True)
+    prompt.add("tree", f"FILES:\n{tree(sandbox.root)}", priority=20, floor=400)
+    source = prompt.add("source", priority=10, floor=4000)
+    prompt.add("instructions",
+               "Document the architecture as built. Return JSON:\n"
+               '{"overview": "", "components": [{"name": "", "path": "", '
+               '"responsibility": "", "interfaces": ""}], "data_flow": "", '
+               '"key_decisions": [""], "extension_points": [""]}', required=True)
+    source.fill("SOURCE:\n" + _source_digest(sandbox, max(0, source.room() - 8)))
+    result = documenter.ask_json(prompt.render())
     lines = [f"# Architecture\n", result.get("overview", ""), "", "## Components\n"]
     for component in result.get("components") or []:
         if not isinstance(component, dict):

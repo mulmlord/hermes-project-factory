@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .log import Logger, NULL
-from .models import Router
+from .models import Allowance, PromptTooLarge, Router
 
 _PROTOCOL_HEAD = """\
 Return JSON of exactly this shape:
@@ -75,6 +75,14 @@ class Agent:
         self.log.info("agent.ask_json", agent=self.name,
                       model=self.router.describe(self.task))
         return self.router.complete_json(self.task, self.system, prompt, **kw)
+
+    def allowance(self) -> Allowance:
+        """What this role's model gives it to spend on one prompt."""
+        return self.router.allowance(self.task)
+
+    def prompt(self, log: Logger | None = None) -> "Prompt":
+        """An empty prompt already sized to this agent's budget."""
+        return Prompt(self, log=log)
 
 
 BASE = (
@@ -218,3 +226,121 @@ def ticket_block(ticket) -> str:
         + "\nEXPECTED ARTIFACTS:\n"
         + ("\n".join(f"  - {a}" for a in ticket.artifacts) or "  - (your judgement)")
     )
+
+
+# -- prompt assembly ---------------------------------------------------------
+
+@dataclass
+class Block:
+    """One labelled piece of a prompt, and what to do when it will not fit.
+
+    A block that a caller must size itself -- file contents, a failure log --
+    is added empty, asked for its :meth:`room`, and filled.
+    """
+
+    name: str
+    text: str = ""
+    priority: int = 50
+    #: Characters below which a trimmed copy is not worth its room. Without
+    #: one, the block is kept whole or dropped whole.
+    floor: int = 0
+    #: Keep the end rather than the start. True for anything where the last
+    #: lines carry the meaning, such as a traceback.
+    tail: bool = False
+    #: The prompt cannot be built without it: never trimmed, never dropped.
+    required: bool = False
+    owner: "Prompt | None" = None
+
+    def room(self) -> int:
+        """Characters free for this block once everything above it is in."""
+        return self.owner.room(self.priority) if self.owner else 0
+
+    def fill(self, text: str) -> "Block":
+        self.text = text
+        return self
+
+
+class Prompt:
+    """An agent prompt assembled inside its model's token budget.
+
+    Blocks are added in the order they should be *read* -- stable first, so a
+    local server can reuse the cached prefix across the calls that share it --
+    and carry a separate priority saying what survives when they do not all
+    fit. Spending in priority order and dropping whole blocks is the point:
+    trimming every block a little leaves half a file listing, half the
+    journal and half the source the ticket is actually about, and the last of
+    those is the one that makes the prompt unanswerable.
+    """
+
+    MARKER = "… (trimmed to fit the model context)"
+
+    #: Characters the blank line between blocks costs.
+    SEPARATOR = 2
+
+    def __init__(self, agent: Agent, log: Logger | None = None):
+        self.allowance = agent.allowance()
+        self.log = agent.log if log is None else log
+        self.blocks: list[Block] = []
+        # The role's system prompt is charged against the same context, and
+        # complete_json adds a line to it, so the user turn cannot have the
+        # whole allowance.
+        self.limit = max(0, self.allowance.prompt_chars - len(agent.system) - 200)
+
+    def add(self, name: str, text: str = "", *, priority: int = 50, floor: int = 0,
+            tail: bool = False, required: bool = False) -> Block:
+        block = Block(name, text, priority, floor, tail, required, owner=self)
+        self.blocks.append(block)
+        return block
+
+    def room(self, priority: int) -> int:
+        """Characters still free for a block of *priority*.
+
+        Counts everything that outranks it, whether or not it has been added
+        yet -- so a caller that sizes its own content gets the same answer
+        wherever in the assembly it asks.
+        """
+        spent = sum(len(b.text) + self.SEPARATOR for b in self.blocks
+                    if (b.required or b.priority < priority) and b.text)
+        return max(0, self.limit - spent - self.SEPARATOR)
+
+    def render(self) -> str:
+        """Spend the budget, then join what survived in reading order."""
+        limit = self.limit
+        required = [b for b in self.blocks if b.required]
+        room = limit - sum(len(b.text) + self.SEPARATOR for b in required if b.text)
+        if room < 0:
+            raise PromptTooLarge(
+                f"task {self.allowance.task!r}: the blocks that cannot be dropped "
+                f"are {-room} characters over a budget of {limit} "
+                f"({self.allowance.prompt_tokens} tokens of a "
+                f"{self.allowance.context}-token context): "
+                + ", ".join(f"{b.name} {len(b.text)}c" for b in required)
+            )
+        kept = {id(b): b.text for b in required}
+        for block in sorted((b for b in self.blocks if not b.required),
+                            key=lambda b: b.priority):
+            if not block.text:
+                continue
+            cost = len(block.text) + self.SEPARATOR
+            if cost <= room:
+                kept[id(block)] = block.text
+                room -= cost
+            elif block.floor and room - self.SEPARATOR >= block.floor:
+                kept[id(block)] = self._trim(block, room - self.SEPARATOR)
+                self.log.warn("prompt.block_trimmed", task=self.allowance.task,
+                              block=block.name, had=len(block.text),
+                              kept=len(kept[id(block)]))
+                room -= len(kept[id(block)]) + self.SEPARATOR
+            else:
+                self.log.warn("prompt.block_dropped", task=self.allowance.task,
+                              block=block.name, chars=len(block.text), room=room)
+        return "\n\n".join(text for text in
+                            (kept.get(id(b), "") for b in self.blocks) if text)
+
+    def _trim(self, block: Block, room: int) -> str:
+        body = room - len(self.MARKER) - 1
+        if body <= 0:
+            return ""
+        if block.tail:
+            return f"{self.MARKER}\n{block.text[-body:]}"
+        return f"{block.text[:body]}\n{self.MARKER}"

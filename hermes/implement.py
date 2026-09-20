@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .agents import context_block, file_protocol, ticket_block
+from .agents import Prompt, context_block, file_protocol, ticket_block
 from .log import Logger, NULL
 from .sandbox import Sandbox, SandboxError
 from .verify import Verification, review, triage, verify_ticket
@@ -185,6 +185,11 @@ def relevant_files(sandbox: Sandbox, ticket, plan: dict, hints: list[str] | None
     *hints* are paths the work journal says prior tickets actually wrote. They
     beat the ticket's own artifact list, which is a guess made before the code
     existed and often names files nobody ever created.
+
+    *budget* is what the caller has left after everything that outranks this
+    block; :func:`generate` takes it from the model's context rather than
+    guessing, because the files that do not fit here are read as a guess about
+    what the ticket needs anyway.
     """
     wanted: list[str] = list(ticket.artifacts) + list(hints or [])
     for component in plan.get("components") or []:
@@ -217,26 +222,39 @@ def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
              temperature: float | None = None, log: Logger = NULL) -> dict:
     """Ask the right agent for the code that satisfies *ticket*.
 
-    Ordered stable-first so a retry can reuse the inference server's cached
-    prefix: the project, the ticket and the work journal are identical across
-    all attempts at this ticket, and only the tail -- the file listing, the
-    current contents, and the failure being repaired -- differs between them.
+    Blocks are added in reading order, stable first, so a retry can reuse the
+    inference server's cached prefix: the project, the ticket and the work
+    journal are identical across all attempts at this ticket, and only the
+    tail -- the file listing, the current contents, and the failure being
+    repaired -- differs between them. Their priorities are a different
+    ordering: what survives when the model's context cannot hold all of it.
+    The repair instructions and the failure outrank the sources, which outrank
+    the journal, which outranks the file listing.
     """
     agent = agents["tester"] if ticket.kind == "test" else agents["implementer"]
-    existing = relevant_files(sandbox, ticket, state.plan, hints)
-    prompt = (
-        f"{context_block(state)}\n\n{ticket_block(ticket)}\n\n"
-        + (f"{prior}\n\n" if prior else "")
-        + f"FILES:\n{tree}\n\n"
-        + f"EXISTING FILES RELEVANT TO THIS TICKET:\n{existing}\n\n"
-        + (f"REPAIR INSTRUCTIONS:\n{instructions}\n\n" if instructions else "")
-        + (f"PREVIOUS ATTEMPT FAILED:\n{failure[:6000]}\n\n" if failure else "")
-        + "Implement this ticket completely. Every file you return must be "
-        "complete and runnable. If the ticket needs tests, write real ones.\n\n"
-        + file_protocol(edits=allow_edits)
-    )
+    prompt = Prompt(agent, log=log)
+    prompt.add("context", context_block(state), required=True)
+    prompt.add("ticket", ticket_block(ticket), required=True)
+    prompt.add("journal", prior, priority=40, floor=1200)
+    prompt.add("tree", f"FILES:\n{tree}", priority=50, floor=400)
+    sources = prompt.add("sources", priority=30, floor=2000)
+    if instructions:
+        prompt.add("repair", f"REPAIR INSTRUCTIONS:\n{instructions}", priority=10)
+    if failure:
+        prompt.add("failure", f"PREVIOUS ATTEMPT FAILED:\n{failure}",
+                   priority=20, floor=800, tail=True)
+    prompt.add("closing", "Implement this ticket completely. Every file you return "
+               "must be complete and runnable. If the ticket needs tests, write "
+               "real ones.", required=True)
+    prompt.add("protocol", file_protocol(edits=allow_edits), required=True)
+    # Filled last so the room it is given accounts for the repair instructions
+    # and the failure, which outrank it: knowing what broke is worth more than
+    # a sixth file the ticket may not touch.
+    header = "EXISTING FILES RELEVANT TO THIS TICKET:\n"
+    sources.fill(header + relevant_files(sandbox, ticket, state.plan, hints,
+                                         budget=max(0, sources.room() - len(header))))
     extra = {} if temperature is None else {"temperature": temperature}
-    return agent.ask_json(prompt, **extra)
+    return agent.ask_json(prompt.render(), **extra)
 
 
 def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
@@ -251,7 +269,13 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
     board.move(ticket.id, "active", "picked up")
     board.save()
     # Read once: the journal cannot change while this ticket is the one running.
-    prior = journal.block(ticket, board) if journal else ""
+    # An eighth of the implementer's prompt is what history is worth against
+    # the code the ticket is about; taking it from the model's context rather
+    # than a constant means a bigger model remembers proportionally more.
+    prior = journal.block(
+        ticket, board,
+        budget=max(1000, agents["implementer"].allowance().prompt_chars // 8),
+    ) if journal else ""
     hints = journal.suggested_files(ticket, board) if journal else []
     instructions, failure = "", ""
     last_verification: Verification | None = None
@@ -308,8 +332,8 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
             state.metrics["tests_passed"] = True
 
         if verification.passed:
-            verdict = review(agents, ticket, _change_view(sandbox, change),
-                             verification, prior=prior, log=log)
+            verdict = review(agents, ticket, sandbox, change, verification,
+                             prior=prior, log=log)
             if verdict.get("approved"):
                 board.move(ticket.id, "review", change.describe())
                 for note in verdict.get("advisory", [])[:3]:
@@ -411,17 +435,3 @@ def _race(sandbox: Sandbox, payloads: list[dict], gate, ticket, log: Logger):
         restore(sandbox, saved)
     return change, verification
 
-
-def _change_view(sandbox: Sandbox, change: Change, budget: int = 20000) -> str:
-    """The written files, truncated, as the reviewer's view of the change."""
-    parts, used = [], 0
-    for path in change.written:
-        text = sandbox.read(path)
-        slice_ = text[: max(0, budget - used)]
-        if not slice_:
-            break
-        used += len(slice_)
-        parts.append(f"--- {path} ---\n{slice_}")
-    if change.deleted:
-        parts.append("deleted: " + ", ".join(change.deleted))
-    return "\n\n".join(parts) or change.describe()

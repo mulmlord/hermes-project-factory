@@ -8,15 +8,18 @@ import pytest
 
 from types import SimpleNamespace
 
-from hermes.config import Config, ConfigError, deep_merge, is_local_url
+from hermes.agents import Prompt
+from hermes.config import Config, ConfigError, DEFAULTS, deep_merge, is_local_url
 from hermes.evolve import Bandit, Candidate, Evolution, Objective, parse_score
 from hermes.implement import (Change, _protected, _race, apply_change, execute_ticket,
+                             generate,
                               relevant_files, restore as restore_files,
                               snapshot as snapshot_files)
 from hermes.git_ops import GitHub, Issues
 from hermes.journal import Entry, Journal
 from hermes.log import NULL
-from hermes.models import ModelError, Router, extract_json, strip_reasoning
+from hermes.models import (ModelError, PromptTooLarge, Router, extract_json,
+                          strip_reasoning)
 from hermes.openhands import OpenHands
 from hermes.research import investigate
 from hermes.resources import Governor
@@ -271,6 +274,126 @@ def test_only_routed_models_are_preflighted():
     assert "simple" in tasks  # the summariser gives the small model real work
 
 
+# -- prompt budgets ----------------------------------------------------------
+
+def _router(context: int) -> Router:
+    """A router whose only interesting property is the configured context."""
+    return Router(Config(deep_merge(DEFAULTS, {"models": {"default": {"context": context}}})))
+
+
+def test_the_prompt_budget_is_derived_from_the_configured_context():
+    """One number an operator sets decides what every agent may send."""
+    small, large = _router(16384), _router(65536)
+    coding = small.allowance("coding")
+    assert coding.context == 16384
+    assert coding.prompt_tokens == 16384 - coding.reserve - coding.overhead
+    assert coding.prompt_chars == coding.prompt_tokens * 3
+    # Raising the context is all an operator does; the budgets follow.
+    assert large.allowance("coding").prompt_tokens > coding.prompt_tokens
+    # Same window, different split: a reviewer returns a verdict, an
+    # implementer returns whole files, so the reviewer may read more.
+    assert small.allowance("review").reserve < coding.reserve
+    assert small.allowance("review").prompt_tokens > coding.prompt_tokens
+
+
+def test_a_small_context_still_leaves_room_to_ask():
+    """The answer's floor must never swallow the whole window."""
+    allowance = _router(2048).allowance("coding")
+    assert allowance.reserve <= 2048 // 2
+    assert allowance.prompt_tokens > 0
+
+
+def test_the_server_is_told_how_much_room_the_answer_gets(refusing_server, tmp_path):
+    """An unsaid max_tokens is a server default: truncated JSON, or a runaway."""
+    router = _router_for(refusing_server, tmp_path)
+    router.complete_json("coding", "sys", "prompt")
+    assert refusing_server["requests"][0]["max_tokens"] == router.allowance("coding").reserve
+
+
+def test_an_oversized_prompt_is_refused_here_not_by_the_server(refusing_server, tmp_path):
+    """Nothing leaves the machine, and the message says what to change."""
+    router = _router_for(refusing_server, tmp_path)
+    oversized = "x" * (router.allowance("coding").prompt_chars + 1000)
+    with pytest.raises(PromptTooLarge, match="models.<role>.context"):
+        router.complete("coding", "sys", oversized)
+    assert refusing_server["requests"] == []
+
+
+def _prompt(limit: int) -> Prompt:
+    """An assembler with a known number of characters to spend.
+
+    The derivation from the model context is checked above; fixing the limit
+    here keeps the arithmetic of what survives readable.
+    """
+    prompt = Prompt(_agent(lambda _: {}))
+    prompt.limit = limit
+    return prompt
+
+
+def test_a_block_that_does_not_fit_is_dropped_whole():
+    """Trimming everything a little would leave half of each: answer nothing."""
+    prompt = _prompt(300)
+    prompt.add("ticket", "T" * 100, required=True)
+    prompt.add("sources", "S" * 150, priority=10)
+    prompt.add("tree", "F" * 150, priority=50)
+
+    rendered = prompt.render()
+    assert "S" * 150 in rendered   # the code the ticket is about, intact
+    assert "F" not in rendered     # the cheapest block went, whole
+    assert Prompt.MARKER not in rendered
+    assert len(rendered) <= prompt.limit
+
+
+def test_only_a_block_with_a_floor_is_trimmed_and_a_tail_keeps_its_end():
+    """A traceback's last line is the one that says what broke."""
+    prompt = _prompt(300)
+    prompt.add("ticket", "T" * 100, required=True)
+    failure = "frame\n" * 40 + "AssertionError: the last line"
+    prompt.add("failure", failure, priority=20, floor=40, tail=True)
+
+    rendered = prompt.render()
+    assert Prompt.MARKER in rendered
+    assert rendered.endswith("AssertionError: the last line")
+    assert len(rendered) <= prompt.limit
+
+
+def test_a_prompt_whose_required_blocks_do_not_fit_names_them():
+    prompt = _prompt(100)
+    prompt.add("context", "C" * 80, required=True)
+    prompt.add("protocol", "P" * 80, required=True)
+    with pytest.raises(PromptTooLarge, match="protocol 80c"):
+        prompt.render()
+
+
+def test_generate_fits_a_tight_context_and_keeps_what_the_ticket_needs(tmp_path):
+    """The whole implementer prompt, assembled under a window half the usual."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 30})
+    sandbox.write("src/a.py", "# the file the ticket is about\n" + "filler = 1\n" * 400)
+    board = Board(tmp_path)
+    ticket = board.add(title="carry the value", status="ready", artifacts=["src/a.py"],
+                       validation=["grep -q good src/a.py"])
+    state = State(idea="carry the value",
+                  plan={"commands": {"build": "true", "test": "true"}})
+
+    seen, dropped = [], []
+    agent = _agent(lambda prompt: seen.append(prompt) or {"summary": "", "files": []},
+                   context=6144)
+    log = SimpleNamespace(warn=lambda event, **kw: dropped.append((event, kw["block"])),
+                          info=lambda *a, **kw: None, debug=lambda *a, **kw: None,
+                          error=lambda *a, **kw: None)
+    generate({"implementer": agent, "tester": agent}, sandbox, state, ticket,
+             tree="\n".join(f"src/file{i}.py" for i in range(400)),
+             failure="Traceback\n" + "frame\n" * 300 + "AssertionError: the last line",
+             prior="journal entry\n" * 300, log=log)
+
+    prompt = seen[0]
+    agent.allowance().check(agent.system, prompt)  # the check the router makes
+    assert "the file the ticket is about" in prompt      # sources survived whole
+    assert "AssertionError: the last line" in prompt     # so did the failure's end
+    assert "FILES:" not in prompt                        # the listing went, whole
+    assert ("prompt.block_dropped", "tree") in dropped   # and said so
+
+
 # -- state -------------------------------------------------------------------
 
 def test_illegal_transition_rejected():
@@ -473,6 +596,35 @@ def test_snapshot_restores_a_file_that_did_not_exist(tmp_path):
     assert not (tmp_path / "src" / "new.py").exists()
 
 
+class Budgeted:
+    """What an agent double needs besides an answer: its own budget.
+
+    An agent that does not know its context cannot assemble a prompt, so a
+    double without one would exercise a path the factory never takes. The
+    numbers are the configured ones, which is what makes an overlong prompt
+    fail in a test the same way it would against the real server.
+    """
+
+    task = "coding"
+    system = ""
+    log = NULL
+
+    def allowance(self):
+        return Router(Config.load()).allowance(self.task)
+
+
+def _agent(answer, task: str = "coding", context: int | None = None):
+    """A stand-in for one :class:`~hermes.agents.Agent`.
+
+    *context* narrows the model window, which is how a test puts a prompt
+    under real budget pressure without having to invent a huge one.
+    """
+    router = Router(Config.load()) if context is None else _router(context)
+    return SimpleNamespace(ask_json=lambda prompt, **kw: answer(prompt),
+                           allowance=lambda: router.allowance(task),
+                           system="", log=NULL)
+
+
 #: One attempt each for the review cycle below: the change that clears the
 #: gates, the rewrite that answers the reviewer by breaking them, and the one
 #: that manages both.
@@ -513,9 +665,9 @@ def _review_cycle(tmp_path, replies):
         return {"diagnosis": "the value is wrong", "classification": "implementation",
                 "action": "repair", "instructions": "write the right value"}
 
-    agents = {name: SimpleNamespace(ask_json=lambda prompt, _fn=fn, **kw: _fn(prompt))
-              for name, fn in (("implementer", implement), ("tester", implement),
-                               ("reviewer", reviewer), ("triager", triager))}
+    agents = {name: _agent(fn) for name, fn in
+              (("implementer", implement), ("tester", implement),
+               ("reviewer", reviewer), ("triager", triager))}
     outcome = execute_ticket(agents, sandbox, state, board, ticket, lambda: "src/a.py",
                              max_attempts=len(replies))
     return outcome, sandbox, prompts, ticket
@@ -708,7 +860,7 @@ def test_the_router_registers_every_call_with_the_governor():
     seen = {}
 
     class Stub:
-        cfg = SimpleNamespace(model="m")
+        cfg = SimpleNamespace(model="m", context=16384)
 
         def complete(self, system, prompt, **kw):
             seen["inflight"] = governor.status()["inflight"]
@@ -766,8 +918,10 @@ def _librarian(root, **cfg):
     return Librarian(sandbox, root, cfg, NULL)
 
 
-class _Researcher:
+class _Researcher(Budgeted):
     """Answers the three research prompts, citing whatever it was handed."""
+
+    task = "research"
 
     def __init__(self, url):
         self.url = url
@@ -1142,7 +1296,9 @@ def test_evolution_promotes_only_a_gain_that_clears_the_margin(tmp_path):
          "files": [{"path": "src/kernel.py", "content": "COST = 5\n"}]},
     ]
 
-    class StubEvolver:
+    class StubEvolver(Budgeted):
+        task = "evolution"
+
         def ask_json(self, prompt, **kw):
             return proposals.pop(0)
 

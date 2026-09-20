@@ -28,7 +28,8 @@ from hermes.sandbox import Sandbox, SandboxError
 from hermes.sources import Librarian
 from hermes.state import State, StateError, checkpoint, restore
 from hermes.tickets import Board, split_validation
-from hermes.verify import scan_unsafe, verify_project
+from hermes.tools import Toolbox
+from hermes.verify import Verification, review, scan_unsafe, verify_project
 from hermes import cli, workspace
 
 
@@ -613,7 +614,8 @@ class Budgeted:
         return Router(Config.load()).allowance(self.task)
 
 
-def _agent(answer, task: str = "coding", context: int | None = None):
+def _agent(answer, task: str = "coding", context: int | None = None,
+           name: str = "agent"):
     """A stand-in for one :class:`~hermes.agents.Agent`.
 
     *context* narrows the model window, which is how a test puts a prompt
@@ -622,7 +624,7 @@ def _agent(answer, task: str = "coding", context: int | None = None):
     router = Router(Config.load()) if context is None else _router(context)
     return SimpleNamespace(ask_json=lambda prompt, **kw: answer(prompt),
                            allowance=lambda: router.allowance(task),
-                           system="", log=NULL)
+                           name=name, system="", log=NULL)
 
 
 #: One attempt each for the review cycle below: the change that clears the
@@ -694,6 +696,213 @@ def test_a_restored_snapshot_does_not_satisfy_the_review(tmp_path):
     assert outcome["status"] == "failed"
     assert sandbox.read("src/a.py") == "value = 'good'\n"  # restored, not the retry's
     assert ticket.status != "completed"
+
+
+# -- workspace lookups -------------------------------------------------------
+
+def _scripted(replies, task: str = "coding", name: str = "implementer",
+              context: int | None = None):
+    """An agent double that answers from a script and keeps what it was asked.
+
+    The last reply repeats, so a test that wants an agent which only ever
+    looks up gives one reply and lets the budget be what stops it.
+    """
+    prompts: list[str] = []
+
+    def answer(prompt):
+        prompts.append(prompt)
+        return replies[min(len(prompts), len(replies)) - 1]
+
+    return _agent(answer, task=task, name=name, context=context), prompts
+
+
+def _ticket_for(tmp_path, **kw):
+    board = Board(tmp_path)
+    return board.add(title="parse the config", status="ready", **kw)
+
+
+def _state():
+    return State(idea="parse the config",
+                 plan={"commands": {"build": "true", "test": "true"}})
+
+
+def test_an_implementer_reads_a_file_it_was_not_handed(tmp_path):
+    """The whole point: check a signature instead of inventing one."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/parser.py", "def parse(text, *, strict=False):\n    return {}\n")
+    # The ticket names a file nobody has written, which is what the planner
+    # routinely produces, so relevant_files hands the agent nothing.
+    ticket = _ticket_for(tmp_path, artifacts=["src/cli.py"])
+    agent, prompts = _scripted([
+        {"lookup": [{"tool": "grep", "pattern": "def parse"}]},
+        {"lookup": [{"tool": "read_file", "path": "src/parser.py"}]},
+        {"summary": "call the real signature",
+         "files": [{"path": "src/cli.py",
+                    "content": "from parser import parse\nparse('x', strict=True)\n"}]},
+    ])
+    toolbox = Toolbox(sandbox, budget=6, rounds=3)
+
+    payload = generate({"implementer": agent, "tester": agent}, sandbox, _state(),
+                       ticket, tree="src/parser.py", toolbox=toolbox)
+
+    assert payload["files"][0]["path"] == "src/cli.py"
+    assert len(prompts) == 3                       # two lookups, then the answer
+    assert "src/parser.py:1: def parse" in prompts[1]
+    assert "def parse(text, *, strict=False)" in prompts[2]
+    assert [c.tool for c in toolbox.calls] == ["grep", "read_file"]
+
+
+def test_a_path_outside_the_workspace_is_answered_not_raised(tmp_path):
+    """A refusal the model can read beats an exception that fails the ticket."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    agent, prompts = _scripted([
+        {"lookup": [{"tool": "read_file", "path": "../../etc/passwd"},
+                    {"tool": "read_file", "path": "src/missing.py"},
+                    {"tool": "grep", "pattern": "def never_written"}]},
+        {"summary": "write it myself", "files": [{"path": "src/a.py", "content": "x = 1\n"}]},
+    ])
+
+    payload = generate({"implementer": agent, "tester": agent}, sandbox, _state(),
+                       _ticket_for(tmp_path), tree="", toolbox=Toolbox(sandbox))
+
+    assert payload["summary"] == "write it myself"
+    assert "path escapes workspace" in prompts[1]
+    assert "no such file in the workspace" in prompts[1]
+    assert "no matches" in prompts[1]              # the function does not exist
+    assert not (tmp_path / "etc").exists()
+
+
+def test_the_budget_stops_an_agent_that_only_ever_looks(tmp_path):
+    """Lookups cost a generation each, so something has to end the loop."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/a.py", "x = 1\n")
+    agent, prompts = _scripted([{"lookup": [{"tool": "read_file", "path": "src/a.py"}]}])
+    toolbox = Toolbox(sandbox, budget=6, rounds=2)
+
+    payload = generate({"implementer": agent, "tester": agent}, sandbox, _state(),
+                       _ticket_for(tmp_path), tree="", toolbox=toolbox)
+
+    assert "lookup" in payload                     # it never did answer
+    assert len(prompts) == 3                       # two rounds, then one last ask
+    assert toolbox.used_rounds == 2 and len(toolbox.calls) == 2
+    assert "lookup budget is spent" in prompts[2]
+
+
+def test_a_malformed_lookup_still_costs_a_call(tmp_path):
+    """Otherwise a model that only asks nonsense loops until the run dies."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    agent, prompts = _scripted([{"lookup": ["read src/a.py", {"tool": "teleport"}]}])
+    toolbox = Toolbox(sandbox, budget=4, rounds=4)
+
+    generate({"implementer": agent, "tester": agent}, sandbox, _state(),
+             _ticket_for(tmp_path), tree="", toolbox=toolbox)
+
+    assert len(toolbox.calls) == 4 and not any(c.ok for c in toolbox.calls)
+    assert "there is no 'teleport' tool" in prompts[1]
+    assert "a lookup must be an object" in prompts[1]
+
+
+def test_no_budget_is_the_single_shot_prompt_it_replaces(tmp_path):
+    """The comparison the suite runs: one knob at zero, the old behaviour back."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    agent, prompts = _scripted([{"summary": "", "files": []}])
+
+    generate({"implementer": agent, "tester": agent}, sandbox, _state(),
+             _ticket_for(tmp_path), tree="", toolbox=Toolbox(sandbox, budget=0))
+
+    assert len(prompts) == 1
+    assert "lookup" not in prompts[0].lower()
+
+
+def test_lookups_land_in_the_run_log(tmp_path):
+    """'What did it read before it wrote that' has to be answerable afterwards."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/a.py", "x = 1\n")
+    log = Logger(tmp_path / "log.jsonl", quiet=True)
+    agent, _ = _scripted([
+        {"lookup": [{"tool": "read_file", "path": "src/a.py"},
+                    {"tool": "read_file", "path": "src/gone.py"}]},
+        {"summary": "done", "files": [{"path": "src/b.py", "content": "y = 2\n"}]},
+    ])
+
+    with scope(ticket="T001", attempt=2):
+        generate({"implementer": agent, "tester": agent}, sandbox, _state(),
+                 _ticket_for(tmp_path), tree="",
+                 toolbox=Toolbox(sandbox, log=log), log=log)
+
+    records = [r for r in _records(tmp_path / "log.jsonl") if r["event"].startswith("lookup")]
+    calls = [r for r in records if r["event"] == "lookup.call"]
+    assert [(r["tool"], r["detail"], r["ok"]) for r in calls] == [
+        ("read_file", "src/a.py", True), ("read_file", "src/gone.py", False)]
+    assert all(r["ticket"] == "T001" and r["attempt"] == 2 for r in records)
+    done = records[-1]
+    assert done["event"] == "lookup.done" and done["agent"] == "implementer"
+    assert done["calls"] == 2 and done["rounds"] == 1 and done["answered"] is True
+
+
+def test_the_reviewer_can_read_what_the_change_did_not_touch(tmp_path):
+    """A caller the change breaks is outside the diff the reviewer is shown."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/caller.py", "from lib import send\nsend('a', 'b')\n")
+    sandbox.write("src/lib.py", "def send(one):\n    return one\n")
+    agent, prompts = _scripted([
+        {"lookup": [{"tool": "grep", "pattern": "send\\("}]},
+        {"approved": False, "blocking": ["src/caller.py still passes two arguments"]},
+    ], task="review", name="reviewer")
+    change = Change(written=["src/lib.py"], summary="one argument is enough")
+
+    verdict = review({"reviewer": agent}, _ticket_for(tmp_path), sandbox, change,
+                     Verification(), toolbox=Toolbox(sandbox))
+
+    assert verdict["approved"] is False
+    assert "src/caller.py:2: send('a', 'b')" in prompts[1]
+
+
+def test_lookup_results_outrank_the_files_the_ticket_only_might_need(tmp_path):
+    """Dropping what the model asked for makes it ask again, forever."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/wanted.py", "def signature(a, b):\n    return a\n")
+    sandbox.write("src/guessed.py", "guess = 1\n" * 600)
+    ticket = _ticket_for(tmp_path, artifacts=["src/guessed.py"])
+    agent, prompts = _scripted([
+        {"lookup": [{"tool": "read_file", "path": "src/wanted.py"}]},
+        {"summary": "", "files": []},
+    ], context=6144)
+
+    generate({"implementer": agent, "tester": agent}, sandbox, _state(), ticket,
+             tree="\n".join(f"src/file{i}.py" for i in range(400)),
+             prior="journal entry\n" * 300, toolbox=Toolbox(sandbox))
+
+    assert "def signature(a, b)" in prompts[1]      # what it asked for survived
+    assert "BEFORE YOU ANSWER" in prompts[1]        # so did how to ask again
+    agent.allowance().check(agent.system, prompts[1])
+
+
+def test_a_long_file_is_cut_short_where_reading_can_resume(tmp_path):
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/long.py", "".join(f"line = {i}\n" for i in range(2000)))
+    toolbox = Toolbox(sandbox)
+
+    first = toolbox.invoke({"tool": "read_file", "path": "src/long.py"})
+    assert first.ok and len(first.output) < 2000 * 12
+    resume = int(first.output.rsplit("start: ", 1)[1])
+    second = toolbox.invoke({"tool": "read_file", "path": "src/long.py", "start": resume})
+    assert f"line = {resume - 1}" in second.output
+    assert toolbox.invoke({"tool": "read_file", "path": "src/long.py",
+                           "start": 9000}).ok is False
+
+
+def test_a_search_never_walks_the_factory_state_or_the_git_directory(tmp_path):
+    """Both are large, neither is code the ticket is about."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write(".hermes/state/state.json", '{"secret_token": "abc"}\n')
+    sandbox.write(".git/config", "token = abc\n")
+    sandbox.write("src/a.py", "token = 'abc'\n")
+    toolbox = Toolbox(sandbox)
+
+    assert toolbox.invoke({"tool": "grep", "pattern": "token"}).output == \
+        "src/a.py:1: token = 'abc'"
+    assert ".hermes" not in toolbox.invoke({"tool": "list_dir", "path": "."}).output
 
 
 # -- work journal ------------------------------------------------------------

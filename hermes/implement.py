@@ -8,6 +8,7 @@ from pathlib import Path
 from .agents import Prompt, context_block, file_protocol, ticket_block
 from .log import Logger, NULL, scope
 from .sandbox import Sandbox, SandboxError
+from .tools import Lookup, Toolbox
 from .verify import Verification, review, triage, verify_ticket
 
 #: Files an agent may never write, regardless of what it asks for.
@@ -219,8 +220,14 @@ def relevant_files(sandbox: Sandbox, ticket, plan: dict, hints: list[str] | None
 def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
              instructions: str = "", failure: str = "", prior: str = "",
              hints: list[str] | None = None, *, allow_edits: bool = True,
-             temperature: float | None = None, log: Logger = NULL) -> dict:
+             temperature: float | None = None, toolbox: Toolbox | None = None,
+             log: Logger = NULL) -> dict:
     """Ask the right agent for the code that satisfies *ticket*.
+
+    *toolbox* lets the agent read the rest of the workspace before it answers.
+    The sources below are a guess at what the ticket needs, made from a list
+    the planner wrote before the code existed; the lookups are how the agent
+    checks a name instead of inventing one.
 
     Blocks are added in reading order, stable first, so a retry can reuse the
     inference server's cached prefix: the project, the ticket and the work
@@ -247,25 +254,34 @@ def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
                "must be complete and runnable. If the ticket needs tests, write "
                "real ones.", required=True)
     prompt.add("protocol", file_protocol(edits=allow_edits), required=True)
-    # Filled last so the room it is given accounts for the repair instructions
-    # and the failure, which outrank it: knowing what broke is worth more than
-    # a sixth file the ticket may not touch.
+    lookup = Lookup(agent, prompt, toolbox, log=log)
+    # Filled last so the room it is given accounts for the repair instructions,
+    # the failure and the lookup protocol, all of which outrank it: knowing
+    # what broke is worth more than a sixth file the ticket may not touch.
     header = "EXISTING FILES RELEVANT TO THIS TICKET:\n"
     sources.fill(header + relevant_files(sandbox, ticket, state.plan, hints,
                                          budget=max(0, sources.room() - len(header))))
     extra = {} if temperature is None else {"temperature": temperature}
-    return agent.ask_json(prompt.render(), **extra)
+    return lookup.ask(**extra)
 
 
 def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
                    *, journal=None, max_attempts: int = 3, candidates: int = 1,
                    allow_edits: bool = True, prefetched: dict | None = None,
+                   tool_calls: int = 6, tool_rounds: int = 3,
                    on_apply=None, log: Logger = NULL) -> dict:
     """Run one ticket to a verdict.
 
     Returns ``{"status": completed|failed, "action": ..., "verification": ...}``.
     The caller owns board transitions beyond the active/review moves here.
+
+    *tool_calls* and *tool_rounds* bound the workspace lookups each generation
+    and each review may make. Every one of them is a fresh toolbox: the budget
+    is what one answer may spend, not what the ticket may.
     """
+    def toolbox() -> Toolbox:
+        return Toolbox(sandbox, budget=tool_calls, rounds=tool_rounds, log=log)
+
     board.move(ticket.id, "active", "picked up")
     board.save()
     # Read once: the journal cannot change while this ticket is the one running.
@@ -310,7 +326,8 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
             payloads = _propose(agents, sandbox, state, ticket, tree_fn, instructions,
                                 failure, prior, hints, allow_edits=allow_edits,
                                 wanted=max(1, candidates) if attempt == 1 else 1,
-                                prefetched=prefetched if attempt == 1 else None, log=log)
+                                prefetched=prefetched if attempt == 1 else None,
+                                toolbox=toolbox, log=log)
             if not payloads:
                 failure = "the implementer produced no usable output"
                 continue
@@ -338,7 +355,7 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
 
             if verification.passed:
                 verdict = review(agents, ticket, sandbox, change, verification,
-                                 prior=prior, log=log)
+                                 prior=prior, toolbox=toolbox(), log=log)
                 if verdict.get("approved"):
                     board.move(ticket.id, "review", change.describe())
                     for note in verdict.get("advisory", [])[:3]:
@@ -395,7 +412,7 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
 
 def _propose(agents, sandbox, state, ticket, tree_fn, instructions, failure, prior,
              hints, *, allow_edits: bool, wanted: int, prefetched: dict | None,
-             log: Logger) -> list[dict]:
+             toolbox, log: Logger) -> list[dict]:
     """Collect the candidate changes to race through the gates.
 
     The extra samples are drawn hotter than the first: two candidates from the
@@ -409,7 +426,8 @@ def _propose(agents, sandbox, state, ticket, tree_fn, instructions, failure, pri
             payloads.append(generate(
                 agents, sandbox, state, ticket, tree_fn(), instructions, failure,
                 prior, hints, allow_edits=allow_edits,
-                temperature=None if not payloads else 0.6, log=log))
+                temperature=None if not payloads else 0.6, toolbox=toolbox(),
+                log=log))
         except Exception as exc:  # model returned nothing usable
             log.error("ticket.generate_failed", ticket=ticket.id, error=str(exc)[:200])
             break

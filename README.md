@@ -50,8 +50,13 @@ detected and broken before the scheduler ever sees them.
 **Implementation** picks the next ticket by score, not by order: priority,
 how much other work it unblocks, expected information gain, cost, risk and
 past failures all feed the choice. Each ticket is generated, applied,
-verified, reviewed, and either completed or diagnosed and repaired. While one
-ticket spends minutes on the CPU in its gates, the next independent one is
+verified, reviewed, and either completed or diagnosed and repaired. What an
+agent is handed of the existing code is a guess — the ticket's artifact list
+was written before any of it existed — so the implementer and the reviewer can
+also look: `read_file`, `grep` and `list_dir` over the workspace, read-only,
+under a budget of a few calls per answer. Checking a signature costs one
+lookup; inventing one costs a whole generate, verify and triage cycle. While
+one ticket spends minutes on the CPU in its gates, the next independent one is
 generated on the GPU — but only when the host actually has room for a second
 concurrent model call, and never while a benchmark is being timed, because a
 measurement that shares the machine records the contention rather than the
@@ -306,6 +311,9 @@ project workspace mounted. Agent file writes are checked against path escapes
 and a protected-path list, so generated code cannot reach Hermes state, the
 git directory, or anything on the host. In the local fallback runtime the
 environment is stripped of anything resembling a key, token or credential.
+Agent lookups go through the same check in the other direction: they read
+only, only inside the workspace, and a path that escapes it comes back to the
+model as a refusal it can act on rather than an error that fails the ticket.
 
 Research fetches, where you enable them, are the one thing that reaches the
 network, and they run in a one-shot container rather than the project's own.
@@ -412,10 +420,12 @@ one factory against another. `--compare` says the same thing about a pair of
 runs where nothing moved.
 
 This exists because everything else in this section is a trade. Constrained
-decoding, search/replace edits, prefetching the next ticket, racing several
-samples through the gates and the noise-aware evolution selector all cost
-something to buy something, and which way a given change lands depends on the
-model and the machine. The first-pass rate and the GPU/CPU split are the two
+decoding, search/replace edits, workspace lookups, prefetching the next
+ticket, racing several samples through the gates and the noise-aware evolution
+selector all cost something to buy something, and which way a given change
+lands depends on the model and the machine. Each is a knob, so each can be
+measured the same way — `execution.tool_calls: 0` in one run and the default
+in the other is the comparison that says what lookups are worth on your model. The first-pass rate and the GPU/CPU split are the two
 numbers that say which. It is also the precondition for the factory improving
 its own components: a self-modification that cannot be measured cannot be
 promoted.

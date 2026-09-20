@@ -50,10 +50,17 @@ detected and broken before the scheduler ever sees them.
 **Implementation** picks the next ticket by score, not by order: priority,
 how much other work it unblocks, expected information gain, cost, risk and
 past failures all feed the choice. Each ticket is generated, applied,
-verified, reviewed, and either completed or diagnosed and repaired. What an
-agent is handed of the existing code is a guess — the ticket's artifact list
-was written before any of it existed — so the implementer and the reviewer can
-also look: `read_file`, `grep` and `list_dir` over the workspace, read-only,
+verified, reviewed, and either completed or diagnosed and repaired. A repeated
+failure is not retried identically — the same prompt at the same temperature
+answers the same way — so each attempt is asked harder than the last: attempt
+two races two samples and is shown more of the existing code, attempt three
+goes to the reasoning role instead of the implementer, told to work out why
+the approach cannot be made to work rather than resend it. The ladder is
+`execution.escalation`, and it climbs roles rather than models, because
+routing a retry to a second model would unload the resident one mid-ticket.
+What an agent is handed of the existing code is a guess — the ticket's
+artifact list was written before any of it existed — so the implementer and
+the reviewer can also look: `read_file`, `grep` and `list_dir` over the workspace, read-only,
 under a budget of a few calls per answer. Checking a signature costs one
 lookup; inventing one costs a whole generate, verify and triage cycle. While
 one ticket spends minutes on the CPU in its gates, the next independent one is
@@ -421,11 +428,14 @@ runs where nothing moved.
 
 This exists because everything else in this section is a trade. Constrained
 decoding, search/replace edits, workspace lookups, prefetching the next
-ticket, racing several samples through the gates and the noise-aware evolution
-selector all cost something to buy something, and which way a given change
-lands depends on the model and the machine. Each is a knob, so each can be
-measured the same way — `execution.tool_calls: 0` in one run and the default
-in the other is the comparison that says what lookups are worth on your model. The first-pass rate and the GPU/CPU split are the two
+ticket, racing several samples through the gates, escalating a repeated
+failure and the noise-aware evolution selector all cost something to buy
+something, and which way a given change lands depends on the model and the
+machine. Each is a knob, so each can be measured the same way —
+`execution.tool_calls: 0` in one run and the default in the other is the
+comparison that says what lookups are worth on your model, and
+`execution.escalation: []` against the default says whether asking harder
+turns abandoned tickets into completed ones or only spends more GPU. The first-pass rate and the GPU/CPU split are the two
 numbers that say which. It is also the precondition for the factory improving
 its own components: a self-modification that cannot be measured cannot be
 promoted.

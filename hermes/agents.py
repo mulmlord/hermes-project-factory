@@ -6,7 +6,7 @@ Each returns plain Python data, never free-form prose the caller must parse.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .log import Logger, NULL
@@ -185,6 +185,31 @@ def build(router: Router, log: Logger = NULL) -> dict[str, Agent]:
         name: Agent(name=name, task=ROUTING[name], system=system, router=router, log=log)
         for name, system in PROMPTS.items()
     }
+
+
+def escalate(agents: dict[str, Agent], base: Agent, role: str,
+             log: Logger = NULL) -> Agent:
+    """The role a harder attempt should ask, on the model already resident.
+
+    Escalation names a role, not a model. Routing a retry to a second model
+    means unloading the first one and loading the second -- the reload
+    :meth:`Router.preflight` warns about -- which on a single-GPU host costs
+    more than the retry it is meant to rescue. So when the stronger role
+    routes elsewhere, its system prompt is asked of the model the ticket is
+    already using: what changes is how the work is framed, not the weights.
+
+    An unknown role leaves the base agent alone; a ladder naming a role the
+    factory does not have should cost a log line, not the ticket.
+    """
+    agent = agents.get(role)
+    if agent is None:
+        log.warn("agent.escalation_unknown", role=role)
+        return base
+    if agent is base or agent.router.describe(agent.task) == base.router.describe(base.task):
+        return agent
+    log.info("agent.escalation_pinned", role=role, task=base.task,
+             model=base.router.describe(base.task))
+    return replace(agent, task=base.task)
 
 
 # -- shared prompt fragments -------------------------------------------------

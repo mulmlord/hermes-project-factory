@@ -17,7 +17,7 @@ from .agents import Prompt, build as build_agents, context_block
 from .config import Config
 from .evolve import Evolution, objective_from_spec
 from .git_ops import GitHub, Issues, Repo
-from .implement import Change, execute_ticket, generate
+from .implement import Change, Ladder, execute_ticket, generate
 from .journal import Journal
 from .log import Logger, current_scope, for_workspace, scope
 from .models import Router
@@ -53,6 +53,7 @@ class Factory:
                              int(self.config.get("github.issue_batch", 20)))
         self.openhands = OpenHands(self.config.get("openhands", {}),
                                    self.config.model_for("coding"), self.log)
+        self.ladder = Ladder.from_config(self.config)
         self.resources = self.governor.snapshot()
         self._pool: ThreadPoolExecutor | None = None
         self._prefetch: tuple[str, Future] | None = None
@@ -293,7 +294,7 @@ class Factory:
                 self.agents, self.sandbox, self.state, self.board, ticket, self.tree,
                 journal=self.journal,
                 max_attempts=int(self.config.get("execution.max_ticket_attempts", 3)),
-                candidates=int(self.config.get("execution.candidates", 1)),
+                ladder=self.ladder,
                 allow_edits=bool(self.config.get("execution.edit_protocol", True)),
                 prefetched=self._take_prefetch(ticket),
                 tool_calls=int(self.config.get("execution.tool_calls", 6)),
@@ -354,6 +355,10 @@ class Factory:
         kwargs = dict(prior=self.journal.block(candidate, self.board),
                       hints=self.journal.suggested_files(candidate, self.board),
                       allow_edits=bool(self.config.get("execution.edit_protocol", True)),
+                      # A prefetch is a first attempt, so it is asked the way
+                      # the first rung asks; anything harder is wasted on work
+                      # that has not failed yet.
+                      files=self.ladder.rung(1).files,
                       toolbox=self._toolbox(),
                       log=self.log)
 

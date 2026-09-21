@@ -23,6 +23,12 @@ Nothing here writes, and every path goes through :meth:`Sandbox.resolve`,
 which already refuses anything outside the workspace. A refusal comes back as
 an observation the model can act on rather than an exception: telling it the
 file is not there is the point of the tool, not a fault.
+
+One prompt never gets any of it. :class:`Lookup` refuses a toolbox to a
+prompt carrying an untrusted block -- retrieved page text, in practice --
+and raises rather than quietly going without, because a defence that
+degrades silently is one nobody notices losing. That is the tool-free half
+of the quarantine described in :mod:`hermes.sources`.
 """
 from __future__ import annotations
 
@@ -324,6 +330,17 @@ class Toolbox:
         return "\n\n".join(reversed(kept))
 
 
+class Quarantined(Exception):
+    """Raised when tools were offered to a prompt carrying untrusted text.
+
+    Not a runtime condition: it means a caller wired a prompt that quotes a
+    fetched page into an agent that can read the workspace, which is the
+    programming mistake this whole arrangement exists to make impossible.
+    Failing loudly is the point -- a quiet downgrade would leave the defence
+    looking present while nothing enforced it.
+    """
+
+
 class Lookup:
     """One agent's chance to read the workspace before it answers.
 
@@ -331,6 +348,13 @@ class Lookup:
     protocol and the results are charged against the budget before any block
     that sizes itself against the room left. With no toolbox, or one whose
     budget is zero, this is exactly the single-shot ask it replaces.
+
+    A prompt carrying an untrusted block never gets one. Retrieved page text
+    is a stranger's writing, and a stranger who can also spend lookups has
+    the beginnings of a channel: the tool results come back into the same
+    prompt, so a page that asks for a file gets the file quoted to it. The
+    rule is on the data rather than on the call site, because the call site
+    is what changes.
     """
 
     HEADER = "WHAT YOU LOOKED UP:\n"
@@ -341,6 +365,12 @@ class Lookup:
                  log: Logger = NULL):
         self.agent = agent
         self.prompt = prompt
+        tainted = tuple(prompt.untrusted)
+        if tainted and toolbox is not None and toolbox.enabled:
+            raise Quarantined(
+                f"{agent.name} was offered lookup tools on a "
+                f"prompt carrying untrusted text ({', '.join(tainted)}). Untrusted "
+                "content is read on a call that has none.")
         self.toolbox = toolbox if toolbox is not None and toolbox.enabled else None
         self.log = log
         self.results = self.protocol = None

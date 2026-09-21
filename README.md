@@ -39,6 +39,9 @@ research round that changes nothing is treated as a failed round. Enable
 into URLs that exist, the researcher picks which of the results are worth
 reading, the sandbox fetches those, the bytes are kept under `research/` as
 evidence, and a finding may cite only a page that was actually retrieved.
+What those pages say reaches the rest of the round as short cited claims and
+never as prose, because a page is written by a stranger and the prompt it
+lands in belongs to an agent that writes files — see [Isolation](#isolation).
 The URLs come from a search rather than from the model's memory because a
 local model asked to recall one mostly invents it, and an invented URL
 spends a page of the budget to return a 404. Point `research.search` at a
@@ -371,6 +374,21 @@ judged, since a public hostname is free to point at `127.0.0.1`, and every
 redirect hop is judged again. That is what stops a model-supplied URL from
 reaching your inference server, your LAN, or a cloud metadata endpoint.
 
+A fetched page is also a stranger writing into a prompt, so it is treated as
+untrusted for the whole of its life. Nothing about that defence is a sentence
+in a prompt, because any instruction written above a page can be argued with
+by the page. Instead: retrieved text is read on one call that has the question
+and the page and nothing else — no project context and no tools, since a
+prompt carrying untrusted text cannot be given a toolbox at all — and what
+that call may return is cut down in Python to a few short claims, each pinned
+to a page that was really fetched. Every later prompt sees the claims, fenced
+and labelled, never the page. The database records which pages were read and
+why, never what they said, so the `recall` tool cannot hand a page to an agent
+that also holds a shell. Finally, a research round that read pages may not
+install anything, and any command it proposes must clear the security gate and
+the classifier before it can reach a ticket; what is refused is written into
+that round's notes under `docs/research/`.
+
 A static scan runs over generated sources on every ticket and again at
 release, and it blocks completion regardless of whether the tests pass.
 
@@ -597,6 +615,16 @@ halfway through.
   default endpoint is DuckDuckGo's HTML interface, which is a third party and
   rate-limits: `research.search` takes any URL template, so a self-hosted
   SearXNG is one line of configuration.
+- The fencing around retrieved pages is structural rather than advisory, and
+  it is still not total. A page that persuades the researcher of something
+  false has changed what the project believes, and the mechanism that stops
+  the *wrong answer* is the one that was always there: a finding carries its
+  confidence and its citation, and a claim has to survive the synthesis and
+  the reviewer. Screening bites on the executable surface — the commands a
+  research round proposes — while a dependency named in prose can still reach
+  the architect and end up in the project's setup command, since the architect
+  is where dependencies are legitimately chosen and no gate can tell a good
+  package name from a bad one.
 
 ## License
 

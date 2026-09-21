@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
+from .contextdb import TRUSTED, UNTRUSTED
 from .log import Logger, NULL
 from .models import Allowance, PromptTooLarge, Router
 
@@ -280,6 +281,10 @@ class Block:
     tail: bool = False
     #: The prompt cannot be built without it: never trimmed, never dropped.
     required: bool = False
+    #: Where this text came from. A block holding anything fetched off the
+    #: network is marked :data:`hermes.contextdb.UNTRUSTED`, and that marking
+    #: is what :class:`hermes.tools.Lookup` refuses to give tools to.
+    trust: str = TRUSTED
     owner: "Prompt | None" = None
 
     def room(self) -> int:
@@ -318,10 +323,22 @@ class Prompt:
         self.limit = max(0, self.allowance.prompt_chars - len(agent.system) - 200)
 
     def add(self, name: str, text: str = "", *, priority: int = 50, floor: int = 0,
-            tail: bool = False, required: bool = False) -> Block:
-        block = Block(name, text, priority, floor, tail, required, owner=self)
+            tail: bool = False, required: bool = False,
+            trust: str = TRUSTED) -> Block:
+        block = Block(name, text, priority, floor, tail, required, trust, owner=self)
         self.blocks.append(block)
         return block
+
+    @property
+    def untrusted(self) -> tuple[str, ...]:
+        """The blocks carrying text the factory did not write.
+
+        A prompt that has any is a prompt an attacker has a sentence in, and
+        :class:`hermes.tools.Lookup` will not attach a toolbox to it. The
+        property is on the prompt rather than on the caller because the
+        caller is exactly who cannot be relied on to remember.
+        """
+        return tuple(b.name for b in self.blocks if b.trust != TRUSTED)
 
     def room(self, priority: int) -> int:
         """Characters still free for a block of *priority*.

@@ -184,6 +184,7 @@ def implementation(factory) -> None:
                 prefetched=factory._take_prefetch(ticket),
                 tool_calls=int(factory.config.get("execution.tool_calls", 6)),
                 tool_rounds=int(factory.config.get("execution.tool_rounds", 3)),
+                classifier=factory.classifier,
                 on_apply=lambda: factory._prefetch_next(ticket),
                 log=factory.log)
 
@@ -234,7 +235,8 @@ def _run_openhands(factory, ticket) -> bool:
         factory.board.save()
         return False
     from .verify import verify_ticket
-    verification = verify_ticket(factory.sandbox, ticket, factory.state.plan, [], factory.log)
+    verification = verify_ticket(factory.sandbox, ticket, factory.state.plan, [],
+                                 factory.log, classifier=factory.classifier)
     if verification.passed:
         factory.board.move(ticket.id, "completed", "OpenHands + gates passed")
         sha = factory.commit(f"{_commit_kind(ticket.kind)}: {ticket.title}\n\n"
@@ -256,7 +258,8 @@ def _run_openhands(factory, ticket) -> bool:
 
 
 def validation(factory) -> None:
-    verification = verify_project(factory.sandbox, factory.state.plan, log=factory.log)
+    verification = verify_project(factory.sandbox, factory.state.plan,
+                                  classifier=factory.classifier, log=factory.log)
     record_evaluation(factory.root, "project-validation", verification)
     factory.log.info("validation", passed=verification.passed,
                      gates=len(verification.gates))

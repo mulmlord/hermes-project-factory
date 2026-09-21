@@ -337,7 +337,7 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
                    ladder: Ladder | None = None,
                    allow_edits: bool = True, prefetched: dict | None = None,
                    tool_calls: int = 6, tool_rounds: int = 3,
-                   on_apply=None, log: Logger = NULL) -> dict:
+                   classifier=None, on_apply=None, log: Logger = NULL) -> dict:
     """Run one ticket to a verdict.
 
     Returns ``{"status": completed|failed, "action": ..., "verification": ...}``.
@@ -387,7 +387,8 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
             on_apply()
         return verify_ticket(
             sandbox, ticket, state.plan, change.written, log=log,
-            tests_required=bool(state.metrics.get("tests_passed")))
+            tests_required=bool(state.metrics.get("tests_passed")),
+            classifier=classifier)
 
     for attempt in range(1, max_attempts + 1):
         # Every record from here down -- model call, sandbox command, gate --

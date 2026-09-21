@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import prompts, workspace
 from .agents import Prompt, build as build_agents, context_block
+from .classify import Classifier
 from .config import Config
 from .experiment import Lab
 from .git_ops import GitHub, Issues, Repo
@@ -58,6 +59,7 @@ class Factory:
         self.openhands = OpenHands(self.config.get("openhands", {}),
                                    self.config.model_for("coding"), self.log)
         self.ladder = Ladder.from_config(self.config)
+        self.classifier = Classifier.from_config(self.config, self.log)
         self.resources = self.governor.snapshot()
         self._pool: ThreadPoolExecutor | None = None
         self._prefetch: tuple[str, Future] | None = None

@@ -36,9 +36,11 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$REPO/.venv"
 OH_VENV="$REPO/.venv-openhands"
+LAYA_VENV="$REPO/.venv-laya"
 VLLM_VENV="$REPO/.venv-vllm"
 BIN_DIR="$HOME/.local/bin"
 UNIT_NAME="hermes-vllm.service"
+CLASSIFIER_UNIT="hermes-classifier.service"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 MODELS_DIR="${HERMES_MODELS_DIR:-$HOME/.local/share/hermes/models}"
 CONFIG=0
@@ -167,6 +169,27 @@ fi
 for egg in "$REPO"/*.egg-info; do
   [ -d "$egg" ] && remove "$egg"
 done
+
+# -- security classifier -----------------------------------------------------
+
+# Only ever installed by `install.sh --classifier`, so on most machines this
+# finds nothing and says so once.
+if [ -f "$UNIT_DIR/$CLASSIFIER_UNIT" ]; then
+  note "stopping and removing $CLASSIFIER_UNIT"
+  if [ "$DRY" -eq 1 ]; then
+    note "would run: systemctl --user disable --now $CLASSIFIER_UNIT"
+  else
+    systemctl --user disable --now "$CLASSIFIER_UNIT" 2>/dev/null \
+      || warn "could not stop $CLASSIFIER_UNIT; removing the unit file anyway"
+  fi
+  remove "$UNIT_DIR/$CLASSIFIER_UNIT"
+  [ "$DRY" -eq 0 ] && systemctl --user daemon-reload 2>/dev/null || true
+fi
+
+if [ -f "$LAYA_VENV/pyvenv.cfg" ]; then
+  note "removing the security classifier environment"
+  remove "$LAYA_VENV"
+fi
 
 # -- openhands ---------------------------------------------------------------
 

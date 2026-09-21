@@ -1317,6 +1317,15 @@ GUIDE = ("<html><head><title>Ring Buffer Guide</title>"
          "</head><body><h1>Ring buffers</h1><p>A power-of-two capacity lets the "
          "index wrap with a bitmask instead of a modulo.</p></body></html>")
 
+#: A results page in the shape engines actually serve one: navigation of its
+#: own, an advert-style link back to itself, one plain result, and one result
+#: hidden behind the engine's redirector.
+RESULTS = ('<html><body><a href="/settings">Settings</a>'
+           '<a href="{engine}/about">About this search engine</a>'
+           '<a href="{base}/guide.html">Ring buffer guide</a>'
+           '<a href="{engine}/l/?uddg={wrapped}&amp;rut=x">Another page</a>'
+           '<a href="mailto:nobody@example.com">Contact</a></body></html>')
+
 
 @pytest.fixture
 def served():
@@ -1328,26 +1337,41 @@ def served():
     import functools
     import http.server
     import tempfile
+    from urllib.parse import quote
 
     class Quiet(http.server.SimpleHTTPRequestHandler):
         def log_message(self, *args):
             pass
 
     with tempfile.TemporaryDirectory() as pages:
-        for name, body in (
-                ("guide.html", GUIDE),
-                ("second.html", "<html><body>another page</body></html>"),
-                ("setup.py", 'import os\nos.system("rm -rf " + target)\n')):
-            with open(f"{pages}/{name}", "w") as handle:
-                handle.write(body)
         server = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0), functools.partial(Quiet, directory=pages))
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        for name, body in (
+                ("guide.html", GUIDE),
+                ("second.html", "<html><body>another page</body></html>"),
+                ("setup.py", 'import os\nos.system("rm -rf " + target)\n'),
+                ("search.html", RESULTS.format(
+                    base=base, engine=_search_engine(base),
+                    wrapped=quote(f"{base}/second.html", safe="")))):
+            with open(f"{pages}/{name}", "w") as handle:
+                handle.write(body)
         try:
-            yield f"http://127.0.0.1:{server.server_port}"
+            yield base
         finally:
             server.shutdown()
             server.server_close()
+
+
+def _search_engine(base: str) -> str:
+    """The same server under a different hostname, as the search engine.
+
+    A real engine and the pages it returns are different sites, and the
+    results page is read on that assumption: the engine's own links are
+    dropped. Serving both from one loopback address would hide that.
+    """
+    return base.replace("127.0.0.1", "localhost")
 
 
 def _librarian(root, **cfg):
@@ -1357,13 +1381,14 @@ def _librarian(root, **cfg):
 
 
 class _Researcher(Budgeted):
-    """Answers the three research prompts, citing whatever it was handed."""
+    """Answers the research prompts, citing whatever it was handed."""
 
     task = "research"
 
     def __init__(self, url):
-        self.url = url
+        self.url = url            # the one URL it "remembers", which does not exist
         self.saw_material = False
+        self.listing = ""
 
     def ask_json(self, prompt, **kw):
         if "Step 1 of the Feynman method" in prompt:
@@ -1371,8 +1396,12 @@ class _Researcher(Budgeted):
                     "what_we_know": [],
                     "unknowns": [{"question": "How should the index wrap?",
                                   "why_it_matters": "it decides the per-op cost"}]}
-        if "Name at most" in prompt:
-            return {"sources": [{"url": self.url, "why": "the reference guide"}]}
+        if "web search queries" in prompt:
+            return {"queries": ["ring buffer index wrap bitmask"],
+                    "urls": [{"url": self.url, "why": "the reference guide"}]}
+        if "SEARCH RESULTS:" in prompt:
+            self.listing = prompt
+            return {"pick": [{"n": 1, "why": "the reference guide"}]}
         if "QUESTION:" in prompt:
             self.saw_material = "power-of-two capacity" in prompt
             return {"answer": "Mask the index.", "confidence": "verified",
@@ -1417,14 +1446,65 @@ def test_a_non_http_url_never_reaches_the_sandbox(tmp_path):
     assert "scheme" in librarian.refusals[0]["reason"]
 
 
-def test_the_page_budget_bounds_one_round(tmp_path, served):
+def test_a_search_returns_result_urls_and_drops_the_engines_own_pages(tmp_path,
+                                                                      served):
     workspace.create(tmp_path, "a ring buffer")
-    librarian = _librarian(tmp_path, allow_private=True, max_fetches=1)
+    librarian = _librarian(tmp_path, allow_private=True,
+                           search=f"{_search_engine(served)}/search.html?q={{query}}")
+
+    hits = librarian.search("ring buffer index wrap")
+
+    # The plain result, then the one behind the engine's redirector. Its own
+    # navigation, its advert back to itself and the mailto: link are not results.
+    assert [hit["url"] for hit in hits] == [f"{served}/guide.html",
+                                            f"{served}/second.html"]
+    assert hits[0]["title"] == "Ring buffer guide"
+    # A results page is evidence of nothing and is never cited, so it costs a
+    # search rather than one of the pages the researcher gets to read.
+    assert librarian.searched == 1 and librarian.spent == 0
+
+
+def test_a_search_is_bounded_like_a_fetch(tmp_path, served):
+    workspace.create(tmp_path, "a ring buffer")
+    librarian = _librarian(tmp_path, allow_private=True, max_searches=1,
+                           search=f"{_search_engine(served)}/search.html?q={{query}}")
+
+    assert librarian.search("ring buffer") and not librarian.search("anything else")
+    assert librarian.searched == 1
+
+
+def test_one_round_cannot_spend_the_whole_run_budget(tmp_path, served):
+    workspace.create(tmp_path, "a ring buffer")
+    librarian = _librarian(tmp_path, allow_private=True, max_fetches=4,
+                           max_fetches_per_round=1)
 
     found = librarian.gather([{"url": f"{served}/guide.html"},
                               {"url": f"{served}/second.html"}])
 
     assert len(found) == 1 and librarian.remaining == 0
+    librarian.start_round()
+    assert librarian.remaining == 1                   # the round's share, not the run's
+    assert librarian.fetch(f"{served}/second.html") is not None
+
+
+def test_the_page_budget_bounds_the_run_not_the_round(tmp_path, served):
+    """Research is re-entered by every ticket failure triaged as research.
+
+    Each of those used to build its own librarian, so ``max_fetches`` bounded
+    a call and nothing bounded the run.
+    """
+    workspace.create(tmp_path, "a ring buffer")
+    librarian = _librarian(tmp_path, allow_private=True, max_fetches=2,
+                           max_fetches_per_round=2)
+
+    for page in ("guide.html", "second.html"):
+        librarian.start_round()
+        assert librarian.fetch(f"{served}/{page}") is not None
+
+    librarian.start_round()                           # a third escalation
+    assert librarian.fetch(f"{served}/setup.py") is None
+    assert librarian.spent == 2
+    assert "budget" in librarian.refusals[-1]["reason"]
 
 
 def test_the_same_page_is_retrieved_once(tmp_path, served):
@@ -1448,18 +1528,31 @@ def test_retrieved_material_cannot_fail_the_security_scan(tmp_path, served):
     assert not scan_unsafe(tmp_path)
 
 
-def test_research_answers_from_what_it_retrieved_and_cites_it(tmp_path, served):
+def test_research_reads_what_the_search_found_not_what_the_model_recalled(
+        tmp_path, served):
+    """The round's one page goes to a result, not to a remembered URL.
+
+    A URL the model is certain of is still tried, but after the results: the
+    budget is spent on pages something claims exist before it is spent on a
+    page the model believes exists.
+    """
     workspace.create(tmp_path, "a ring buffer")
     url = f"{served}/guide.html"
-    researcher = _Researcher(url)
+    researcher = _Researcher("http://invented.example/reference/ring-buffer")
+    librarian = _librarian(tmp_path, allow_private=True, max_fetches_per_round=1,
+                           search=f"{_search_engine(served)}/search.html?q={{query}}")
 
     payload = investigate({"researcher": researcher}, tmp_path, "ring buffers",
-                          "CONTEXT", librarian=_librarian(tmp_path, allow_private=True))
+                          "CONTEXT", librarian=librarian)
 
+    assert url in researcher.listing, "the search results never reached the model"
     assert researcher.saw_material, "the retrieved text never reached the prompt"
     # "[1]" resolves to the page that was actually fetched; the invented URL goes.
     assert payload["findings"][0]["sources"] == [url]
+    assert [s["url"] for s in payload["sources"]] == [url]
     assert payload["sources"][0]["path"].startswith("research/sources/")
+    # The round's one page went to a result; the remembered URL never cost one.
+    assert librarian.spent == 1 and list(librarian.fetched) == [url]
 
     notes = next((tmp_path / "docs" / "research").glob("*.md")).read_text()
     assert url in notes and "Sources retrieved" in notes

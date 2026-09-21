@@ -2,15 +2,22 @@
 
 Research otherwise runs on whatever the local model happens to remember,
 which is why the researcher is forced to label every answer's confidence.
-This module is what turns a remembered claim into a citation: the researcher
-names pages worth reading, the *sandbox* fetches them, the bytes are kept
-under ``research/`` as evidence, and the extracted text goes back into the
-prompt that answers the question.
+This module is what turns a remembered claim into a citation: a search turns
+the question into URLs that exist, the *sandbox* fetches the pages the
+researcher picks from the results, the bytes are kept under ``research/`` as
+evidence, and the extracted text goes back into the prompt that answers the
+question.
+
+The search step is what makes the rest of it pay for itself. A 7B model
+asked to recall a URL mostly invents one, and an invented URL spends a page
+of the budget to return a 404, leaving the round answering from memory
+anyway -- the exact outcome the feature exists to remove.
 
 Two properties matter more than the feature itself.
 
 Fetching is off unless ``research.network`` is set, and even then it is
-bounded: a page count per round, a byte cap per page, and a timeout.
+bounded: a page count for the run, a smaller one for a single round, a
+search count, a byte cap per page, and a timeout.
 
 Only public addresses are fetched. A container attached to the bridge
 network can otherwise reach the operator's own inference server, a LAN
@@ -29,7 +36,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from .log import Logger, NULL
 from .workspace import slugify
@@ -38,6 +45,16 @@ from .workspace import slugify
 #: the generated workspace and dropped by the release export: the copies are
 #: evidence for re-reading on this machine, not material to republish.
 STORE = "research/sources"
+
+#: Where a question becomes URLs, with ``{query}`` replaced by the encoded
+#: query. Any endpoint that answers with a page of links works, because the
+#: results are read as HTML rather than through an engine-specific API: point
+#: ``research.search`` at a SearXNG instance you host (with ``allow_private``
+#: for one on your own network) to keep the lookup off a third party.
+SEARCH = "https://html.duckduckgo.com/html/?q={query}"
+
+#: Query parameters engines hide the real destination behind on a result link.
+_REDIRECT = ("uddg", "url", "u", "q", "rurl", "target")
 
 #: Runs in the sandbox, never in the Hermes process. Takes the URL, the
 #: destination inside the workspace, the byte cap, the timeout, and whether
@@ -113,13 +130,24 @@ class Source:
 
 
 class Librarian:
-    """Fetches what the researcher asks for, within a fixed budget."""
+    """Fetches what the researcher asks for, within a fixed budget.
+
+    One of these belongs to a run rather than to a round. Research is entered
+    once per project and again for every ticket failure triaged as research,
+    so a page budget counted per round is a budget nothing adds up: a project
+    that triages into research ten times would fetch ten times the stated
+    number. ``max_fetches`` therefore bounds the run, and
+    ``max_fetches_per_round`` keeps a single round from spending all of it.
+    """
 
     def __init__(self, sandbox, root: Path, cfg: dict, log: Logger = NULL):
         self.sandbox = sandbox
         self.root = Path(root)
         self.log = log
-        self.max_pages = int(cfg.get("max_fetches", 6))
+        self.max_pages = int(cfg.get("max_fetches", 24))
+        self.per_round = int(cfg.get("max_fetches_per_round", 6))
+        self.max_searches = int(cfg.get("max_searches", 8))
+        self.search_url = str(cfg.get("search") or SEARCH)
         self.max_bytes = int(cfg.get("fetch_bytes", 250_000))
         self.timeout = int(cfg.get("fetch_timeout", 30))
         #: Escape hatch for an internal documentation server, mirroring
@@ -127,12 +155,53 @@ class Librarian:
         #: something a model's answer can turn on.
         self.allow_private = bool(cfg.get("allow_private", False))
         self.spent = 0
+        self.round_spent = 0
+        self.searched = 0
         self.fetched: dict[str, Source] = {}
         self.refusals: list[dict[str, str]] = []
 
     @property
     def remaining(self) -> int:
-        return max(0, self.max_pages - self.spent)
+        """Pages still available, which is whichever budget binds first."""
+        return max(0, min(self.max_pages - self.spent,
+                          self.per_round - self.round_spent))
+
+    @property
+    def searches_left(self) -> int:
+        return max(0, self.max_searches - self.searched)
+
+    def start_round(self) -> None:
+        """Open a research round: the per-round share resets, the run's does not."""
+        self.round_spent = 0
+
+    def search(self, query: str, limit: int = 6) -> list[dict]:
+        """Ask the configured engine what exists on *query*.
+
+        Returns ``{"url", "title"}`` per result, in the engine's own order.
+        The results page goes through the same guard and the same sandbox as
+        any other page, but it is evidence of nothing and is never cited, so
+        it costs a search rather than a page of the fetch budget.
+        """
+        query = (query or "").strip()
+        if not query or not self.searches_left:
+            return []
+        url = self.search_url.replace("{query}", quote(query, safe=""))
+        problem = self._refuse(url, pages=False)
+        if problem:
+            self._refused(url, problem)
+            return []
+
+        got = self._retrieve(url, f"{STORE}/searches/{self._filename(url)}")
+        self.searched += 1
+        if got is None:
+            return []
+        stored, _ = got
+        results = _results(stored.read_bytes(), url, limit)
+        self.log.info("research.searched", query=query[:80], results=len(results),
+                      searches_left=self.searches_left)
+        if not results:
+            self._refused(url, "the search returned no usable result links")
+        return results
 
     def fetch(self, url: str, why: str = "") -> Source | None:
         """Retrieve one page. Returns None when it was refused or failed."""
@@ -144,20 +213,12 @@ class Librarian:
             return self._refused(url, problem)
 
         destination = f"{STORE}/{self._filename(url)}"
-        command = (
-            f"python3 -c {shlex.quote(_FETCH)} {shlex.quote(url)} "
-            f"{shlex.quote(destination)} {self.max_bytes} {self.timeout} "
-            f"{'1' if self.allow_private else '0'}"
-        )
-        result = self.sandbox.run(command, timeout=self.timeout + 30, network=True)
+        got = self._retrieve(url, destination)
         self.spent += 1
-        if not result.ok:
-            return self._refused(url, _reason(result))
-
-        meta = _meta(result.stdout)
-        stored = self.root / destination
-        if not stored.is_file():
-            return self._refused(url, "the sandbox reported success but wrote nothing")
+        self.round_spent += 1
+        if got is None:
+            return None
+        stored, meta = got
         raw = stored.read_bytes()
         final = meta.get("final_url") or url
         suffix = _suffix(meta.get("content_type", ""))
@@ -205,7 +266,27 @@ class Librarian:
             return ""
         return to_text(path.read_bytes())[:limit]
 
-    def _refuse(self, url: str) -> str:
+    def _retrieve(self, url: str, destination: str) -> tuple[Path, dict] | None:
+        """Run one guarded fetch in the sandbox, whatever it is being read for.
+
+        Returns where the bytes landed and what the sandbox reported, or None
+        having recorded why nothing arrived. Budgets belong to the caller:
+        a page counts against the fetch budget, a results page does not.
+        """
+        command = (
+            f"python3 -c {shlex.quote(_FETCH)} {shlex.quote(url)} "
+            f"{shlex.quote(destination)} {self.max_bytes} {self.timeout} "
+            f"{'1' if self.allow_private else '0'}"
+        )
+        result = self.sandbox.run(command, timeout=self.timeout + 30, network=True)
+        if not result.ok:
+            return self._refused(url, _reason(result))
+        stored = self.root / destination
+        if not stored.is_file():
+            return self._refused(url, "the sandbox reported success but wrote nothing")
+        return stored, _meta(result.stdout)
+
+    def _refuse(self, url: str, *, pages: bool = True) -> str:
         """Cheap local checks, so an obvious refusal costs no container."""
         if not url:
             return "empty url"
@@ -214,7 +295,7 @@ class Librarian:
             return f"refused scheme {parts.scheme or 'none'!r}"
         if not parts.hostname:
             return "no host in url"
-        if not self.remaining:
+        if pages and not self.remaining:
             return f"fetch budget of {self.max_pages} page(s) is spent"
         return ""
 
@@ -229,6 +310,86 @@ class Librarian:
         # The digest keeps two pages with the same slug from overwriting each
         # other; research/ is evidence and must not lose a fetch silently.
         return f"{stem}-{hashlib.sha256(url.encode()).hexdigest()[:8]}.html"
+
+
+class _Links(HTMLParser):
+    """Every anchor on a page, with its text, in document order."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links: list[list] = []
+        self._open = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        href = dict(attrs).get("href") or ""
+        if href:
+            self.links.append([href, ""])
+            self._open = 1
+
+    def handle_endtag(self, tag):
+        if tag == "a":
+            self._open = 0
+
+    def handle_data(self, data):
+        if self._open and self.links:
+            self.links[-1][1] += data
+
+
+def _results(raw: bytes, engine_url: str, limit: int) -> list[dict]:
+    """The pages a results page points at, deduplicated, in its own order.
+
+    Read as plain links rather than through an engine's API, so a SearXNG
+    instance and a plain HTML search endpoint both work with no adapter. The
+    engine's own pages are dropped: its navigation, settings and adverts are
+    links like any other, and none of them answer a research question.
+    """
+    parser = _Links()
+    try:
+        parser.feed(raw.decode("utf-8", errors="replace"))
+        parser.close()
+    except Exception:  # noqa: BLE001 - a malformed page still yields what parsed
+        pass
+    engine = urlparse(engine_url).hostname or ""
+    found: list[dict] = []
+    seen: set[str] = set()
+    for href, text in parser.links:
+        url = _unwrap(href).split("#")[0]
+        host = urlparse(url).hostname or ""
+        if not host or url in seen or _same_site(host, engine):
+            continue
+        seen.add(url)
+        found.append({"url": url, "title": " ".join(text.split())[:200]})
+        if len(found) >= limit:
+            break
+    return found
+
+
+def _unwrap(href: str) -> str:
+    """The destination behind a result link, which engines often wrap.
+
+    DuckDuckGo's HTML endpoint links to ``/l/?uddg=<the real url>`` and its
+    adverts to ``/y.js?...``; others use ``url=`` or ``q=``. A link wrapping
+    nothing is returned as it is, and anything that is not http(s) -- a
+    relative path, an anchor, ``javascript:`` -- as the empty string.
+    """
+    href = (href or "").strip()
+    if href.startswith("//"):
+        href = f"https:{href}"
+    parts = urlparse(href)
+    for key in _REDIRECT:
+        for value in parse_qs(parts.query).get(key, []):
+            if value.startswith(("http://", "https://")):
+                return value
+    return href if parts.scheme in ("http", "https") else ""
+
+
+def _same_site(host: str, other: str) -> bool:
+    """Whether two hosts are the same site, compared by their last two labels."""
+    if not host or not other:
+        return False
+    return host.lower().split(".")[-2:] == other.lower().split(".")[-2:]
 
 
 class _Extract(HTMLParser):

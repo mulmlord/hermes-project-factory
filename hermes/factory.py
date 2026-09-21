@@ -57,6 +57,7 @@ class Factory:
         self.resources = self.governor.snapshot()
         self._pool: ThreadPoolExecutor | None = None
         self._prefetch: tuple[str, Future] | None = None
+        self._lib: Librarian | None = None
 
     # -- helpers ---------------------------------------------------------
     def tree(self) -> str:
@@ -166,16 +167,21 @@ class Factory:
         self.state.transition("SPECIFICATION", f"{len(topics)} research topic(s)")
 
     def _librarian(self) -> Librarian | None:
-        """A fetcher, only where the operator enabled a network budget.
+        """The one fetcher for this run, or None: the network is opt-in.
 
-        One per round, so the page budget is per round rather than per run,
-        and None by default: research reaches the network only on purpose.
+        One per run, not one per call. Research is entered once here and again
+        by every ticket failure triaged as ``research``, so a librarian built
+        per call made ``max_fetches`` a number that nothing ever added up: ten
+        research escalations fetched ten times the configured pages. The
+        per-round share inside it is what still bounds a single round.
         """
         if not self.config.get("research.network", False):
             return None
-        self._record_evidence_policy()
-        return Librarian(self.sandbox, self.root, self.config.get("research", {}),
-                         self.log)
+        if self._lib is None:
+            self._record_evidence_policy()
+            self._lib = Librarian(self.sandbox, self.root,
+                                  self.config.get("research", {}), self.log)
+        return self._lib
 
     def _record_evidence_policy(self) -> None:
         """Say in the project what becomes of the pages it retrieves.

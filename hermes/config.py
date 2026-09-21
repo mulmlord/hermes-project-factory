@@ -69,7 +69,12 @@ DEFAULTS: dict[str, Any] = {
         "network": False,             # allow network during research stage
         "max_rounds": 3,
         "max_unknowns": 6,
-        "max_fetches": 6,             # pages one research round may retrieve
+        # Blank uses the default HTML search endpoint; set it to a SearXNG
+        # instance you host to keep the lookup off a third party.
+        "search": "",                 # e.g. http://searx.lan/search?q={query}
+        "max_searches": 8,            # searches one run may make
+        "max_fetches": 24,            # pages one run may retrieve, all rounds
+        "max_fetches_per_round": 6,   # and what one round may spend of them
         "fetch_bytes": 250000,        # cap on a single retrieved page
         "fetch_timeout": 30,          # seconds one fetch may take
         "allow_private": False,       # reach a LAN/loopback documentation server
@@ -326,9 +331,16 @@ sandbox:
 research:
   enabled: true
   network: false         # off: findings come from what the local model knows.
-                         # on: the sandbox retrieves and cites real pages.
+                         # on: a search turns each question into URLs that
+                         # exist, and the sandbox retrieves and cites them.
   max_rounds: 3
-  max_fetches: 6         # pages one research round may retrieve
+  search: ""             # blank uses the default HTML search endpoint; set it
+                         # to http://searx.lan/search?q={query} for a SearXNG
+                         # you host, with allow_private for one on your network
+  max_searches: 8        # searches one run may make
+  max_fetches: 24        # pages one run may retrieve, across every round and
+                         # every ticket failure that escalates into research
+  max_fetches_per_round: 6   # and what a single round may spend of them
   fetch_bytes: 250000    # cap on a single page
   allow_private: false   # only set for a documentation server you host
 

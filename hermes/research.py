@@ -107,6 +107,8 @@ def investigate(agents, root: Path, topic: str, context: str, *,
 
     refused_from = len(librarian.refusals) if librarian else 0
     sources, material = [], ""
+    if librarian is not None:
+        librarian.start_round()      # the run's page budget does not reset
     if librarian is not None and unknowns:
         sources = _consult(researcher, librarian, topic, unknowns, context, log)
         material = librarian.excerpts(sources)
@@ -201,22 +203,90 @@ def investigate(agents, root: Path, topic: str, context: str, *,
 
 def _consult(researcher, librarian, topic: str, unknowns: list, context: str,
              log: Logger) -> list:
-    """Ask what is worth reading, then have the sandbox fetch it."""
+    """Turn the questions into URLs that exist, then have the sandbox fetch them.
+
+    The model writes search queries rather than URLs. Asking a local model to
+    recall a URL is asking it to invent one, and an invented URL spends a page
+    of the budget to return a 404; choosing among results a search engine
+    returned is a far easier job, and a wrong choice costs a page rather than
+    producing a citation to a page that never existed. A URL the model says it
+    is certain of is still tried, but only after the results.
+    """
+    if not librarian.remaining or not librarian.searches_left:
+        # Without a search left there is nothing to pick from, and a round that
+        # falls back to recalled URLs spends pages to answer from memory anyway.
+        log.info("research.budget_spent", pages=librarian.spent,
+                 searches=librarian.searched)
+        return []
     questions = "\n".join(
         f"- {u.get('question') if isinstance(u, dict) else u}" for u in unknowns)
-    wanted = researcher.ask_json(
+    queries = min(3, librarian.searches_left)
+    plan = researcher.ask_json(
         f"{context}\n\nTOPIC: {topic}\n\nQUESTIONS TO ANSWER:\n{questions}\n\n"
-        f"Name at most {librarian.remaining} pages worth retrieving to answer "
-        "these. Prefer primary sources: official documentation, a specification "
-        "or RFC, a project's own repository or reference manual, a paper. Give a "
-        "URL only if you are confident it exists and is publicly reachable — an "
-        "invented URL spends part of the budget and returns nothing. Return JSON:\n"
-        '{"sources": [{"url": "https://...", "why": "what it should settle"}]}'
+        f"Write at most {queries} web search queries that would find primary "
+        "sources for these questions: official documentation, a specification "
+        "or RFC, a project's own repository or reference manual, a paper. Write "
+        "search queries, not questions — the terms an expert would type, "
+        "including the exact names of the technologies involved. If you are "
+        "certain a specific URL exists and is publicly reachable, you may list "
+        "it as well. Return JSON:\n"
+        '{"queries": ["search terms"], '
+        '"urls": [{"url": "https://...", "why": "what it should settle"}]}'
     )
-    found = librarian.gather((wanted.get("sources") or [])[:librarian.remaining])
-    log.info("research.consulted", topic=topic[:60], retrieved=len(found),
-             refused=len(librarian.refusals))
+    candidates: list[dict] = []
+    seen: set[str] = set()
+    for query in [q for q in (plan.get("queries") or [])
+                  if isinstance(q, str) and q.strip()][:queries]:
+        for hit in librarian.search(query):
+            if hit["url"] not in seen:
+                seen.add(hit["url"])
+                candidates.append(hit)
+    wanted = _choose(researcher, candidates, topic, questions,
+                     librarian.remaining, log)
+    wanted += [u for u in (plan.get("urls") or [])
+               if isinstance(u, dict) and u.get("url")]
+    found = librarian.gather(wanted[:librarian.remaining])
+    log.info("research.consulted", topic=topic[:60], candidates=len(candidates),
+             retrieved=len(found), refused=len(librarian.refusals))
     return found
+
+
+def _choose(researcher, candidates: list, topic: str, questions: str, limit: int,
+            log: Logger) -> list[dict]:
+    """Pick which search results are worth spending a page of the budget on."""
+    if not candidates or limit <= 0:
+        return []
+    listing = "\n".join(f"[{n}] {hit['title'] or '(no title)'}\n    {hit['url']}"
+                        for n, hit in enumerate(candidates, 1))
+    picked = researcher.ask_json(
+        f"TOPIC: {topic}\n\nQUESTIONS TO ANSWER:\n{questions}\n\n"
+        f"SEARCH RESULTS:\n{listing}\n\n"
+        f"Choose at most {limit} of these results worth reading in full, best "
+        "first. Prefer primary sources over blog posts and aggregators, and "
+        "skip anything that only restates what another result covers. Refer to "
+        "each by its number. Return JSON:\n"
+        '{"pick": [{"n": 1, "why": "what it should settle"}]}'
+    )
+    wanted: list[dict] = []
+    for item in (picked.get("pick") or []):
+        number = item.get("n") if isinstance(item, dict) else item
+        try:
+            index = int(str(number).strip("[]"))
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= index <= len(candidates):
+            continue
+        hit = candidates[index - 1]
+        why = item.get("why", "") if isinstance(item, dict) else ""
+        if hit["url"] not in {w["url"] for w in wanted}:
+            wanted.append({"url": hit["url"], "why": why or hit["title"]})
+    if not wanted:
+        # An unusable answer should not throw the search away: the engine's
+        # own ranking is a better default than falling back to memory.
+        log.info("research.pick_unusable", candidates=len(candidates))
+        wanted = [{"url": hit["url"], "why": hit["title"]}
+                  for hit in candidates[:limit]]
+    return wanted[:limit]
 
 
 def _cited(claimed, sources: list) -> list[str]:

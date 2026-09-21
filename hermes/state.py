@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
+
+from .contextdb import DB_PATH
 
 PHASES = [
     "INTAKE",
@@ -114,8 +117,35 @@ def checkpoint(root: Path, label: str, keep: int = 20) -> Path:
     src = root / ".hermes" / "state"
     if src.is_dir():
         shutil.copytree(src, dest / "state", dirs_exist_ok=True)
+    _backup_context(root, dest / "context.db")
     _prune(dest.parent, keep)
     return dest
+
+
+def _backup_context(root: Path, dest: Path) -> None:
+    """Snapshot the context database through SQLite, not the filesystem.
+
+    It is deliberately not under `.hermes/state`, because copying an open
+    write-ahead-logged database with :func:`shutil.copytree` is how a
+    checkpoint ends up holding one that will not open. The online backup API
+    takes a consistent copy while the factory goes on writing.
+    """
+    source_path = Path(root) / DB_PATH
+    if not source_path.is_file():
+        return
+    source = target = None
+    try:
+        source = sqlite3.connect(source_path)
+        target = sqlite3.connect(dest)
+        source.backup(target)
+    except sqlite3.Error:
+        # A checkpoint that loses a derived index is still a checkpoint; one
+        # that refuses to be taken loses the state that is not derived.
+        pass
+    finally:
+        for conn in (source, target):
+            if conn is not None:
+                conn.close()
 
 
 def _prune(directory: Path, keep: int) -> None:
@@ -129,3 +159,13 @@ def restore(root: Path, checkpoint_dir: Path) -> None:
     if not src.is_dir():
         raise StateError(f"checkpoint has no state directory: {checkpoint_dir}")
     shutil.copytree(src, Path(root) / ".hermes" / "state", dirs_exist_ok=True)
+    saved = Path(checkpoint_dir) / "context.db"
+    if saved.is_file():
+        destination = Path(root) / DB_PATH
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        # The -wal and -shm beside it belong to the database being replaced;
+        # left there they would be replayed onto the restored one.
+        for stale in (destination.with_name(destination.name + "-wal"),
+                      destination.with_name(destination.name + "-shm")):
+            stale.unlink(missing_ok=True)
+        shutil.copyfile(saved, destination)

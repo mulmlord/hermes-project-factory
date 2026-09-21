@@ -16,6 +16,7 @@ from conftest import needs_docker
 
 from hermes.agents import Prompt, build as build_agents, escalate
 from hermes.config import Config, ConfigError, DEFAULTS, deep_merge, is_local_url
+from hermes.contextdb import ContextDB, open_db, split
 from hermes.evolve import (Bandit, Candidate, Evolution, NoTargetFits, Objective,
                           parse_score)
 from hermes.experiment import (Lab, Run, aggregate, measurements,
@@ -3315,3 +3316,350 @@ def test_running_holds_the_server_for_exactly_one_block(monkeypatch):
     off = Config(deep_merge(DEFAULTS, {"server": {"autostart": False}}))
     with running(off, router) as server:
         assert server is None
+
+
+# -- the context database ----------------------------------------------------
+
+def _db(tmp_path):
+    return ContextDB.for_workspace(tmp_path)
+
+
+def _source(count: int = 20, changed: str = "", tag: str = "f") -> str:
+    """A file with *count* top-level functions, optionally one of them edited."""
+    body = "\n".join(f"def {tag}{i}(x):\n    return x + {i}\n" for i in range(count))
+    return body.replace("return x + 7\n", changed + "\n") if changed else body
+
+
+def test_a_changed_function_costs_one_chunk_and_not_the_file(tmp_path):
+    """The whole point: a reader that has the file is sent only the edit."""
+    db = _db(tmp_path)
+    whole = _source(120)
+    db.sync_file("src/engine.py", whole)
+    caught_up = db.head
+
+    db.sync_file("src/engine.py", _source(120, changed="return x * 7  # overflow"))
+    delta = db.delta(caught_up)
+
+    assert len(delta.chunks) == 1
+    assert "return x * 7" in delta.chunks[0].body
+    # the reader pays for the edit, not for the file it lives in
+    assert len(delta.render(8000)) < len(whole) / 4
+    # and the unchanged neighbours are still stored, not re-sent
+    assert len(db.outline("src/engine.py")) > 4
+
+
+def test_an_unchanged_file_neither_writes_nor_moves_the_revision(tmp_path):
+    """A no-op sync that bumped the head would invalidate every reader's cursor."""
+    db = _db(tmp_path)
+    db.sync_file("src/engine.py", _source())
+    head = db.head
+
+    again = db.sync_file("src/engine.py", _source())
+
+    assert not again.changed and again.kept and db.head == head
+
+
+def test_inserting_at_the_top_does_not_rewrite_everything_below_it(tmp_path):
+    """Chunks are matched by content; position-keyed ones would all shift."""
+    db = _db(tmp_path)
+    db.sync_file("src/engine.py", _source())
+    head = db.head
+
+    sync = db.sync_file("src/engine.py", "def first():\n    return 0\n\n" + _source())
+
+    assert sync.kept >= 1 and sync.added == 1
+    assert len(db.delta(head).chunks) == 1
+
+
+def test_stored_files_come_back_byte_for_byte(tmp_path):
+    """An agent that edits what it was handed would write any difference back."""
+    db = _db(tmp_path)
+    for text in ("", "no trailing newline", "a\nb\n", "x\n\n\n", _source(40)):
+        db.sync_file("t.py", text)
+        assert db.file("t.py") == text
+
+
+def test_a_reader_on_a_small_budget_converges_and_sees_nothing_twice(tmp_path):
+    """Regression: dropping half a revision left the cursor stuck on it forever."""
+    db = _db(tmp_path)
+    for index in range(8):
+        db.sync_file(f"src/m{index}.py", _source(12, tag=f"m{index}_"))
+        db.record("gate", f"tests for m{index}", "3 passed", paths=[f"src/m{index}.py"])
+
+    seen, rounds = [], 0
+    while rounds < 100:
+        delta = db.catch_up("implementer", budget=900)
+        if delta.empty:
+            break
+        rounds += 1
+        assert len(delta.text) <= 900
+        seen += [(c.path, c.hash) for c in delta.chunks if c.render() in delta.text]
+
+    assert db.cursor("implementer") == db.head
+    assert rounds < 30                      # it converges
+    assert len(seen) == len(set(seen))      # and repeats nothing on the way
+
+
+def test_a_cursor_only_claims_the_revisions_that_fitted(tmp_path):
+    db = _db(tmp_path)
+    db.sync_file("a.py", _source(30))
+    db.record("note", "something later", "x" * 200)
+
+    delta = db.catch_up("reader", budget=700)
+
+    assert delta.dropped and delta.through < db.head
+    assert db.cursor("reader") == delta.through
+
+
+def test_one_revision_too_big_for_the_budget_is_named_not_skipped_forever(tmp_path):
+    """Refusing it whole would be a reader that can never move again."""
+    db = _db(tmp_path)
+    db.sync_file("huge.py", _source(60))
+
+    delta = db.catch_up("tiny", budget=400)
+
+    assert "huge.py" in delta.text          # named, so it can still be read
+    assert db.cursor("tiny") == db.head     # and the reader is not stuck
+    assert db.catch_up("tiny", budget=400).empty
+
+
+def test_what_is_merely_queued_is_not_described_as_lost(tmp_path):
+    """The two kinds of leftover send a reader to different places."""
+    db = _db(tmp_path)
+    db.sync_file("huge.py", _source(60))     # one revision, too big on its own
+    for index in range(4):                   # and four ordinary ones behind it
+        db.sync_file(f"src/m{index}.py", _source(4, tag=f"m{index}_"))
+
+    text = db.catch_up("tiny", budget=900).text
+
+    assert "huge.py" in text and "read them if you need them" in text
+    assert "next update" in text             # the rest is queued, not gone
+    assert "src/m0.py" not in text           # so it is not sent away to read it
+    assert db.cursor("tiny") < db.head       # only the broken revision is claimed
+
+
+def test_a_removed_file_is_reported_to_readers_that_still_hold_it(tmp_path):
+    db = _db(tmp_path)
+    db.sync_file("src/old.py", _source(10))
+    db.catch_up("reader")
+
+    db.forget_file("src/old.py")
+    delta = db.catch_up("reader")
+
+    assert [gone.path for gone in delta.removed] == ["src/old.py"]
+    assert "src/old.py" not in db.paths()
+
+
+def test_a_rewritten_file_is_a_change_and_not_a_removal(tmp_path):
+    """Its old chunks die, but the file is still there and must not read as gone."""
+    db = _db(tmp_path)
+    db.sync_file("src/engine.py", _source(10))
+    db.catch_up("reader")
+
+    db.sync_file("src/engine.py", _source(10, changed="return x * 7"))
+    delta = db.catch_up("reader")
+
+    assert delta.removed == [] and delta.chunks
+
+
+def test_a_remembered_fact_is_replaced_rather_than_duplicated(tmp_path):
+    """A living note only helps if a reader can tell which version is current."""
+    db = _db(tmp_path)
+    db.remember("parser", "recursive descent")
+    db.remember("parser", "pratt parsing, after the benchmark")
+
+    assert db.recall("parser").body == "pratt parsing, after the benchmark"
+    assert len(db.facts()) == 1
+    # the superseded version is kept: how the understanding changed is history
+    assert len(db.records(kind="fact", limit=10)) == 2
+
+
+def test_search_finds_records_and_code_and_survives_model_punctuation(tmp_path):
+    db = _db(tmp_path)
+    db.sync_file("src/retry.py", "def backoff(attempt):\n    return 2 ** attempt\n")
+    db.record("decision", "exponential backoff", "capped at 30s", paths=["src/retry.py"])
+
+    assert any(h.kind == "chunk" for h in db.search("backoff"))
+    assert any(h.kind == "decision" for h in db.search("exponential backoff"))
+    # a model will eventually type this; an unparseable query finds nothing,
+    # it does not raise
+    assert db.search("backoff(attempt) AND (") or True
+    assert db.search("!!!") == []
+
+
+def test_search_still_works_without_fts5(tmp_path):
+    """Some distribution builds ship SQLite without it; the store must not care."""
+    db = _db(tmp_path)
+    db.sync_file("src/retry.py", "def backoff(attempt):\n    return 2 ** attempt\n")
+    db.record("decision", "exponential backoff", "capped at 30s")
+    db.fts = False
+
+    assert any(h.kind == "chunk" for h in db.search("backoff"))
+    assert any(h.kind == "decision" for h in db.search("exponential"))
+
+
+def test_an_outline_describes_a_file_without_carrying_it(tmp_path):
+    db = _db(tmp_path)
+    # Functions with real bodies, because the point being measured is that an
+    # agent can be told what a file contains for a fraction of what the file
+    # costs -- and in a file that is nothing but signatures there is no
+    # fraction to save.
+    text = "\n".join(
+        f"def f{i}(x):\n" + "".join(f"    step_{j}(x)\n" for j in range(8))
+        for i in range(30)
+    )
+    db.sync_file("src/engine.py", text)
+
+    outline = db.outline("src/engine.py")
+    brief = db.brief(["src/engine.py"])
+
+    assert len(outline) > 1 and all(c.heading for c in outline)
+    assert all(not c.body for c in outline)
+    assert "src/engine.py" in brief and len(brief) < len(text) / 4
+
+
+def test_narrowing_to_paths_leaves_out_the_rest_of_the_project(tmp_path):
+    db = _db(tmp_path)
+    db.sync_file("src/mine.py", _source(6))
+    db.sync_file("src/theirs.py", _source(6))
+
+    delta = db.delta(0, paths=["src/mine.py"])
+
+    assert {c.path for c in delta.chunks} == {"src/mine.py"}
+
+
+def test_prune_keeps_what_a_lagging_reader_is_still_owed(tmp_path):
+    db = _db(tmp_path)
+    db.sync_file("src/old.py", _source(6))
+    db.set_cursor("slow", 0)
+    db.forget_file("src/old.py")
+
+    db.prune()
+    assert [g.path for g in db.catch_up("slow").removed] == ["src/old.py"]
+
+    db.prune()  # now that nobody is behind, the tombstone can go
+    assert db.stats()["buried"] == 0
+
+
+def test_concurrent_writers_get_distinct_revisions(tmp_path):
+    """The loop writes while a prefetch thread reads; revisions must not collide."""
+    db = _db(tmp_path)
+    revisions, lock = [], threading.Lock()
+
+    def write(index: int) -> None:
+        record = db.record("log", f"event {index}")
+        with lock:
+            revisions.append(record.rev)
+
+    threads = [threading.Thread(target=write, args=(i,)) for i in range(12)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(revisions) == list(range(1, 13))
+
+
+def test_chunks_are_cut_where_the_code_divides_itself(tmp_path):
+    pieces = split(_source(30))
+
+    assert len(pieces) > 1
+    assert all(p.body.startswith("def ") for p in pieces)
+    assert all(p.first_line <= p.last_line for p in pieces)
+
+
+def test_the_journal_publishes_a_finished_ticket_into_the_database(tmp_path):
+    """One wiring point: a ticket that finished is when the project changed."""
+    db = _db(tmp_path)
+    board = Board(tmp_path)
+    journal = Journal(tmp_path, db=db)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "engine.py").write_text(_source(10))
+    ticket = board.add(title="the engine", artifacts=["src/engine.py"])
+
+    journal.record(ticket, {"status": "completed",
+                            "change": Change(summary="wrote the engine",
+                                             written=["src/engine.py"])})
+
+    outcome = db.records(kind="outcome", limit=1)[0]
+    assert outcome.ticket == ticket.id and "wrote the engine" in outcome.body
+    assert db.file("src/engine.py") == _source(10)
+    assert db.records(path="src/engine.py")
+
+
+def test_a_broken_database_cannot_fail_a_ticket_that_already_ran(tmp_path):
+    """The JSONL journal is the durable record; the database is an index."""
+    class Broken:
+        def record(self, *a, **kw):
+            raise RuntimeError("disk full")
+
+    journal = Journal(tmp_path, db=Broken())
+    entry = journal.record(Board(tmp_path).add(title="x"), {"status": "completed"})
+
+    assert entry in journal.entries
+    assert (tmp_path / ".hermes" / "state" / "journal.jsonl").is_file()
+
+
+def test_a_new_workspace_knows_the_idea_it_came_from(tmp_path):
+    workspace.create(tmp_path, "Build a toy JSON parser in C")
+
+    with open_db(tmp_path) as db:
+        assert "JSON parser" in db.recall("project.idea").body
+    assert ".hermes/context.db" in (tmp_path / ".gitignore").read_text()
+
+
+def test_a_checkpoint_carries_the_database_and_a_restore_brings_it_back(tmp_path):
+    workspace.create(tmp_path, "an idea")
+    with open_db(tmp_path) as db:
+        db.remember("approach", "the one that worked")
+        head = db.head
+
+    saved = checkpoint(tmp_path, "after-the-ticket")
+    with open_db(tmp_path) as db:
+        db.remember("approach", "a regression")
+
+    restore(tmp_path, saved)
+    with open_db(tmp_path) as db:
+        assert db.recall("approach").body == "the one that worked"
+        assert db.head == head
+
+
+def test_recall_is_offered_to_agents_only_where_a_database_exists(tmp_path):
+    db = _db(tmp_path)
+    db.record("decision", "we use a ring buffer", "so writes never allocate")
+    sandbox = Sandbox(tmp_path, {"runtime": "local"})
+
+    with_db = Toolbox(sandbox, db=db)
+    assert "recall" in with_db.available and "recall" in with_db.protocol()
+    call = with_db.invoke({"tool": "recall", "query": "ring buffer"})
+    assert call.ok and "never allocate" in call.output
+
+    without = Toolbox(sandbox)
+    assert "recall" not in without.available and "recall" not in without.protocol()
+    assert not without.invoke({"tool": "recall", "query": "x"}).ok
+
+
+def test_recall_says_plainly_when_nothing_was_recorded(tmp_path):
+    """A true "nobody has looked at this" beats an invented answer."""
+    toolbox = Toolbox(Sandbox(tmp_path, {"runtime": "local"}), db=_db(tmp_path))
+
+    call = toolbox.invoke({"tool": "recall", "query": "lock-free queue"})
+
+    assert call.ok and "nothing recorded" in call.output
+
+
+def test_the_cli_reports_a_build_step_and_hands_it_to_the_next_reader(tmp_path, capsys):
+    """What a generated project's build actually calls."""
+    workspace.create(tmp_path, "an idea")
+    argv = ["-p", str(tmp_path), "context"]
+
+    assert cli.main(argv + ["log", "pytest", "--kind", "gate",
+                            "--body", "34 passed", "--ticket", "T-1"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(argv + ["catch-up", "reviewer"]) == 0
+    out = capsys.readouterr().out
+    assert "34 passed" in out and "T-1" in out
+
+    assert cli.main(argv + ["catch-up", "reviewer"]) == 0
+    assert "up to date" in capsys.readouterr().out

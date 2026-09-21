@@ -14,6 +14,11 @@ agents already answer in. A text protocol rather than a function-calling API
 because Hermes must work against any local OpenAI-compatible server, and only
 some of them speak ``tools=``.
 
+A fourth, :func:`recall`, reads the context database instead of the disk: it
+answers "what did the others already find out about this" from what agents
+recorded, which is the one question no amount of reading the tree can settle.
+It is offered only where a database exists.
+
 Nothing here writes, and every path goes through :meth:`Sandbox.resolve`,
 which already refuses anything outside the workspace. A refusal comes back as
 an observation the model can act on rather than an exception: telling it the
@@ -31,7 +36,7 @@ from .log import Logger, NULL
 from .sandbox import SandboxError
 
 #: What a lookup may name, and the order the protocol lists them in.
-TOOLS = ("read_file", "grep", "list_dir")
+TOOLS = ("read_file", "grep", "list_dir", "recall")
 
 #: Keys a model may put its lookups under. The first is what the protocol
 #: asks for; the rest are what models trained on other harnesses reach for.
@@ -73,6 +78,11 @@ class Toolbox:
     LINE_CHARS = 300
     #: Entries one directory listing returns.
     ENTRIES = 120
+    #: Results one recall returns, and the width of each. Deliberately tighter
+    #: than a file read: these are pointers into work already recorded, and an
+    #: agent that wants one of them whole can read the file it names.
+    RECALLS = 6
+    RECALL_CHARS = 700
     #: A file larger than this is data, not source, and is never searched.
     MAX_BYTES = 1_000_000
     #: Files one search walks before it gives up on the pattern.
@@ -82,8 +92,11 @@ class Toolbox:
     SEARCH_SECONDS = 5.0
 
     def __init__(self, sandbox, *, budget: int = 6, rounds: int = 3,
-                 log: Logger = NULL):
+                 db=None, log: Logger = NULL):
         self.sandbox = sandbox
+        #: The context database, or None. Without one the toolbox is exactly
+        #: the three filesystem lookups it was before.
+        self.db = db
         self.budget = max(0, int(budget))
         self.rounds = max(0, int(rounds))
         self.log = log
@@ -94,6 +107,12 @@ class Toolbox:
     @property
     def enabled(self) -> bool:
         return self.budget > 0 and self.rounds > 0
+
+    @property
+    def available(self) -> tuple[str, ...]:
+        """The tools this toolbox can actually serve."""
+        return TOOLS if self.db is not None else tuple(
+            name for name in TOOLS if name != "recall")
 
     @property
     def remaining(self) -> int:
@@ -133,11 +152,12 @@ class Toolbox:
         else:
             name = str(request.get("tool") or request.get("name") or "").strip()
             handler = {"read_file": self._read_file, "grep": self._grep,
-                       "list_dir": self._list_dir}.get(name)
-            if handler is None:
+                       "list_dir": self._list_dir,
+                       "recall": self._recall}.get(name)
+            if handler is None or name not in self.available:
                 call = Call(name or "lookup", "", ok=False, output=(
                     f"there is no {name!r} tool; the tools are "
-                    + ", ".join(TOOLS)))
+                    + ", ".join(self.available)))
             else:
                 try:
                     detail, output, ok = handler(request)
@@ -223,6 +243,23 @@ class Toolbox:
             listing.append(f"… {len(entries) - self.ENTRIES} more")
         return where, "\n".join(listing) or "(empty)", True
 
+    def _recall(self, request: dict) -> tuple[str, str, bool]:
+        """What agents recorded about something, from the context database."""
+        query = str(request.get("query") or request.get("pattern")
+                    or request.get("q") or "").strip()
+        where = _path(request)
+        detail = query + (f" in {where}" if where else "")
+        if self.db is None:
+            return detail, "this project keeps no context database", False
+        if not query:
+            return detail, 'no "query" given', False
+        hits = self.db.search(query, limit=self.RECALLS, path=where)
+        if not hits:
+            # A true answer, and a useful one: it means no earlier agent left
+            # anything about this, so there is nothing to be consistent with.
+            return detail, "nothing recorded about that", True
+        return detail, "\n\n".join(h.render()[: self.RECALL_CHARS] for h in hits), True
+
     def _walk(self, root: Path):
         if root.is_file():
             yield root
@@ -255,7 +292,10 @@ class Toolbox:
             '      matching lines; "path" optional\n'
             '  {"tool": "list_dir", "path": "src"}'
             '                          what one directory holds\n'
-            f"You have {self.remaining} lookup(s) left across {self.rounds_left} more "
+            + ('  {"tool": "recall", "query": "retry backoff"}'
+               '                 what other agents recorded about it\n'
+               if self.db is not None else "")
+            + f"You have {self.remaining} lookup(s) left across {self.rounds_left} more "
             "repl(y/ies). The results come back and you are asked again.\n"
             "Look up anything you would otherwise guess: a function you are about to "
             "call, its arguments, an import path, a file you were not shown. A guessed "

@@ -402,6 +402,7 @@ rate against your own code, and `block` is worth setting only after that.
 | `hermes logs -f` | follow the machine-readable log |
 | `hermes inspect [-t T003]` | spec, plan, board, history, or one ticket |
 | `hermes journal` | what each agent did, the record the agents themselves read |
+| `hermes context catch-up <reader>` | what has changed since that reader last looked, and only that |
 | `hermes test` | run the project's verification gates |
 | `hermes benchmark` | run the project's benchmark and report the score |
 | `hermes evolve -g 30` | run evolutionary optimisation |
@@ -425,10 +426,33 @@ project/
 ├── tickets/            kanban board, mirrored as markdown
 ├── research/  artifacts/
 └── .hermes/            state, logs, metrics, evaluations, checkpoints
+    └── context.db      what every agent recorded, queryable and incremental
 ```
 
 Everything outside `.hermes/` is meant to be readable without Hermes. The
 released repository excludes factory internals entirely.
+
+Inside `.hermes/` sits `context.db`, the project's context database. Agents
+are stateless, so everything one of them learned has to reach the next one
+through the workspace, and a file costs the same to hand over whether or not
+it changed. The database makes that handover incremental: records (a gate
+result, a decision, a ticket's outcome, a remembered fact) and the project's
+own files, split at their own boundaries and keyed by content hash, each
+stamped with a rising revision number. A reader remembers the revision it last
+saw and asks for what came after, so a one-function change in a 900-line file
+arrives as one chunk rather than the file. It is SQLite and nothing but the
+standard library, and it is derived, not authoritative — the files are on disk
+and the journal is still JSONL, so `hermes context sync` rebuilds it from a
+clean checkout and it is never committed.
+
+A generated project's own build steps write to it too:
+
+```sh
+cargo test 2>&1 | hermes context log "cargo test" --kind gate
+hermes context catch-up implementer   # what the next agent has not seen yet
+hermes context search "retry backoff"
+hermes context outline src/engine.rs  # what a file contains, without its body
+```
 
 The JSONL log under `.hermes/logs/` stamps every record with the work that
 produced it — `run`, `phase`, `ticket` and `attempt` — so a line written deep

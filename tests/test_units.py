@@ -2,6 +2,7 @@
 import contextlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import threading
@@ -1366,6 +1367,11 @@ def _serving(bind: str, reachable_as: str):
                     wrapped=quote(f"{base}/second.html", safe="")))):
             with open(f"{pages}/{name}", "w") as handle:
                 handle.write(body)
+        # A directory, so that asking for /manual gets a 301 to /manual/ and a
+        # fetch has a redirect to follow without reaching off this machine.
+        os.mkdir(f"{pages}/manual")
+        with open(f"{pages}/manual/index.html", "w") as handle:
+            handle.write(GUIDE)
         try:
             yield base
         finally:
@@ -1633,35 +1639,35 @@ def _docker_librarian(root, **cfg):
     """A librarian whose sandbox really is a container, or a skip."""
     if not shutil.which("docker"):
         needs_docker("docker is not installed")
-    root.chmod(0o755)  # the container drops CAP_DAC_OVERRIDE, so 0700 is unreadable
     sandbox = Sandbox(root, {"runtime": "docker", "timeout": 300,
                              "image": "python:3.11-slim"}, NULL)
     # No start(): a fetch always takes the one-shot container, never the
     # long-lived one, because the long-lived one has no network. Probe the
     # runtime the way a fetch will use it rather than trusting the daemon.
-    if not sandbox.run("python3 -c ''", network=True).ok:
-        needs_docker("the docker daemon refused to start a container")
+    probe = sandbox.run(f"test -d {shlex.quote(sandbox.workdir)}", network=True)
+    if not probe.ok:
+        needs_docker(f"docker did not run a container: {probe.stderr.strip()[:300]}")
     return Librarian(sandbox, root, cfg, NULL)
 
 
-def test_docker_fetch_lands_in_the_workspace_readable_by_the_host(tmp_path,
+def test_docker_fetch_lands_in_the_workspace_readable_by_the_host(shared_tmp,
                                                                   bridge_served):
     """The bytes cross the bind mount, and the host owns what comes back."""
-    workspace.create(tmp_path, "a ring buffer")
-    librarian = _docker_librarian(tmp_path, allow_private=True)
+    workspace.create(shared_tmp, "a ring buffer")
+    librarian = _docker_librarian(shared_tmp, allow_private=True)
 
     source = librarian.fetch(f"{bridge_served}/guide.html", why="how the index wraps")
 
     assert source is not None, librarian.refusals
-    stored = tmp_path / source.path
+    stored = shared_tmp / source.path
     assert source.path.startswith("research/sources/")
     assert stored.is_file() and stored.stat().st_uid == os.getuid()
     assert "power-of-two capacity" in librarian.text(source, 4000)
     # research/sources/ was created by the container, so it too must be ours.
-    assert (tmp_path / "research" / "sources").stat().st_uid == os.getuid()
+    assert (shared_tmp / "research" / "sources").stat().st_uid == os.getuid()
 
 
-def test_docker_fetch_carries_the_content_type_and_final_url_back(tmp_path,
+def test_docker_fetch_carries_the_content_type_and_final_url_back(shared_tmp,
                                                                  bridge_served):
     """The metadata is a line of container stdout; nothing else reports it.
 
@@ -1669,40 +1675,42 @@ def test_docker_fetch_carries_the_content_type_and_final_url_back(tmp_path,
     redirect ended at, so both losing the container boundary is silent: the
     page still arrives, mislabelled and cited as the address asked for.
     """
-    workspace.create(tmp_path, "a ring buffer")
-    librarian = _docker_librarian(tmp_path, allow_private=True)
+    workspace.create(shared_tmp, "a ring buffer")
+    librarian = _docker_librarian(shared_tmp, allow_private=True)
 
-    # SimpleHTTPRequestHandler redirects a directory to its trailing-slash form.
     source = librarian.fetch(f"{bridge_served}/guide.html")
-    redirected = librarian.fetch(bridge_served)
+    # /manual is a directory, which the server answers with a 301 to /manual/.
+    redirected = librarian.fetch(f"{bridge_served}/manual")
 
-    assert source is not None and source.path.endswith(".html")
+    assert source is not None, librarian.refusals
+    assert source.path.endswith(".html")            # the suffix the type chose
     assert source.title == "Ring Buffer Guide"      # the arriving bytes parsed
     assert redirected is not None, librarian.refusals
-    assert redirected.url == f"{bridge_served}/"    # where it ended, not where it went
+    assert redirected.url == f"{bridge_served}/manual/"   # where it ended up
+    assert redirected.cite().endswith(f"<{bridge_served}/manual/>")
 
 
 def test_docker_fetch_refuses_a_private_address_from_inside_the_container(
-        tmp_path, bridge_served):
+        shared_tmp, bridge_served):
     """The guard resolves with the container's resolver, and still says no."""
-    workspace.create(tmp_path, "a ring buffer")
-    librarian = _docker_librarian(tmp_path)         # allow_private defaults off
+    workspace.create(shared_tmp, "a ring buffer")
+    librarian = _docker_librarian(shared_tmp)         # allow_private defaults off
 
     assert librarian.fetch(f"{bridge_served}/guide.html") is None
     assert "non-public" in librarian.refusals[0]["reason"]
-    assert not list((tmp_path / "research" / "sources").glob("*"))
+    assert not list((shared_tmp / "research" / "sources").glob("*"))
 
 
-def test_docker_fetch_resolves_names_inside_the_container(tmp_path, bridge_served):
+def test_docker_fetch_resolves_names_inside_the_container(shared_tmp, bridge_served):
     """A name is resolved where the fetch runs, which is not where Hermes runs.
 
     ``localhost`` is the host's own server to Hermes and the container itself
     to the container. The refusal has to come from the container's answer, or
     the guard is checking an address that was never dialled.
     """
-    workspace.create(tmp_path, "a ring buffer")
+    workspace.create(shared_tmp, "a ring buffer")
     port = bridge_served.rsplit(":", 1)[1]
-    librarian = _docker_librarian(tmp_path, allow_private=True)
+    librarian = _docker_librarian(shared_tmp, allow_private=True)
 
     # Allowed past the guard, then dialled in the container, where nothing is
     # listening on its own loopback: a connection error, not a fetched page.
@@ -2707,7 +2715,7 @@ def test_docker_install_gets_network_then_loses_it(shared_tmp):
                                  "image": "python:3.11-slim"})
     with sandbox:
         if sandbox.runtime != "docker":
-            needs_docker("the docker daemon refused to start a container")
+            needs_docker(f"docker did not run a container: {sandbox.fallback}")
         assert sandbox.install("pip install --quiet pytest").ok
         assert sandbox.run("python -c 'import pytest'").ok
         assert not sandbox.run(
@@ -2727,7 +2735,7 @@ def test_missing_tool_is_installed_and_recorded(shared_tmp):
                                  "image": "python:3.11-slim"})
     with sandbox:
         if sandbox.runtime != "docker":
-            needs_docker("the docker daemon refused to start a container")
+            needs_docker(f"docker did not run a container: {sandbox.fallback}")
         verification = verify_project(sandbox, plan)
     assert verification.passed, verification.report()
     assert sandbox.installed == ["pytest"]
@@ -2756,7 +2764,7 @@ def test_console_script_triggers_editable_install(shared_tmp):
                                    "image": "python:3.11-slim"})
     with sandbox:
         if sandbox.runtime != "docker":
-            needs_docker("the docker daemon refused to start a container")
+            needs_docker(f"docker did not run a container: {sandbox.fallback}")
         verification = verify_project(sandbox, plan)
     assert verification.passed, verification.report()
     assert plan["commands"]["setup"] == "pip install -e ."
@@ -2771,7 +2779,7 @@ def test_unknown_tool_is_not_fetched_from_pypi(shared_tmp):
                                    "image": "python:3.11-slim"})
     with sandbox:
         if sandbox.runtime != "docker":
-            needs_docker("the docker daemon refused to start a container")
+            needs_docker(f"docker did not run a container: {sandbox.fallback}")
         verification = verify_project(sandbox, plan)
     assert not verification.passed
     assert sandbox.installed == []
@@ -2794,7 +2802,7 @@ def test_failed_install_reaches_the_agent(shared_tmp):
                                    "image": "python:3.11-slim"})
     with sandbox:
         if sandbox.runtime != "docker":
-            needs_docker("the docker daemon refused to start a container")
+            needs_docker(f"docker did not run a container: {sandbox.fallback}")
         verification = verify_project(sandbox, plan)
     assert not verification.passed
     assert "pip install" in verification.failure_output()

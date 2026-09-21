@@ -65,9 +65,12 @@ class Sandbox:
         #: own ledger it says whether a run was bound by the GPU or the CPU.
         self.spent = 0.0
         self._probe_error = ""
+        #: Why the docker runtime was abandoned, empty while it still holds.
+        #: Falling back to ``local`` weakens the isolation the config asked
+        #: for, so the reason has to outlive the log line that announced it.
+        self.fallback = ""
         if self.runtime == "docker" and not shutil.which("docker"):
-            self.log.warn("sandbox.docker_missing", fallback="local")
-            self.runtime = "local"
+            self._fall_back("sandbox.docker_missing", "docker is not installed")
 
     # -- lifecycle -------------------------------------------------------
     def start(self) -> None:
@@ -92,9 +95,7 @@ class Sandbox:
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
-            self.log.warn("sandbox.start_failed", error=proc.stderr.strip()[:300],
-                          fallback="local")
-            self.runtime = "local"
+            self._fall_back("sandbox.start_failed", proc.stderr.strip()[:300])
             return
         self.container = name
         if not self._workspace_visible():
@@ -102,15 +103,20 @@ class Sandbox:
             # directory when the host path also exists inside the engine VM
             # (/tmp is the usual victim). Gates would then all fail against a
             # workspace the container cannot see, so refuse to run blind.
-            self.log.warn("sandbox.workspace_not_shared", root=str(self.root),
-                          error=self._probe_error,
-                          hint="the docker engine must share this path and the "
-                               "directory must be readable inside the container",
-                          fallback="local")
             self.stop()
-            self.runtime = "local"
+            self._fall_back(
+                "sandbox.workspace_not_shared",
+                f"the container cannot read {self.root}: {self._probe_error}",
+                hint="the docker engine must share this path and the "
+                     "directory must be readable inside the container")
             return
         self.log.info("sandbox.started", container=name, image=self.cfg.get("image"))
+
+    def _fall_back(self, event: str, reason: str, **fields) -> None:
+        """Give up on docker for this run, remembering what went wrong."""
+        self.fallback = reason
+        self.log.warn(event, error=reason, fallback="local", **fields)
+        self.runtime = "local"
 
     @staticmethod
     def _user_args() -> list[str]:

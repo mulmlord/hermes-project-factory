@@ -566,9 +566,13 @@ halfway through.
 
 - Output quality tracks the local model. A small model produces a small
   project.
-- Agents patch files with exact search/replace edits and fall back to whole
-  files. A local model that cannot copy an anchor character for character
-  loses the edit and retries, which costs a generation.
+- Agents patch files with search/replace edits and fall back to whole files.
+  An anchor whose indentation or trailing space drifted is re-located against
+  the file and the replacement re-indented to match, so the common near-miss no
+  longer costs a generation. What is never guessed is *which* of two possible
+  sites was meant: an ambiguous anchor is refused unless the edit names the
+  function or class it belongs to, because a wrong edit that still passes the
+  tests is worse than a retry.
 - Optimisation needs its targets to fit the evolver's context whole. A project
   whose hot file is larger than that gets no optimisation rather than a
   half-informed one; the log names the file and the room it missed by, and the

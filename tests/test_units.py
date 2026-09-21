@@ -17,6 +17,7 @@ from conftest import needs_docker
 from hermes.agents import Prompt, build as build_agents, escalate
 from hermes.config import Config, ConfigError, DEFAULTS, deep_merge, is_local_url
 from hermes.contextdb import ContextDB, open_db, split
+from hermes.anchor import locate
 from hermes.evolve import (Bandit, Candidate, Evolution, NoTargetFits, Objective,
                           parse_score)
 from hermes.experiment import (Lab, Run, aggregate, measurements,
@@ -580,6 +581,122 @@ def test_an_ambiguous_edit_is_refused_with_a_reason(tmp_path):
         {"path": "src/a.py", "find": "x = 1", "replace": "x = 2"}]})
     assert sandbox.read("src/a.py") == "x = 1\nx = 1\n"
     assert change.empty and "appears 2 times" in change.unmatched[0]
+
+
+def test_an_edit_whose_indentation_drifted_still_lands(tmp_path):
+    """The file indents with two spaces and the model sent four."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/a.py", "def add(a, b):\n  return a - b\n")
+    change = apply_change(sandbox, {"edits": [
+        {"path": "src/a.py", "find": "    return a - b", "replace": "    return a + b"}]})
+    assert change.written == ["src/a.py"] and not change.unmatched
+    assert change.repaired == ["src/a.py (whitespace)"]
+    assert sandbox.read("src/a.py") == "def add(a, b):\n  return a + b\n"
+
+
+def test_a_relocated_edit_keeps_the_shape_of_its_replacement(tmp_path):
+    """Only the block moves: what is nested inside it stays nested."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/a.py", "def f(xs):\n    for x in xs:\n        use(x)\n    return 1\n")
+    change = apply_change(sandbox, {"edits": [
+        {"path": "src/a.py", "find": "for x in xs:\n    use(x)",
+         "replace": "for x in xs:\n    if x:\n        use(x)"}]})
+    assert not change.unmatched
+    assert sandbox.read("src/a.py") == (
+        "def f(xs):\n    for x in xs:\n        if x:\n            use(x)\n    return 1\n")
+
+
+def test_a_symbol_hint_decides_between_identical_anchors(tmp_path):
+    """Two functions hold the same line; the model said which one it meant."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/a.py", "def a():\n    return 0\n\n\ndef b():\n    return 0\n")
+    change = apply_change(sandbox, {"edits": [
+        {"path": "src/a.py", "find": "    return 0", "replace": "    return 1",
+         "symbol": "b"}]})
+    assert change.repaired == ["src/a.py (hint)"] and not change.unmatched
+    assert sandbox.read("src/a.py") == (
+        "def a():\n    return 0\n\n\ndef b():\n    return 1\n")
+
+
+def test_a_hint_that_decides_nothing_leaves_the_edit_refused(tmp_path):
+    """Equidistant anchors are as ambiguous with the hint as without it."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/a.py", "x = 1\ny = 0\nx = 1\n")
+    change = apply_change(sandbox, {"edits": [
+        {"path": "src/a.py", "find": "x = 1", "replace": "x = 2", "line": 2}]})
+    assert change.empty and "appears 2 times" in change.unmatched[0]
+    assert sandbox.read("src/a.py") == "x = 1\ny = 0\nx = 1\n"
+
+
+def test_a_widened_match_that_is_ambiguous_is_refused(tmp_path):
+    """Widening the search must not widen what counts as unique."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/a.py", "if a:\n\tgo()\nif b:\n\tgo()\n")
+    change = apply_change(sandbox, {"edits": [
+        {"path": "src/a.py", "find": "    go()", "replace": "    stop()"}]})
+    assert change.empty and "matches 2 places" in change.unmatched[0]
+    assert sandbox.read("src/a.py") == "if a:\n\tgo()\nif b:\n\tgo()\n"
+
+
+def test_locate_tolerates_trailing_whitespace_without_eating_the_newline():
+    text = "a = 1\nb = 2   \nc = 3\n"
+    found, reason = locate(text, "b = 2\nc = 3", "b = 4\nc = 3")
+    assert reason == "" and found.how == "whitespace"
+    assert found.splice(text) == "a = 1\nb = 4\nc = 3\n"
+
+
+def test_locate_keeps_the_line_endings_the_file_already_used():
+    text = "def f():\r\n\tif a:\r\n\t\tgo()\r\n"
+    found, _ = locate(text, "    if a:\n        go()", "    if a:\n        stop()")
+    assert found.splice(text) == "def f():\r\n\tif a:\r\n\t\tstop()\r\n"
+
+
+def test_a_line_hint_decides_between_identical_anchors():
+    text = "x = 1\ny = 0\nz = 0\nx = 1\n"
+    found, _ = locate(text, "x = 1", "x = 2", line=4)
+    assert found.how == "hint" and found.splice(text) == "x = 1\ny = 0\nz = 0\nx = 2\n"
+
+
+def test_re_anchoring_never_rewrites_a_file_it_was_not_asked_to():
+    """The safety property, checked against real code rather than fixtures.
+
+    For any block of a real source file, an edit that replaces the block with
+    itself must leave the file byte for byte identical -- whether the anchor
+    was sent as the file has it, shifted bodily to the wrong indentation, or
+    flattened. A refusal is always an acceptable answer -- an anchor can be
+    genuinely ambiguous, and flattening destroys the nesting outright -- so
+    what this forbids is the third answer, where the file comes back changed.
+    """
+    import random
+    from pathlib import Path
+
+    random.seed(20260922)
+    seen = {"exact": 0, "shifted": 0, "refused": 0}
+    for path in sorted((Path(__file__).resolve().parent.parent / "hermes").glob("*.py")):
+        text = path.read_text()
+        lines = text.splitlines(keepends=True)
+        for _ in range(60):
+            first = random.randrange(0, max(1, len(lines) - 6))
+            block = "".join(lines[first:first + random.randint(1, 6)]).rstrip("\n")
+            if not block.strip():
+                continue
+            shifted = "\n".join("  " + p if p.strip() else p for p in block.splitlines())
+            flattened = "\n".join(p.lstrip() for p in block.splitlines())
+            for anchor, kind in ((block, "exact"), (shifted, "shifted"),
+                                 (flattened, "flattened")):
+                found, reason = locate(text, anchor, anchor)
+                if found is None:
+                    assert reason, f"{path}: refused {anchor[:60]!r} without saying why"
+                    seen["refused"] += 1
+                    continue
+                assert found.splice(text) == text, f"{path}: {kind} {anchor[:60]!r}"
+                seen[kind if kind != "flattened" else "exact"] += 1
+    assert seen["exact"] and seen["shifted"] and seen["refused"]
+
+
+def test_locate_refuses_an_anchor_that_is_simply_not_there():
+    found, reason = locate("a = 1\n", "z = 9", "z = 8")
+    assert found is None and "does not appear" in reason
 
 
 def test_an_edit_to_a_missing_file_asks_for_the_whole_file(tmp_path):

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from . import prompts
 from .agents import Prompt, context_block, escalate, file_protocol, ticket_block
+from .anchor import locate
 from .ledger import ABANDONED, FAILED, FIXED, NullLedger
 from .log import Logger, NULL, scope
 from .sandbox import Sandbox, SandboxError
@@ -89,6 +90,9 @@ class Change:
     commands: list[str] = field(default_factory=list)
     #: Edits whose "find" text did not match, phrased for the next attempt.
     unmatched: list[str] = field(default_factory=list)
+    #: Edits that only landed because the applier widened the search, with how.
+    #: Nothing depends on this; it is what says whether widening pays.
+    repaired: list[str] = field(default_factory=list)
 
     @property
     def touched(self) -> list[str]:
@@ -106,6 +110,8 @@ class Change:
             parts.append(f"deleted {', '.join(self.deleted[:5])}")
         if self.rejected:
             parts.append(f"rejected {', '.join(self.rejected[:5])}")
+        if self.repaired:
+            parts.append(f"re-anchored {', '.join(self.repaired[:5])}")
         if self.unmatched:
             parts.append(f"{len(self.unmatched)} edit(s) did not match")
         return "; ".join(parts) or "no changes"
@@ -152,7 +158,8 @@ def apply_change(sandbox: Sandbox, payload: dict, log: Logger = NULL) -> Change:
             target.unlink()
             change.deleted.append(path)
     log.info("implement.applied", files=len(change.written), deleted=len(change.deleted),
-             rejected=len(change.rejected), unmatched=len(change.unmatched))
+             rejected=len(change.rejected), unmatched=len(change.unmatched),
+             repaired=len(change.repaired))
     return change
 
 
@@ -160,9 +167,10 @@ def _apply_edit(sandbox: Sandbox, item: dict, change: Change, log: Logger) -> No
     """Apply one search/replace edit, or record precisely why it did not apply.
 
     An edit is only safe when its anchor is unambiguous, so a "find" that is
-    absent or appears more than once is refused rather than guessed at. Saying
-    which of those happened is what lets the next attempt fix it instead of
-    resending the same edit.
+    absent, or that could mean two places, is refused rather than guessed at.
+    Saying which of those happened is what lets the next attempt fix it instead
+    of resending the same edit. :mod:`hermes.anchor` decides where -- and
+    whether -- the anchor lands; everything here is about the file.
     """
     path = str(item.get("path", "")).strip().lstrip("/")
     find, replace = item.get("find"), item.get("replace")
@@ -183,21 +191,25 @@ def _apply_edit(sandbox: Sandbox, item: dict, change: Change, log: Logger) -> No
             f"{path}: the file does not exist yet, so it cannot be edited. "
             "Return its complete contents under \"files\".")
         return
-    occurrences = text.count(find)
-    if occurrences == 0:
-        change.unmatched.append(
-            f"{path}: the text in \"find\" does not appear in the file. Copy it "
-            "exactly from the current contents shown to you, or return the whole "
-            "file under \"files\".")
+    found, reason = locate(text, find, replace, line=_int(item.get("line")),
+                           symbol=str(item.get("symbol") or ""))
+    if found is None:
+        change.unmatched.append(f"{path}: {reason}")
         return
-    if occurrences > 1:
-        change.unmatched.append(
-            f"{path}: the text in \"find\" appears {occurrences} times, so the edit "
-            "is ambiguous. Include more surrounding lines so it occurs once.")
-        return
-    sandbox.write(path, text.replace(find, replace, 1))
+    sandbox.write(path, found.splice(text))
+    if not found.exact:
+        change.repaired.append(f"{path} ({found.how})")
+        log.info("implement.edit_relocated", path=path, how=found.how)
     if path not in change.written:
         change.written.append(path)
+
+
+def _int(value) -> int | None:
+    """*value* as a line number, for a hint a model may send as a string."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _protected(path: str) -> bool:

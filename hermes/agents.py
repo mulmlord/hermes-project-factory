@@ -21,7 +21,8 @@ Return JSON of exactly this shape:
 
 _PROTOCOL_EDITS = """\
   "edits": [{"path": "src/thing.py", "find": "<exact text to replace>",
-             "replace": "<the text that takes its place>"}],
+             "replace": "<the text that takes its place>",
+             "symbol": "<optional: the function or class it is inside>"}],
 """
 
 _PROTOCOL_TAIL = """\
@@ -44,6 +45,8 @@ EDIT_RULES = """\
   copied character for character from the file as shown to you, and long enough
   to appear exactly once in it; "replace" is what it becomes. An edit that does
   not match is discarded and you will be told so.
+- Name the enclosing function or class in "symbol" when the file has several
+  places the same text could be. That is what decides which one you meant.
 - Use "files" for a file you are creating, or when you are genuinely rewriting a
   whole small file. Re-emitting a large file to change a few lines is slow and
   tends to lose code you did not mean to touch.

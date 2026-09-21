@@ -535,3 +535,20 @@ def test_a_run_starts_the_model_server_and_stops_it_afterwards(factory, monkeypa
     factory.run(max_iterations=1)
     assert calls == ["cat", "start", "stop"]
     assert not up["now"]
+
+
+def test_one_page_budget_serves_the_whole_run(factory):
+    """Research is entered once, then again by every failure triaged as research.
+
+    Each of those built its own librarian, so `research.max_fetches` bounded a
+    call rather than the run: ten escalations fetched ten times the configured
+    pages and nothing counted them. One librarian for the run is what makes
+    the configured number the number.
+    """
+    factory.config.data["research"]["network"] = True
+
+    first = factory._librarian()
+    first.spent = first.max_pages
+
+    assert factory._librarian() is first
+    assert factory._librarian().remaining == 0

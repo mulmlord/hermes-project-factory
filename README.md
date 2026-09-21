@@ -35,10 +35,17 @@ everything you did not say and recording each inference as an assumption.
 the problem plainly, name the unknowns, attack them, challenge the answers,
 then convert what survives into decision records, hypotheses and tickets. A
 research round that changes nothing is treated as a failed round. Enable
-`research.network` and the round also reads: the researcher names the pages
-worth consulting, the sandbox fetches them, the bytes are kept under
-`research/` as evidence, and a finding may cite only a page that was
-actually retrieved. Those copies stay on your machine: they are gitignored
+`research.network` and the round also reads: a search turns each question
+into URLs that exist, the researcher picks which of the results are worth
+reading, the sandbox fetches those, the bytes are kept under `research/` as
+evidence, and a finding may cite only a page that was actually retrieved.
+The URLs come from a search rather than from the model's memory because a
+local model asked to recall one mostly invents it, and an invented URL
+spends a page of the budget to return a 404. Point `research.search` at a
+SearXNG instance you host to keep the lookup off a third party. The page
+budget belongs to the run, not to a round, so it still bounds the total when
+a failing ticket escalates into research again. Those copies stay on your
+machine: they are gitignored
 and excluded from the release export, so a clone gets the citations and the
 extracted text without republishing someone else's pages under the project's
 licence.
@@ -487,10 +494,13 @@ halfway through.
   from a worse one on your model is exactly what the `resolution` line will
   tell you the first time you run it.
 - Research works from what the model knows until you set
-  `research.network: true`, which buys it real sources within a page, byte
-  and time budget. The retrieval path is exercised against a real server on
-  every commit; which URLs a given local model actually names, and how often
-  they exist, is unmeasured.
+  `research.network: true`, which buys it real sources within a page, search,
+  byte and time budget. The search and retrieval path is exercised against a
+  real server on every commit; how well a given local model turns a question
+  into search terms, and how often the results answer it, is unmeasured. The
+  default endpoint is DuckDuckGo's HTML interface, which is a third party and
+  rate-limits: `research.search` takes any URL template, so a self-hosted
+  SearXNG is one line of configuration.
 
 ## License
 

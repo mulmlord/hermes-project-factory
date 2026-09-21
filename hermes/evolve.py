@@ -21,7 +21,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-from .agents import EDIT_RULES, Prompt, context_block
+from . import prompts
+from .agents import Prompt, context_block
 from .implement import Change, apply_change
 from .log import Logger, NULL
 from .sandbox import Sandbox
@@ -408,18 +409,8 @@ class Evolution:
             prompt.add("feedback", f"YOUR LAST PROPOSAL DID NOT APPLY:\n{feedback}\n"
                        "Anchor every edit in text you can see above, character for "
                        "character.", priority=5, floor=200)
-        prompt.add("direction", f"THIS GENERATION'S DIRECTION: {family}\n\n"
-                   "Propose ONE focused change in that direction that improves the "
-                   "objective while keeping every test passing. Do not repeat a change "
-                   "listed as not helping. Return JSON:\n"
-                   '{"mutation": "one line naming the change", '
-                   '"mechanism": "why this is faster/better, mechanically", '
-                   '"edits": [{"path": "src/thing.ext", "find": "<exact text to '
-                   'replace>", "replace": "<the text that takes its place>"}], '
-                   '"files": [{"path": "src/thing.ext", "content": "<COMPLETE file '
-                   'contents>"}], '
-                   '"risk": "what could break"}\n' + EDIT_RULES
-                   + "- Change only the files shown above.", required=True)
+        prompt.add("direction", prompts.evolution_direction(family),
+                   required=True)
         # The code block takes what the fixed blocks leave, and every target it
         # offers it offers whole: an edit's anchor has to be copied from the
         # file as it actually is, and a fragment is also a candidate reasoning

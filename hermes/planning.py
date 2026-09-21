@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from . import prompts
 from .log import Logger, NULL
 from .tickets import Board, KINDS, Ticket, split_validation
 from .workspace import slugify
@@ -14,31 +15,7 @@ MAX_TICKET_FIELDS = 400
 def intake(agents, idea: str, log: Logger = NULL) -> dict:
     """Turn a one-line idea into a formal, self-contained specification."""
     log.info("intake.start", idea=idea[:100])
-    spec = agents["architect"].ask_json(
-        f"PROJECT IDEA (the only input the user gave):\n{idea}\n\n"
-        "Produce a complete specification. Infer sensible defaults for anything "
-        "unstated and record each inference under \"assumptions\" -- you cannot "
-        "ask the user. Return JSON:\n"
-        "{\n"
-        '  "name": "short-kebab-case-project-name",\n'
-        '  "objective": "one paragraph: what this software does and for whom",\n'
-        '  "deliverables": ["concrete artifact the project must produce"],\n'
-        '  "platforms": ["target OS/runtime"],\n'
-        '  "technologies": ["language and key libraries, with the language first"],\n'
-        '  "functional_requirements": ["testable statement of required behaviour"],\n'
-        '  "nonfunctional_requirements": ["performance, security, reliability"],\n'
-        '  "constraints": ["hard limits the implementation must respect"],\n'
-        '  "risks": ["what could make this fail"],\n'
-        '  "unknowns": ["what is not yet known and must be researched"],\n'
-        '  "success_criteria": ["measurable, checkable completion condition"],\n'
-        '  "assumptions": ["defaults you chose because the idea did not say"],\n'
-        '  "optimization_objective": {"metric": "name of an automatically '
-        'measurable metric, or empty string if none applies", "direction": '
-        '"minimize|maximize", "how_measured": "how a script would measure it"}\n'
-        "}\n"
-        "Scope it so a small team could build it: ambitious but finishable. "
-        "Prefer the standard library and few dependencies."
-    )
+    spec = agents["architect"].ask_json(prompts.spec_from_idea(idea))
     spec.setdefault("name", slugify(idea))
     spec["name"] = slugify(spec.get("name") or idea)
     log.info("intake.done", name=spec["name"],
@@ -49,32 +26,8 @@ def intake(agents, idea: str, log: Logger = NULL) -> dict:
 def architect(agents, spec: dict, research: str, log: Logger = NULL) -> dict:
     """Choose the architecture and the concrete build/test/benchmark commands."""
     log.info("architecture.start")
-    plan = agents["architect"].ask_json(
-        f"SPECIFICATION:\n{json.dumps(spec, indent=2)[:10000]}\n\n"
-        f"RESEARCH CONCLUSIONS:\n{research or '(none)'}\n\n"
-        "Design the system and define how it is built and verified. Return JSON:\n"
-        "{\n"
-        '  "approach": "how you will build this, in a short paragraph",\n'
-        '  "architecture": "components and how they fit together",\n'
-        '  "components": [{"name": "", "responsibility": "", "path": "src/..."}],\n'
-        '  "milestones": [{"name": "", "description": "", "exit_criteria": ""}],\n'
-        '  "commands": {"setup": "shell command installing dependencies", '
-        '"build": "shell command that compiles/checks, or \'true\' for '
-        'interpreted projects", "test": "shell command running the test suite", '
-        '"lint": "shell command or empty", "benchmark": "shell command printing '
-        'a score, or empty"},\n'
-        '  "layout": ["files the project will contain, with one-line purpose"],\n'
-        '  "decisions": [{"title": "", "decision": "", "rationale": "", '
-        '"alternatives": "", "consequences": ""}]\n'
-        "}\n"
-        "Commands must be real, runnable, non-interactive shell commands that "
-        "work from the project root inside a Linux container. Never use sudo. "
-        "The container is a bare base image with nothing but the language "
-        "runtime installed. Only the setup command has network access, so it "
-        "must install every tool the build, test and lint commands invoke "
-        "(for example 'pip install pytest flake8'). Every other command runs "
-        "offline."
-    )
+    plan = agents["architect"].ask_json(prompts.system_design(
+        json.dumps(spec, indent=2)[:10000], research))
     plan.setdefault("commands", {})
     for key, fallback in (("build", "true"), ("test", "true"), ("setup", "true")):
         if not plan["commands"].get(key):
@@ -89,32 +42,9 @@ def generate_tickets(agents, board: Board, spec: dict, plan: dict, *,
                      max_tickets: int = 40, log: Logger = NULL) -> list[Ticket]:
     """Decompose the plan into an ordered, dependency-aware ticket set."""
     log.info("planning.tickets")
-    result = agents["planner"].ask_json(
-        f"SPECIFICATION:\n{json.dumps(spec, indent=2)[:8000]}\n\n"
-        f"PLAN:\n{json.dumps(plan, indent=2)[:8000]}\n\n"
-        f"Break this into at most {max_tickets} tickets. Each ticket must be "
-        "small enough for one agent to implement, test and verify in a single "
-        "pass -- roughly one component or one coherent feature. Order them so "
-        "foundations come first. Return JSON:\n"
-        "{\n"
-        '  "tickets": [{\n'
-        '    "key": "short-unique-key",\n'
-        '    "title": "imperative summary",\n'
-        '    "objective": "what done looks like, concretely",\n'
-        '    "context": "what the implementer needs to know",\n'
-        f'    "kind": "one of {"|".join(KINDS)}",\n'
-        '    "dependencies": ["key of a ticket that must finish first"],\n'
-        '    "acceptance": ["checkable criterion"],\n'
-        '    "validation": ["shell command proving it works"],\n'
-        '    "artifacts": ["file this ticket creates or changes"],\n'
-        '    "priority": 1, "risk": 3, "cost": 2, "info_gain": 2\n'
-        "  }]\n"
-        "}\n"
-        "priority/risk/cost/info_gain are 1-5. Include tickets for tests and "
-        "benchmarks where they apply. Do NOT include a README ticket; "
-        "documentation is generated at the end. Dependencies must reference "
-        "keys in this same list and must not form a cycle."
-    )
+    result = agents["planner"].ask_json(prompts.ticket_breakdown(
+        json.dumps(spec, indent=2)[:8000], json.dumps(plan, indent=2)[:8000],
+        max_tickets, "|".join(KINDS)))
     return _ingest(board, result.get("tickets") or [], log=log)
 
 
@@ -122,17 +52,11 @@ def decompose(agents, board: Board, ticket: Ticket, reason: str,
               log: Logger = NULL) -> list[Ticket]:
     """Split a ticket that proved too large into executable children."""
     log.info("planning.decompose", ticket=ticket.id, reason=reason[:120])
-    result = agents["planner"].ask_json(
-        f"This ticket is too large or keeps failing and must be split.\n\n"
-        f"TICKET: {json.dumps({k: getattr(ticket, k) for k in ('id','title','objective','context','acceptance','validation','artifacts')}, indent=2)}\n\n"
-        f"WHY IT IS BEING SPLIT:\n{reason[:4000]}\n\n"
-        "Return JSON with 2-5 smaller tickets that together fully replace it:\n"
-        '{"tickets": [{"key": "", "title": "", "objective": "", "context": "", '
-        '"kind": "", "dependencies": ["key of an earlier ticket in this list"], '
-        '"acceptance": [""], "validation": [""], "artifacts": [""], '
-        '"priority": 1, "risk": 2, "cost": 2, "info_gain": 2}]}\n'
-        "Each child must be strictly smaller and independently verifiable."
-    )
+    fields = ("id", "title", "objective", "context", "acceptance",
+              "validation", "artifacts")
+    result = agents["planner"].ask_json(prompts.ticket_split(
+        json.dumps({k: getattr(ticket, k) for k in fields}, indent=2),
+        reason[:4000]))
     children = _ingest(board, result.get("tickets") or [], parent=ticket,
                        depth=ticket.depth + 1, log=log)
     if children:

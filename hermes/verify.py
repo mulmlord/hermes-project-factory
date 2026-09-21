@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import prompts
 from .agents import Prompt
 from .log import Logger, NULL
 from .sandbox import Result, Sandbox
@@ -270,20 +271,7 @@ def review(agents, ticket, sandbox: Sandbox, change, verification: Verification,
     prompt.add("gates", f"VERIFICATION RESULTS:\n{verification.report()}",
                priority=20, floor=400)
     view = prompt.add("change", priority=10, floor=2000)
-    prompt.add("instructions",
-               "Review this change. Return JSON:\n"
-               "{\n"
-               '  "approved": true|false,\n'
-               '  "meets_acceptance": true|false,\n'
-               '  "blocking": ["issue that must be fixed before this can be accepted"],\n'
-               '  "advisory": ["worth improving but not blocking"],\n'
-               '  "security": ["security concern, or empty"],\n'
-               '  "reason": "one sentence verdict"\n'
-               "}\n"
-               "Block only on real defects: incorrect behaviour, unmet acceptance "
-               "criteria, stubbed-out work, security problems, or missing error "
-               "handling at a trust boundary. Do not block on style or taste.",
-               required=True)
+    prompt.add("instructions", prompts.REVIEW, required=True)
     lookup = Lookup(reviewer, prompt, toolbox, log=log)
     header = "CHANGE:\n"
     view.fill(header + change_view(sandbox, change,
@@ -312,21 +300,7 @@ def triage(agents, ticket, verification: Verification, context: str,
                          f"ATTEMPT {attempts} of this ticket.", required=True)
     prompt.add("gates", f"GATES:\n{verification.report()}", priority=10, floor=400)
     output = prompt.add("output", priority=20, floor=600, tail=True)
-    prompt.add("instructions",
-               "Diagnose the root cause. Return JSON:\n"
-               "{\n"
-               '  "diagnosis": "what is actually wrong, not what the error text says",\n'
-               '  "classification": "trivial|implementation|architecture|research_gap|'
-               'environment|flaky",\n'
-               '  "action": "retry|repair|decompose|reconsider|research|rollback",\n'
-               '  "instructions": "exactly what the next agent must change",\n'
-               '  "files": ["file that needs changing"],\n'
-               '  "research_topic": "question to research, only when action=research"\n'
-               "}\n"
-               "trivial = a typo, a missing import, a wrong path. implementation = the "
-               "code is wrong. architecture = the design cannot work. research_gap = we "
-               "do not know enough to fix it. environment = a missing tool or dependency.",
-               required=True)
+    prompt.add("instructions", prompts.TRIAGE, required=True)
     header = "OUTPUT:\n"
     output.fill(header + verification.failure_output(
         max(0, output.room() - len(header))))

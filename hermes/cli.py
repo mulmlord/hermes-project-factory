@@ -9,7 +9,7 @@ import uuid
 from dataclasses import asdict
 from pathlib import Path
 
-from . import workspace
+from . import phases, workspace
 from .config import Config, ConfigError, SAMPLE_CONFIG
 from .journal import Journal
 from .log import for_workspace, scope
@@ -259,7 +259,7 @@ def cmd_evolve(args) -> int:
     if args.generations:
         factory.config.data["evolution"]["max_generations"] = args.generations
     with _server_for(factory), factory.sandbox:
-        factory.phase_optimization()
+        phases.optimization(factory)
     factory.save("evolve")
     metrics = factory.state.metrics.get("optimization")
     print(json.dumps(metrics, indent=2) if metrics else "no measurable objective")
@@ -340,7 +340,7 @@ def cmd_release(args) -> int:
     if args.github:
         factory.github.enabled = True
     with _server_for(factory), factory.sandbox:
-        factory.phase_release()
+        phases.release(factory)
     factory.save("release")
     criteria = factory.state.metrics.get("completion", {})
     for name, ok in criteria.items():

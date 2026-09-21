@@ -21,7 +21,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-from .agents import Prompt, context_block
+from .agents import EDIT_RULES, Prompt, context_block
+from .implement import Change, apply_change
 from .log import Logger, NULL
 from .sandbox import Sandbox
 from .verify import Verification, run_commands, scan_unsafe
@@ -61,6 +62,15 @@ class Candidate:
     #: Every measurement taken of this candidate, not just the one that counted.
     samples: list[float] = field(default_factory=list)
     seconds: float = 0.0
+
+
+class NoTargetFits(RuntimeError):
+    """No evolution target can be shown whole inside the evolver's context.
+
+    Raised rather than half-showing one: an anchor copied from a fragment is
+    still exact, but a candidate cannot reason about a hot loop it was given
+    the first half of, and the tail it never saw is where the cost usually is.
+    """
 
 
 class Objective:
@@ -362,7 +372,15 @@ class Evolution:
         return candidate
 
     # -- candidate generation --------------------------------------------
-    def propose(self, generation: int, family: str, parent: Candidate) -> dict:
+    def propose(self, generation: int, family: str, parent: Candidate,
+                feedback: str = "") -> tuple[dict, list[str]]:
+        """Ask for one change, as a patch. Returns the proposal and what it saw.
+
+        *feedback* is the report from a previous proposal whose edits did not
+        apply, which is the one failure the evolver can fix from the report
+        alone -- it knows what it meant to change and has the file in front of
+        it, so it only has to anchor the edit somewhere that exists.
+        """
         evolver = self.agents["evolver"]
         prompt = Prompt(evolver, log=self.log)
         prompt.add("context", context_block(self.state, ", ".join(self.targets)),
@@ -375,7 +393,10 @@ class Evolution:
                    f"SMALLEST MEANINGFUL GAIN: {self.margin(parent.score):.6g} "
                    f"(anything less is measurement noise)\n"
                    f"GENERATION: {generation}", required=True)
-        code = prompt.add("code", priority=10, floor=2000)
+        # No floor: the code is shown whole or not at all. A trimmed copy is
+        # the failure this protocol exists to prevent, and it fits by
+        # construction anyway -- fill() is given exactly the room it has.
+        code = prompt.add("code", priority=10)
         prompt.add("history",
                    (("CHANGES THAT HELPED HERE:\n"
                      + "\n".join(f"- {h}" for h in self.helped[-6:]) + "\n\n")
@@ -383,31 +404,89 @@ class Evolution:
                    + (("CHANGES THAT DID NOT HELP HERE:\n"
                        + "\n".join(f"- {r}" for r in self.hurt[-12:]))
                       if self.hurt else ""), priority=20, floor=400)
+        if feedback:
+            prompt.add("feedback", f"YOUR LAST PROPOSAL DID NOT APPLY:\n{feedback}\n"
+                       "Anchor every edit in text you can see above, character for "
+                       "character.", priority=5, floor=200)
         prompt.add("direction", f"THIS GENERATION'S DIRECTION: {family}\n\n"
                    "Propose ONE focused change in that direction that improves the "
                    "objective while keeping every test passing. Do not repeat a change "
                    "listed as not helping. Return JSON:\n"
                    '{"mutation": "one line naming the change", '
                    '"mechanism": "why this is faster/better, mechanically", '
-                   '"files": [{"path": "", "content": "COMPLETE new file contents"}], '
-                   '"risk": "what could break"}', required=True)
-        # The candidate must return complete files, so it has to be shown
-        # complete files: the code block takes what the fixed blocks leave,
-        # shared between the targets, and a target that does not fit is not
-        # offered at all rather than offered as a fragment.
-        code.fill("CURRENT CODE:\n" + self._sources(max(0, code.room() - 14)))
-        return evolver.ask_json(prompt.render())
+                   '"edits": [{"path": "src/thing.ext", "find": "<exact text to '
+                   'replace>", "replace": "<the text that takes its place>"}], '
+                   '"files": [{"path": "src/thing.ext", "content": "<COMPLETE file '
+                   'contents>"}], '
+                   '"risk": "what could break"}\n' + EDIT_RULES
+                   + "- Change only the files shown above.", required=True)
+        # The code block takes what the fixed blocks leave, and every target it
+        # offers it offers whole: an edit's anchor has to be copied from the
+        # file as it actually is, and a fragment is also a candidate reasoning
+        # about a hot path whose tail it was never shown.
+        sources, shown = self._sources(max(0, code.room() - 14))
+        if not shown:
+            raise NoTargetFits(
+                f"none of {', '.join(self.targets) or '(no targets)'} fits the "
+                f"{code.room()} characters this prompt has left for source")
+        code.fill("CURRENT CODE:\n" + sources)
+        return evolver.ask_json(prompt.render()), shown
 
-    def _sources(self, budget: int) -> str:
-        """The evolution targets, whole, within *budget* characters."""
-        targets = self.targets[:4]
-        share = budget // max(1, len(targets))
-        sources = []
-        for target in targets:
-            text = self.sandbox.read(target, limit=share)
-            if text:
-                sources.append(f"--- {target} ---\n{text}")
-        return "\n\n".join(sources)
+    def _sources(self, budget: int) -> tuple[str, list[str]]:
+        """Targets that fit *budget* whole, and which ones those are.
+
+        A target too big to show is skipped rather than truncated, and the
+        room it did not take is left to the targets after it -- the caller
+        confines the candidate to what came back, so a file nobody saw is not
+        a file anybody may change.
+        """
+        sources: list[str] = []
+        shown: list[str] = []
+        used = 0
+        for target in self.targets[:4]:
+            text = self.sandbox.read(target)
+            if not text:
+                continue
+            chunk = f"--- {target} ---\n{text}"
+            if used + len(chunk) + 2 > budget:
+                self.log.warn("evolve.target_too_large", target=target,
+                              chars=len(text), room=max(0, budget - used))
+                continue
+            used += len(chunk) + 2
+            sources.append(chunk)
+            shown.append(target)
+        return "\n\n".join(sources), shown
+
+    def _apply(self, proposal: dict, shown: list[str]) -> Change:
+        """Apply a proposal's patch, confined to the targets it was shown.
+
+        The implementer's applier, so an edit whose anchor is missing or
+        ambiguous is reported in the same words rather than guessed at. A path
+        outside *shown* is refused for the same reason it was not shown:
+        rollback here restores target files, so a change anywhere else could
+        not be undone when the candidate loses.
+        """
+        allowed = set(shown)
+        payload: dict = {}
+        stray: list[str] = []
+        for key in ("files", "edits"):
+            kept = []
+            for item in proposal.get(key) or []:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path", "")).strip().lstrip("/")
+                if path in allowed:
+                    kept.append(item)
+                else:
+                    stray.append(path)
+            payload[key] = kept
+        change = apply_change(self.sandbox, payload, log=self.log)
+        for path in dict.fromkeys(stray):
+            change.rejected.append(path)
+            change.unmatched.append(
+                f"{path or '(no path)'}: not one of the files you were shown. "
+                f"Change only {', '.join(shown)}.")
+        return change
 
     def remember(self, family: str, mutation: str, improved: bool,
                  detail: str = "") -> None:
@@ -425,20 +504,27 @@ class Evolution:
         population = max(1, int(self.cfg.get("population", 3)))
         stagnant = 0
 
-        for generation in range(1, max_generations + 1):
-            improved_this_round = False
-            for _ in range(population):
-                improved_this_round |= self._attempt(len(self.history))
-                self.save()
-                if self.objective.reached(self.best.score):
-                    self.log.info("evolve.target_reached", score=self.best.score)
-                    self.restore(self.best.generation)
+        try:
+            for generation in range(1, max_generations + 1):
+                improved_this_round = False
+                for _ in range(population):
+                    improved_this_round |= self._attempt(len(self.history))
                     self.save()
-                    return self.best
-            stagnant = 0 if improved_this_round else stagnant + 1
-            if stagnant >= patience:
-                self.log.info("evolve.plateau", generations=generation)
-                break
+                    if self.objective.reached(self.best.score):
+                        self.log.info("evolve.target_reached", score=self.best.score)
+                        self.restore(self.best.generation)
+                        self.save()
+                        return self.best
+                stagnant = 0 if improved_this_round else stagnant + 1
+                if stagnant >= patience:
+                    self.log.info("evolve.plateau", generations=generation)
+                    break
+        except NoTargetFits as exc:
+            # Nothing a further generation can change: the targets are a
+            # property of the project and the room is a property of the model.
+            # Stop and keep the baseline rather than spend the budget on
+            # generations that cannot see the code they are meant to improve.
+            self.log.warn("evolve.no_visible_target", reason=str(exc)[:200])
 
         if self.best:
             self.restore(self.best.generation)
@@ -451,28 +537,40 @@ class Evolution:
         self.restore(parent.generation)
         family = self.bandit.select()
         try:
-            proposal = self.propose(index, family, parent)
+            proposal, shown = self.propose(index, family, parent)
+            change = self._apply(proposal, shown)
+            if change.unmatched:
+                # Any edit that missed makes this a different change from the
+                # one proposed, so the rest of it goes back too and the whole
+                # patch is asked for again, told which anchor was wrong. The
+                # generation is already paid for; a second ask that can see the
+                # same code is cheaper than measuring half a mutation.
+                self.log.info("evolve.reanchor", index=index,
+                              reason=change.unmatched[0][:160])
+                self.restore(parent.generation)
+                proposal, shown = self.propose(index, family, parent,
+                                               "\n".join(change.unmatched))
+                change = self._apply(proposal, shown)
+        except NoTargetFits:
+            raise
         except Exception as exc:  # noqa: BLE001 - a bad proposal is just a bad candidate
             self.log.warn("evolve.propose_failed", index=index, error=str(exc)[:200])
             return False
 
         mutation = str(proposal.get("mutation", "unnamed"))[:200]
-        written = []
-        for item in proposal.get("files") or []:
-            if not isinstance(item, dict):
-                continue
-            path = str(item.get("path", "")).lstrip("/")
-            if path and isinstance(item.get("content"), str) and not path.startswith(
-                    (".hermes/", ".git/")):
-                self.sandbox.write(path, item["content"])
-                written.append(path)
-        if not written:
+        if change.empty or change.unmatched:
+            # Still not a whole patch after the retry: measuring what did land
+            # would score a mutation nobody proposed, and promoting it would
+            # make it the parent of everything after.
+            self.log.info("evolve.no_change", index=index,
+                          detail="; ".join(change.unmatched)[:200] or change.describe())
             self.bandit.update(family, 0.0)
+            self.restore(parent.generation)
             return False
 
         correct, score, verification = self.measure(timeout=self.screen_timeout())
         candidate = Candidate(index, parent.generation, mutation, score, correct,
-                              written, family=family,
+                              change.written, family=family,
                               samples=[score] if score is not None else [],
                               seconds=self.last_seconds,
                               metrics={"mechanism": proposal.get("mechanism", "")})

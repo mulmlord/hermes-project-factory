@@ -79,6 +79,14 @@ code.
 **Optimisation** runs an AlphaEvolve-style loop when the project has an
 automatically measurable objective. Correctness gates performance: a
 candidate that fails the tests is discarded before its score is read.
+Candidates arrive as the same search/replace patches the implementer sends,
+for a sharper version of the same reason: the targets are whichever files
+dominate the benchmark's cost, which is to say the largest ones, and a
+rewrite that drops a constant nothing tests still passes the gate and then
+parents every generation after it. So a target is shown whole or not offered
+at all — a file too big for the evolver's context is dropped from the target
+list rather than truncated — and a patch that does not anchor is reported back
+and re-asked rather than half-applied.
 
 **Release** exports a pristine copy of the tracked tree into a fresh sandbox
 and builds and tests it there, proving the repository is reproducible from a
@@ -481,6 +489,10 @@ halfway through.
 - Agents patch files with exact search/replace edits and fall back to whole
   files. A local model that cannot copy an anchor character for character
   loses the edit and retries, which costs a generation.
+- Optimisation needs its targets to fit the evolver's context whole. A project
+  whose hot file is larger than that gets no optimisation rather than a
+  half-informed one; the log names the file and the room it missed by, and the
+  answer is a bigger `context` or a benchmark that concentrates on less code.
 - OpenHands is installed by default but stays dormant until you set
   `openhands.enabled: true`; without it Hermes uses its own implementer. The
   delegation path is checked against a live install: the invocation and the

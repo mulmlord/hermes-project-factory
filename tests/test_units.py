@@ -10,7 +10,8 @@ from types import SimpleNamespace
 
 from hermes.agents import Prompt, build as build_agents, escalate
 from hermes.config import Config, ConfigError, DEFAULTS, deep_merge, is_local_url
-from hermes.evolve import Bandit, Candidate, Evolution, Objective, parse_score
+from hermes.evolve import (Bandit, Candidate, Evolution, NoTargetFits, Objective,
+                          parse_score)
 from hermes.implement import (Change, Ladder, Rung, _protected, _race, apply_change,
                               execute_ticket, generate, relevant_files,
                               restore as restore_files, snapshot as snapshot_files)
@@ -1846,6 +1847,124 @@ def test_evolution_promotes_only_a_gain_that_clears_the_margin(tmp_path):
     assert best.score == 5 and sandbox.read("src/kernel.py") == "COST = 5\n"
     # The gain was measured more than once before it was believed.
     assert len(best.samples) == 2
+
+
+#: A target the way a real one comes: the line the benchmark reads, and a lot
+#: of code around it that no proposal is about but every proposal can lose.
+KERNEL = "# hand-tuned, and nothing below is meant to change\nCOST = 10\n" \
+         + "SPARE = 'keep me'\n" * 20
+
+
+def _evolving(tmp_path, proposals, targets=("src/kernel.py",), context=None):
+    """An engine over one measurable file, answered by *proposals* in order.
+
+    Returns the engine and the prompts the evolver was sent, which is where a
+    report meant for the next proposal has to turn up.
+    """
+    state = SimpleNamespace(plan={"commands": {"build": "true", "test": "true"}},
+                            spec={}, name="p", idea="i")
+    objective = Objective("cost", "minimize",
+                          "python3 -c \"exec(open('src/kernel.py').read()); "
+                          "print('SCORE:', COST)\"")
+    prompts = []
+
+    class StubEvolver(Budgeted):
+        task = "evolution"
+
+        def allowance(self):
+            router = Router(Config.load()) if context is None else _router(context)
+            return router.allowance(self.task)
+
+        def ask_json(self, prompt, **kw):
+            prompts.append(prompt)
+            return proposals.pop(0)
+
+    engine = Evolution(Sandbox(tmp_path, {"runtime": "local", "timeout": 30}),
+                       {"evolver": StubEvolver()}, state, objective, list(targets),
+                       {"population": 1, "baseline_repeats": 1,
+                        "min_relative_gain": 0.01}, NULL)
+    return engine, prompts
+
+
+def test_evolution_patches_a_target_instead_of_rewriting_it(tmp_path):
+    """Targets are the project's hottest files, so the biggest ones to re-emit."""
+    engine, _ = _evolving(tmp_path, [
+        {"mutation": "halve the cost",
+         "edits": [{"path": "src/kernel.py", "find": "COST = 10",
+                    "replace": "COST = 4"}]}])
+    engine.sandbox.write("src/kernel.py", KERNEL)
+
+    best = engine.run(max_generations=1, patience=5)
+
+    assert best.score == 4 and best.files == ["src/kernel.py"]
+    # Everything the proposal was not about survived it, to the character.
+    assert engine.sandbox.read("src/kernel.py") == KERNEL.replace("COST = 10",
+                                                                  "COST = 4")
+
+
+def test_an_edit_that_does_not_anchor_is_reported_back_and_retried(tmp_path):
+    """A missed anchor is the one failure the evolver can fix from the report."""
+    engine, prompts = _evolving(tmp_path, [
+        {"mutation": "halve the cost",
+         "edits": [{"path": "src/kernel.py", "find": "COST = 11",
+                    "replace": "COST = 4"}]},
+        {"mutation": "halve the cost",
+         "edits": [{"path": "src/kernel.py", "find": "COST = 10",
+                    "replace": "COST = 4"}]}])
+    engine.sandbox.write("src/kernel.py", KERNEL)
+
+    best = engine.run(max_generations=1, patience=5)
+
+    assert "does not appear in the file" in prompts[1]
+    # The generation was not spent on the miss: it produced a real candidate.
+    assert [c.mutation for c in engine.history] == ["baseline", "halve the cost"]
+    assert best.score == 4
+
+
+def test_a_partly_applied_patch_is_never_measured(tmp_path):
+    """Half a mutation scores something nobody proposed, then becomes a parent."""
+    engine, _ = _evolving(tmp_path, [
+        {"mutation": "two-part change",
+         "edits": [{"path": "src/kernel.py", "find": "COST = 10",
+                    "replace": "COST = 4"},
+                   {"path": "src/kernel.py", "find": "MISSING", "replace": "x"}]},
+    ] * 2)
+    engine.sandbox.write("src/kernel.py", KERNEL)
+
+    best = engine.run(max_generations=1, patience=5)
+
+    assert [c.mutation for c in engine.history] == ["baseline"]
+    assert best.score == 10 and engine.sandbox.read("src/kernel.py") == KERNEL
+
+
+def test_a_target_too_large_to_show_whole_is_not_offered_at_all(tmp_path):
+    """A candidate cannot anchor an edit in a file it was shown the front of."""
+    engine, _ = _evolving(tmp_path, [], targets=("src/small.py", "src/huge.py"))
+    engine.sandbox.write("src/small.py", "COST = 10\n")
+    engine.sandbox.write("src/huge.py", "# pad\n" * 500)
+
+    sources, shown = engine._sources(400)
+    assert shown == ["src/small.py"] and "src/huge.py" not in sources
+
+    # And what it was not shown, it may not change: rollback here is per
+    # target, so a write anywhere else would outlive the candidate.
+    change = engine._apply({"edits": [{"path": "src/huge.py", "find": "# pad\n",
+                                       "replace": "# pod\n"}]}, shown)
+    assert change.empty and "not one of the files you were shown" in change.unmatched[0]
+    assert engine.sandbox.read("src/huge.py").startswith("# pad\n")
+
+
+def test_evolution_stops_rather_than_evolve_code_it_cannot_see(tmp_path):
+    """No generation can fix a target too big for the model: spend nothing more."""
+    engine, prompts = _evolving(tmp_path, [], context=8192)
+    engine.sandbox.write("src/kernel.py", "COST = 10\n" + "# pad\n" * 4000)
+
+    best = engine.run(max_generations=20, patience=5)
+
+    assert best.generation == 0 and best.score == 10  # the baseline, kept
+    assert not prompts  # and not one proposal asked for against an unseen file
+    with pytest.raises(NoTargetFits):
+        engine.propose(1, "micro", best)
 
 
 def test_bandit_tries_every_family_once_before_repeating():

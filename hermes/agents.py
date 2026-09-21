@@ -36,7 +36,10 @@ Rules:
 - Omit any key you are not using.
 """
 
-_EDIT_RULES = """\
+#: How to phrase a change as a patch. Shared with the evolver, which edits the
+#: project's largest and hottest files and so has the most to lose by rewriting
+#: them whole.
+EDIT_RULES = """\
 - Use "edits" to change part of a file that already exists. "find" must be text
   copied character for character from the file as shown to you, and long enough
   to appear exactly once in it; "replace" is what it becomes. An edit that does
@@ -50,7 +53,7 @@ _EDIT_RULES = """\
 def file_protocol(edits: bool = True) -> str:
     """The change format agents must answer in."""
     return (_PROTOCOL_HEAD + (_PROTOCOL_EDITS if edits else "") + _PROTOCOL_TAIL
-            + (_EDIT_RULES if edits else ""))
+            + (EDIT_RULES if edits else ""))
 
 
 #: The whole-file format, kept as a name for callers that only ever write files.

@@ -508,6 +508,22 @@ def test_local_sandbox_runs_and_times_out(tmp_path):
     assert sandbox.run("sleep 5", timeout=1).timed_out
 
 
+def test_a_cpu_cap_above_the_host_does_not_cost_the_container(tmp_path, monkeypatch):
+    """Docker rejects --cpus above the host's count, container and all.
+
+    The default is 4, so on any smaller machine every docker run failed to
+    start and fell back to ``local`` -- quietly running generated code on the
+    host because a limit was too generous. Capping keeps the isolation.
+    """
+    monkeypatch.setattr(os, "cpu_count", lambda: 2)
+    sandbox = Sandbox(tmp_path, {"runtime": "docker", "timeout": 10}, NULL)
+
+    assert sandbox._cpu_limit() == "2"
+    assert "4" not in sandbox._docker_argv("true", None, True)
+    # A request the host can meet is passed through untouched, fractions and all.
+    assert Sandbox(tmp_path, {"cpus": 1.5}, NULL)._cpu_limit() == "1.5"
+
+
 def test_sandbox_strips_secrets_from_local_env(tmp_path):
     sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
     import os

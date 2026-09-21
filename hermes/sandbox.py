@@ -81,7 +81,7 @@ class Sandbox:
             "docker", "run", "-d", "--rm", "--name", name,
             "--network", "none" if self.cfg.get("network", "none") != "host" else "bridge",
             "--memory", str(self.cfg.get("memory", "8g")),
-            "--cpus", str(self.cfg.get("cpus", 4)),
+            "--cpus", self._cpu_limit(),
             "--pids-limit", str(self.cfg.get("pids", 512)),
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
@@ -117,6 +117,24 @@ class Sandbox:
         self.fallback = reason
         self.log.warn(event, error=reason, fallback="local", **fields)
         self.runtime = "local"
+
+    def _cpu_limit(self) -> str:
+        """The CPU cap, never more than the host has to give.
+
+        Docker rejects a ``--cpus`` above the number of CPUs it can see, and
+        it rejects the whole container with it. A config written for a bigger
+        machine would then take every run down the fallback to ``local`` --
+        trading the isolation away over a number that only ever meant "at
+        most this much". Ask for less and the run is merely slower.
+        """
+        try:
+            asked = float(self.cfg.get("cpus", 4))
+        except (TypeError, ValueError):
+            asked = 4.0
+        capped = min(asked, float(os.cpu_count() or 1))
+        if capped < asked:
+            self.log.info("sandbox.cpus_capped", asked=asked, using=capped)
+        return f"{capped:g}"
 
     @staticmethod
     def _user_args() -> list[str]:
@@ -218,7 +236,7 @@ class Sandbox:
             "docker", "run", "--rm",
             "--network", "bridge" if network else "none",
             "--memory", str(self.cfg.get("memory", "8g")),
-            "--cpus", str(self.cfg.get("cpus", 4)),
+            "--cpus", self._cpu_limit(),
             "--pids-limit", str(self.cfg.get("pids", 512)),
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "-v", f"{self.root}:{self.workdir}",

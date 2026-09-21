@@ -6,6 +6,7 @@ import re
 import time
 from pathlib import Path
 
+from .contextdb import open_db
 from .state import State
 
 DIRS = [
@@ -42,6 +43,14 @@ artifacts/
 # be re-read, never committed: they are someone else's bytes and must not be
 # republished under this project's licence.
 research/sources/
+
+# The context database. Derived: every row in it is an index over a file or a
+# journal entry that is committed, and `hermes context sync` rebuilds it from
+# a clean checkout. Committing it would put a binary that changes on every
+# ticket into every diff.
+.hermes/context.db
+.hermes/context.db-wal
+.hermes/context.db-shm
 """
 
 AGENTS_MD = """\
@@ -77,6 +86,25 @@ any human who picks the project up.
 | Benchmark Engineer | benchmarks, measurement, profiling |
 | Evolution Agent | measured optimisation, candidate generation |
 | Documentation Agent | README, API docs, architecture docs, examples |
+
+## The context database
+`.hermes/context.db` is where agents report what they did and read what
+everyone else did. It holds records (logs, gate results, decisions,
+remembered facts) and the project's own files, split into chunks and keyed by
+content hash. Every write gets the next revision number.
+
+Read from it instead of re-reading the project:
+- `hermes context catch-up <reader>` -- everything recorded since that reader
+  last looked, and only that. One changed function comes back as one chunk,
+  not as the file it lives in.
+- `hermes context search "<words>"` -- records and code by content.
+- `hermes context outline <path>` -- what a file contains, without its body.
+- `hermes context log "<what ran>" --kind gate --body "<result>"` -- what a
+  build step should call so the next agent knows the outcome. Without
+  `--body` the detail is read from stdin, so a gate can be piped straight in:
+  `cargo test 2>&1 | hermes context log "cargo test" --kind gate`.
+
+The database is derived and not committed. `hermes context sync` rebuilds it.
 
 ## Layout
 - `src/` implementation
@@ -115,6 +143,12 @@ def create(root: Path, idea: str, name: str | None = None) -> State:
         path = root / placeholder
         if not path.exists():
             path.write_text(text)
+    # Open the context database here rather than on first use, so revision 1
+    # of every project is the idea it was asked for: an agent that catches up
+    # from a cold cursor is then told what this is before anything else.
+    with open_db(root) as db:
+        db.remember("project.idea", idea, title="the idea this project came from",
+                    agent="hermes", weight=9)
     return state
 
 

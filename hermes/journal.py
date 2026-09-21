@@ -10,6 +10,12 @@ The prose summary is model-written and can be wrong or stale; the paths, gates
 and commands are extracted from what actually ran, so the rendering leans on
 those. The journal is an index telling an agent *which files to read*, never a
 substitute for reading them.
+
+Every entry is also mirrored into the context database, which is the other
+half of that sentence: the journal says which files to read, and the database
+is what makes reading them cost only the part that changed. The JSONL file
+stays the durable record -- it survives a database that has to be rebuilt --
+so the mirror is best-effort and never fails a ticket that has already run.
 """
 from __future__ import annotations
 
@@ -62,10 +68,14 @@ class Entry:
 
 
 class Journal:
-    def __init__(self, root: Path, log: Logger = NULL):
+    def __init__(self, root: Path, log: Logger = NULL, db=None):
         self.root = Path(root)
         self.path = self.root / ".hermes" / "state" / "journal.jsonl"
         self.log = log
+        #: The context database entries are mirrored into, or None. Optional
+        #: because reading the journal -- `hermes journal`, the tests -- has
+        #: no business opening a database to do it.
+        self.db = db
         self.entries: list[Entry] = list(_read(self.path))
 
     # -- writing ---------------------------------------------------------
@@ -75,9 +85,35 @@ class Journal:
             fh.write(json.dumps(asdict(entry), default=str) + "\n")
         self.entries.append(entry)
         self.mirror()
+        self._publish(entry)
         self.log.info("journal.record", ticket=entry.ticket, outcome=entry.outcome,
                       files=len(entry.files))
         return entry
+
+    def _publish(self, entry: Entry) -> None:
+        """Put the entry and the files it touched into the context database.
+
+        This is the one place the two stores meet, on purpose: a ticket that
+        finished is exactly the moment the project changed, so it is also the
+        moment a reader's cursor should have something new behind it. Ingesting
+        files here rather than on every write keeps half-written intermediate
+        states out of the history agents are shown.
+        """
+        if self.db is None:
+            return
+        try:
+            self.db.record(
+                "outcome", f"{entry.ticket} {entry.title}", entry.render(),
+                ticket=entry.ticket, paths=entry.files + entry.deleted,
+                weight=7 if entry.outcome == "completed" else 8,
+                meta={"outcome": entry.outcome, "kind": entry.kind,
+                      "commit": entry.commit, "gates": entry.gates})
+            self.db.sync_paths(self.root, entry.files)
+            for path in entry.deleted:
+                self.db.forget_file(path)
+        except Exception as exc:  # noqa: BLE001 - an index must not fail a ticket
+            self.log.warn("journal.mirror_failed", ticket=entry.ticket,
+                          error=str(exc)[:200])
 
     def record(self, ticket, outcome: dict, *, status: str | None = None,
                commit: str = "") -> Entry:

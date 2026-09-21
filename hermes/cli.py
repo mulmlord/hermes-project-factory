@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import phases, workspace
 from .config import Config, ConfigError, SAMPLE_CONFIG
+from .contextdb import open_db
 from .journal import Journal
 from .log import for_workspace, scope
 from .sandbox import Sandbox, probe_resources
@@ -218,6 +219,137 @@ def cmd_journal(args) -> int:
         print(json.dumps(asdict(entry), default=str) if args.json
               else entry.render() + "\n")
     return 0
+
+
+def cmd_context(args) -> int:
+    """Read and write the project's context database.
+
+    The same store the agents use, exposed so a build step can report into it
+    and a person can ask it what the agents were told. Every project generated
+    here gets one, so these commands work in any of them.
+    """
+    root = _project_root(args)
+    action = getattr(args, "context_action", "") or "stats"
+    with open_db(root, for_workspace(root, quiet=True)) as db:
+        return _CONTEXT_ACTIONS[action](db, root, args)
+
+
+def _context_stats(db, root, args) -> int:
+    stats = db.stats()
+    width = max(len(k) for k in stats)
+    for key, value in stats.items():
+        print(f"{key:<{width}}  {value}")
+    cursors = db.cursors()
+    if cursors:
+        print("\nreaders (revision each has caught up to, head is "
+              f"{stats['head']}):")
+        for name, rev in cursors.items():
+            behind = stats["head"] - rev
+            print(f"  {name:<40} {rev}" + (f"  ({behind} behind)" if behind else ""))
+    return 0
+
+
+def _context_sync(db, root, args) -> int:
+    synced = db.sync_paths(root, args.paths) if args.paths else db.sync_tree(root)
+    moved = [s for s in synced if s.changed]
+    for sync in moved:
+        print(f"{sync.path}: +{sync.added} -{sync.removed} ={sync.kept} "
+              f"(revision {sync.rev})")
+    print(f"{len(moved)} of {len(synced)} file(s) changed; head is {db.head}")
+    return 0
+
+
+def _context_catch_up(db, root, args) -> int:
+    delta = db.catch_up(args.reader, paths=args.path or (), budget=args.budget,
+                        advance=not args.peek)
+    if delta.empty:
+        print(f"{args.reader} is up to date at revision {delta.head}")
+        return 0
+    print(delta.text)
+    return 0
+
+
+def _context_search(db, root, args) -> int:
+    hits = db.search(" ".join(args.query), limit=args.lines, path=args.path or "")
+    if not hits:
+        print("nothing recorded about that")
+        return 1
+    for hit in hits:
+        print(hit.render() + "\n")
+    return 0
+
+
+def _context_outline(db, root, args) -> int:
+    chunks = db.outline(args.path)
+    if not chunks:
+        print(f"{args.path} is not in the database "
+              "(run `hermes context sync` if it is on disk)")
+        return 1
+    for chunk in chunks:
+        print(f"{chunk.first_line:>6}-{chunk.last_line:<6} {chunk.hash}  "
+              f"{chunk.heading}")
+    return 0
+
+
+def _context_show(db, root, args) -> int:
+    body = db.file(args.path)
+    if not body:
+        print(f"{args.path} is not in the database")
+        return 1
+    print(body, end="")
+    return 0
+
+
+def _context_log(db, root, args) -> int:
+    record = db.record(args.kind, args.title, args.body or _stdin(),
+                       agent=args.agent, ticket=args.ticket or "",
+                       paths=args.path or (), key=args.key or "")
+    print(f"recorded {record.kind} at revision {record.rev}")
+    return 0
+
+
+def _context_recall(db, root, args) -> int:
+    record = db.recall(args.key)
+    if record is None:
+        print(f"nothing remembered under {args.key!r}")
+        return 1
+    print(record.render())
+    return 0
+
+
+def _context_records(db, root, args) -> int:
+    found = db.records(kind=args.kind or "", ticket=args.ticket or "",
+                       path=args.path or "", limit=args.lines)
+    if not found:
+        print("nothing recorded yet")
+        return 0
+    for record in reversed(found):  # oldest first: it reads as a history
+        print(f"r{record.rev:<6} {record.render()}\n")
+    return 0
+
+
+def _context_prune(db, root, args) -> int:
+    print(json.dumps(db.prune()))
+    return 0
+
+
+_CONTEXT_ACTIONS = {
+    "stats": _context_stats,
+    "sync": _context_sync,
+    "catch-up": _context_catch_up,
+    "search": _context_search,
+    "outline": _context_outline,
+    "show": _context_show,
+    "log": _context_log,
+    "recall": _context_recall,
+    "records": _context_records,
+    "prune": _context_prune,
+}
+
+
+def _stdin() -> str:
+    """A body piped in, so a build step can send a gate's output straight in."""
+    return "" if sys.stdin.isatty() else sys.stdin.read()
 
 
 def cmd_test(args) -> int:
@@ -490,6 +622,56 @@ def build_parser() -> argparse.ArgumentParser:
     journal.add_argument("-t", "--ticket", help="only this ticket's entries")
     journal.add_argument("--json", action="store_true")
     journal.set_defaults(func=cmd_journal)
+
+    context = sub.add_parser(
+        "context", help="the project's context database: what agents recorded")
+    context.set_defaults(func=cmd_context)
+    actions = context.add_subparsers(dest="context_action")
+    actions.add_parser("stats", help="size of the store and where readers are")
+
+    sync = actions.add_parser("sync", help="ingest files (all of them by default)")
+    sync.add_argument("paths", nargs="*", help="only these paths")
+
+    catch_up = actions.add_parser(
+        "catch-up", help="what one reader has not seen yet, and only that")
+    catch_up.add_argument("reader", help="a name that identifies this reader")
+    catch_up.add_argument("--path", action="append", help="narrow to these files")
+    catch_up.add_argument("--budget", type=int, default=4000,
+                          help="characters the update may fill (default 4000)")
+    catch_up.add_argument("--peek", action="store_true",
+                          help="do not advance the reader's cursor")
+
+    search = actions.add_parser("search", help="find records and code by content")
+    search.add_argument("query", nargs="+")
+    search.add_argument("--path", help="only this file")
+    search.add_argument("-n", "--lines", type=int, default=10)
+
+    outline = actions.add_parser("outline", help="what a file contains, without its body")
+    outline.add_argument("path")
+
+    show = actions.add_parser("show", help="a stored file, reassembled")
+    show.add_argument("path")
+
+    entry = actions.add_parser("log", help="record something, e.g. from a build step")
+    entry.add_argument("title")
+    entry.add_argument("--kind", default="log",
+                       help="log, gate, note, decision, metric … (default log)")
+    entry.add_argument("--body", help="detail; read from stdin when not given")
+    entry.add_argument("--agent", default="", help="who is reporting")
+    entry.add_argument("--ticket", help="the ticket it belongs to")
+    entry.add_argument("--path", action="append", help="a file it concerns")
+    entry.add_argument("--key", help="replace the previous record under this key")
+
+    recall = actions.add_parser("recall", help="the current record under a key")
+    recall.add_argument("key")
+
+    records = actions.add_parser("records", help="recorded observations, oldest last")
+    records.add_argument("--kind")
+    records.add_argument("--ticket")
+    records.add_argument("--path")
+    records.add_argument("-n", "--lines", type=int, default=20)
+
+    actions.add_parser("prune", help="drop what no reader can still be owed")
 
     sub.add_parser("test", help="run the project's verification gates").set_defaults(
         func=cmd_test)

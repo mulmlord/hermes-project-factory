@@ -20,6 +20,7 @@ from . import prompts, workspace
 from .agents import Prompt, build as build_agents, context_block
 from .classify import Classifier
 from .config import Config
+from .contextdb import open_db
 from .experiment import Lab
 from .git_ops import GitHub, Issues, Repo
 from .implement import Ladder, generate
@@ -47,7 +48,10 @@ class Factory:
         self.log = log or for_workspace(self.root, self.config.get("logging.level"), quiet)
         self.state = State.load(self.root)
         self.board = Board(self.root)
-        self.journal = Journal(self.root, self.log)
+        #: Where agents report what they did and read what the others did.
+        #: See :mod:`hermes.contextdb`.
+        self.context_db = open_db(self.root, self.log)
+        self.journal = Journal(self.root, self.log, db=self.context_db)
         self.governor = Governor(self.config.get("resources", {}), self.log)
         self.router = Router(self.config, self.log, self.governor)
         self.agents = build_agents(self.router, self.log)
@@ -74,7 +78,7 @@ class Factory:
         return Toolbox(self.sandbox,
                        budget=int(self.config.get("execution.tool_calls", 6)),
                        rounds=int(self.config.get("execution.tool_rounds", 3)),
-                       log=self.log)
+                       db=self.context_db, log=self.log)
 
     def _lab(self) -> Lab:
         """Where hypotheses are measured. See :mod:`hermes.experiment`.

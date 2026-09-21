@@ -65,9 +65,12 @@ class Sandbox:
         #: own ledger it says whether a run was bound by the GPU or the CPU.
         self.spent = 0.0
         self._probe_error = ""
+        #: Why the docker runtime was abandoned, empty while it still holds.
+        #: Falling back to ``local`` weakens the isolation the config asked
+        #: for, so the reason has to outlive the log line that announced it.
+        self.fallback = ""
         if self.runtime == "docker" and not shutil.which("docker"):
-            self.log.warn("sandbox.docker_missing", fallback="local")
-            self.runtime = "local"
+            self._fall_back("sandbox.docker_missing", "docker is not installed")
 
     # -- lifecycle -------------------------------------------------------
     def start(self) -> None:
@@ -78,7 +81,7 @@ class Sandbox:
             "docker", "run", "-d", "--rm", "--name", name,
             "--network", "none" if self.cfg.get("network", "none") != "host" else "bridge",
             "--memory", str(self.cfg.get("memory", "8g")),
-            "--cpus", str(self.cfg.get("cpus", 4)),
+            "--cpus", self._cpu_limit(),
             "--pids-limit", str(self.cfg.get("pids", 512)),
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
@@ -92,9 +95,7 @@ class Sandbox:
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
-            self.log.warn("sandbox.start_failed", error=proc.stderr.strip()[:300],
-                          fallback="local")
-            self.runtime = "local"
+            self._fall_back("sandbox.start_failed", proc.stderr.strip()[:300])
             return
         self.container = name
         if not self._workspace_visible():
@@ -102,15 +103,38 @@ class Sandbox:
             # directory when the host path also exists inside the engine VM
             # (/tmp is the usual victim). Gates would then all fail against a
             # workspace the container cannot see, so refuse to run blind.
-            self.log.warn("sandbox.workspace_not_shared", root=str(self.root),
-                          error=self._probe_error,
-                          hint="the docker engine must share this path and the "
-                               "directory must be readable inside the container",
-                          fallback="local")
             self.stop()
-            self.runtime = "local"
+            self._fall_back(
+                "sandbox.workspace_not_shared",
+                f"the container cannot read {self.root}: {self._probe_error}",
+                hint="the docker engine must share this path and the "
+                     "directory must be readable inside the container")
             return
         self.log.info("sandbox.started", container=name, image=self.cfg.get("image"))
+
+    def _fall_back(self, event: str, reason: str, **fields) -> None:
+        """Give up on docker for this run, remembering what went wrong."""
+        self.fallback = reason
+        self.log.warn(event, error=reason, fallback="local", **fields)
+        self.runtime = "local"
+
+    def _cpu_limit(self) -> str:
+        """The CPU cap, never more than the host has to give.
+
+        Docker rejects a ``--cpus`` above the number of CPUs it can see, and
+        it rejects the whole container with it. A config written for a bigger
+        machine would then take every run down the fallback to ``local`` --
+        trading the isolation away over a number that only ever meant "at
+        most this much". Ask for less and the run is merely slower.
+        """
+        try:
+            asked = float(self.cfg.get("cpus", 4))
+        except (TypeError, ValueError):
+            asked = 4.0
+        capped = min(asked, float(os.cpu_count() or 1))
+        if capped < asked:
+            self.log.info("sandbox.cpus_capped", asked=asked, using=capped)
+        return f"{capped:g}"
 
     @staticmethod
     def _user_args() -> list[str]:
@@ -212,7 +236,7 @@ class Sandbox:
             "docker", "run", "--rm",
             "--network", "bridge" if network else "none",
             "--memory", str(self.cfg.get("memory", "8g")),
-            "--cpus", str(self.cfg.get("cpus", 4)),
+            "--cpus", self._cpu_limit(),
             "--pids-limit", str(self.cfg.get("pids", 512)),
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "-v", f"{self.root}:{self.workdir}",

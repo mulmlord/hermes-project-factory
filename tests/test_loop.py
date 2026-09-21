@@ -552,3 +552,92 @@ def test_one_page_budget_serves_the_whole_run(factory):
 
     assert factory._librarian() is first
     assert factory._librarian().remaining == 0
+
+
+#: One research round that proposes a claim, and the experiment that settles it.
+RESEARCH = {
+    "plan": {"simple_explanation": "a ring buffer has to wrap its index",
+             "what_we_know": [], "assumptions_to_challenge": [],
+             "unknowns": [{"question": "How should the index wrap?",
+                           "why_it_matters": "it decides the per-operation cost",
+                           "needs_experiment": True}]},
+    "answer": {"answer": "A power-of-two capacity allows a bitmask.",
+               "confidence": "inferred", "implications": ["size to a power of two"],
+               "alternatives": [], "recommendation": "mask",
+               "experiment": "time both wraps"},
+    "synthesis": {"conclusions": ["prefer a mask"], "decisions": [], "tickets": [],
+                  "remaining_unknowns": [],
+                  "hypotheses": [{"statement": "a bitmask wrap costs less than a modulo",
+                                  "test": "time a million of each and compare"}]},
+}
+
+EXPERIMENT = (
+    "import timeit\n"
+    "mask = timeit.timeit('i & 1023', number=100000, setup='i = 7')\n"
+    "mod = timeit.timeit('i % 1024', number=100000, setup='i = 7')\n"
+    "print('measured both wraps')\n"
+    "print('RESULT: {\"mask_seconds\": %f, \"modulo_seconds\": %f}' % (mask, mod))\n"
+)
+
+
+def test_a_hypothesis_becomes_an_experiment_that_runs_and_feeds_research(factory):
+    """The whole arc of sections 7 and 20, from a claim to a measured record.
+
+    Research proposes a hypothesis, the factory queues it as an experiment
+    ticket, the ticket takes the experiment path rather than the implementer's,
+    the program runs in the sandbox, and what it measured comes back into the
+    research log for whoever asks next.
+    """
+    router, prompts = factory.router, []
+    answer = router._answer
+
+    def research_then_measure(prompt):
+        prompts.append(prompt)
+        if "Decide what genuinely requires research" in prompt:
+            return {"needed": True, "topics": ["how a ring buffer should wrap"]}
+        if "Step 1 of the Feynman method" in prompt:
+            return RESEARCH["plan"]
+        if "QUESTION:" in prompt:
+            return RESEARCH["answer"]
+        if "Challenge these findings" in prompt:
+            return RESEARCH["synthesis"]
+        if "Build the smallest program that settles this hypothesis" in prompt:
+            return {"design": "time both wraps directly",
+                    "parameters": {"iterations": 100000},
+                    "files": [{"path": "wrap.py", "content": EXPERIMENT}],
+                    "command": "python3 wrap.py",
+                    "supports": "mask_seconds below modulo_seconds",
+                    "refutes": "the reverse"}
+        if "Judge the hypothesis against this measurement" in prompt:
+            return {"verdict": "supported",
+                    "finding": "the mask was measurably cheaper than the modulo",
+                    "confidence": "verified",
+                    "implications": ["size the buffer to a power of two"],
+                    "next": ""}
+        return answer(prompt)
+
+    router._answer = research_then_measure
+    state = factory.run(max_iterations=60)
+
+    assert state.phase == "COMPLETED", (state.phase, state.notes)
+
+    experiments = list((factory.root / "experiments").glob("E*/record.json"))
+    assert len(experiments) == 1, [p.name for p in experiments]
+    record = json.loads(experiments[0].read_text())
+    assert record["verdict"] == "supported"
+    assert set(record["measurements"]) == {"mask_seconds", "modulo_seconds"}
+    assert record["code_version"] and record["ticket"]
+    assert (experiments[0].parent / "wrap.py").is_file()
+
+    # It went down the experiment path, not the implementer's.
+    assert not [p for p in prompts
+                if "Implement this ticket completely" in p and "KIND: experiment" in p]
+    settled = factory.board.tickets[record["ticket"]]
+    assert settled.kind == "experiment" and settled.status == "completed"
+
+    # And the measurement is where the next round, and the metrics, will find it.
+    known = json.loads(
+        (factory.root / ".hermes" / "state" / "research.json").read_text())
+    assert any(r.get("experiment") for r in known["rounds"])
+    metrics = (factory.root / ".hermes" / "metrics" / "experiments.jsonl").read_text()
+    assert json.loads(metrics.strip())["verdict"] == "supported"

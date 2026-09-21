@@ -178,10 +178,30 @@ def cmd_inspect(args) -> int:
     print("\n## Phase history")
     for entry in state.history[-15:]:
         print(f"  {entry['from']} -> {entry['to']}: {entry.get('reason', '')}")
+    experiments = _experiments(root)
+    if experiments:
+        print("\n## Experiments\n" + "\n".join(experiments))
     recent = Journal(root).entries[-8:]
     if recent:
         print("\n## Recent work\n" + "\n".join(e.render() for e in recent))
     return 0
+
+
+def _experiments(root: Path, limit: int = 10) -> list[str]:
+    """What the hypotheses this project raised were settled by, one line each."""
+    path = root / ".hermes" / "metrics" / "experiments.jsonl"
+    if not path.is_file():
+        return []
+    lines = []
+    for raw in path.read_text().splitlines()[-limit:]:
+        try:
+            record = json.loads(raw)
+        except ValueError:
+            continue
+        lines.append(f"  {record.get('id', '?'):<6} {record.get('verdict', '?'):<13}"
+                     f" {str(record.get('hypothesis', ''))[:54]}\n"
+                     f"         {json.dumps(record.get('measurements', {}))[:70]}")
+    return lines
 
 
 def cmd_journal(args) -> int:

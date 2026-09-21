@@ -221,6 +221,51 @@ def cmd_journal(args) -> int:
     return 0
 
 
+def cmd_ledger(args) -> int:
+    """What the factory learned about its own retries, across every project.
+
+    Not a project command: the ledger outlives any one workspace, which is
+    the point of it. See :mod:`hermes.ledger`.
+    """
+    from .ledger import MIN_EVIDENCE, open_ledger
+    ledger = open_ledger(_config(args))
+    stats = ledger.stats()
+    if not stats.get("available"):
+        print("no ledger; execution.ledger is off or the file could not be opened")
+        return 1
+    if args.prune:
+        print(f"dropped {ledger.prune()} old attempt(s)")
+        return 0
+    since = stats.get("since") or 0
+    print(f"{stats['path']}\n{stats['attempts']} attempt(s) across "
+          f"{stats['projects']} project(s), {stats['repaired']:.0%} repaired"
+          + (f", since {time.strftime('%Y-%m-%d', time.localtime(since))}"
+             if since else ""))
+
+    signatures = ([(args.signature, 0, 0.0)] if args.signature
+                  else ledger.signatures(args.lines))
+    if not signatures:
+        print("\nnothing learned yet; the fixed ladder is still deciding "
+              "every retry")
+        return 0
+    for signature, tried, rate in signatures:
+        rungs = sorted(ledger.evidence(signature, stack=args.stack or ""),
+                       key=lambda row: -row.confidence)
+        if not rungs:
+            print(f"\n{signature}: nothing recorded")
+            continue
+        seen = sum(row.tried for row in rungs)
+        print(f"\n{signature}  ({tried or seen} seen, "
+              f"{rate or sum(r.fixed for r in rungs) / max(seen, 1):.0%} repaired)")
+        for row in rungs:
+            # A rung under the threshold is shown and marked rather than
+            # hidden: "not yet enough to act on" is the useful thing to know
+            # about it, and hiding it reads as "never tried".
+            mark = " " if row.tried >= MIN_EVIDENCE else "?"
+            print(f"  {mark} {row.describe()}")
+    return 0
+
+
 def cmd_context(args) -> int:
     """Read and write the project's context database.
 
@@ -550,6 +595,12 @@ def cmd_doctor(args) -> int:
     for role in sorted({r.role for r in ladder.rungs if r.role} - set(PROMPTS)):
         print(f"ladder    WARN execution.escalation names no role {role!r}; "
               "that rung falls back to the implementer", file=sys.stderr)
+    from .ledger import open_ledger
+    learned = open_ledger(config).stats()
+    print(f"ledger    {learned['attempts']} attempt(s) from "
+          f"{learned['projects']} project(s) at {learned['path']}"
+          if learned.get("available") else
+          "ledger    off; every retry is decided by the fixed ladder above")
     sandbox_cfg = config.get("sandbox", {})
     probe = Sandbox(Path.cwd(), sandbox_cfg)
     print(f"sandbox   runtime={probe.runtime} image={sandbox_cfg.get('image')} "
@@ -622,6 +673,15 @@ def build_parser() -> argparse.ArgumentParser:
     journal.add_argument("-t", "--ticket", help="only this ticket's entries")
     journal.add_argument("--json", action="store_true")
     journal.set_defaults(func=cmd_journal)
+
+    ledger = sub.add_parser(
+        "ledger", help="what the factory learned about its own retries")
+    ledger.add_argument("-s", "--signature", help="only this failure class")
+    ledger.add_argument("--stack", help="only this toolchain")
+    ledger.add_argument("-n", "--lines", type=int, default=12)
+    ledger.add_argument("--prune", action="store_true",
+                        help="drop the oldest attempts beyond the cap")
+    ledger.set_defaults(func=cmd_ledger)
 
     context = sub.add_parser(
         "context", help="the project's context database: what agents recorded")

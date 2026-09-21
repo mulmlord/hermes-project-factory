@@ -325,7 +325,8 @@ class Factory:
         elif action == "research":
             topic = diagnosis.get("research_topic") or f"How to correctly implement: {ticket.title}"
             payload = investigate(self.agents, self.root, topic, self.context(),
-                                  log=self.log, librarian=self._librarian())
+                                  log=self.log, librarian=self._librarian(),
+                                  db=self.context_db, classifier=self.classifier)
             self._record_decisions(payload.get("decisions", []))
             ticket.context = (ticket.context + "\n\nRESEARCH:\n" +
                               "\n".join(f"- {c}" for c in payload.get("conclusions", []))[:2000])

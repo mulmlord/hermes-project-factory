@@ -43,7 +43,8 @@ def research(factory) -> None:
         payload = investigate(
             factory.agents, factory.root, topic, factory.context(),
             max_unknowns=int(factory.config.get("research.max_unknowns", 6)),
-            log=factory.log, librarian=factory._librarian())
+            log=factory.log, librarian=factory._librarian(),
+            db=factory.context_db, classifier=factory.classifier)
         factory._record_decisions(payload.get("decisions", []))
         _queue_research_tickets(factory, payload.get("tickets", []))
         _queue_hypotheses(factory, payload.get("hypotheses", []), topic)

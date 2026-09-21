@@ -168,13 +168,50 @@ def _sources(root: Path, paths: list[str] | None = None) -> dict[str, str]:
 
 def scan_unsafe(root: Path, paths: list[str] | None = None) -> list[str]:
     """Static security scan over generated sources. Returns human-readable hits."""
+    return _patterns(_sources(root, paths))
+
+
+def _patterns(sources: dict[str, str]) -> list[str]:
+    """Every pattern hit in ``{where: text}``, named by where and by line."""
     hits = []
-    for rel, text in _sources(root, paths).items():
+    for rel, text in sources.items():
         for pattern, description in UNSAFE_PATTERNS:
             for match in re.finditer(pattern, text):
                 line = text[: match.start()].count("\n") + 1
                 hits.append(f"{rel}:{line}: {description}")
     return hits
+
+
+#: Command shapes that add software to the sandbox, and what to call the thing
+#: doing it. Over-matching is the safe direction here: the cost of a false hit
+#: is one refused proposal, and the cost of a miss is a dependency chosen by
+#: whoever wrote a web page.
+INSTALLERS = [
+    (r"\b(?:pip|pip3|pipx|uv|conda|mamba|poetry|pdm)\b[^\n;&|]*?\b(?:install|add)\b",
+     "a python package manager"),
+    (r"\bpython3?\s+-m\s+pip\b[^\n;&|]*?\binstall\b", "pip"),
+    (r"\b(?:npm|pnpm|yarn|bun)\b[^\n;&|]*?\b(?:install|add|i)\b",
+     "a node package manager"),
+    (r"\b(?:cargo|gem|go|dotnet|composer|nix-env)\b[^\n;&|]*?\b(?:install|add|get)\b",
+     "a language package manager"),
+    (r"\b(?:apt|apt-get|dnf|yum|apk|brew|zypper)\b[^\n;&|]*?\b(?:install|add)\b",
+     "a system package manager"),
+    (r"\bpacman\s+-[A-Za-z]*S", "pacman"),
+    (r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:ba)?sh", "a piped installer"),
+]
+
+
+def installs(command: str) -> str:
+    """Name what this command would install with, or ``""`` if it installs nothing.
+
+    Kept beside the security patterns because it answers the same kind of
+    question about a string, but it is not a security verdict: ``pip install
+    pytest`` is what the architect is supposed to write in the setup command.
+    It is only a refusal when the caller has decided that *this* source of
+    commands does not get to add packages.
+    """
+    return next((manager for pattern, manager in INSTALLERS
+                 if re.search(pattern, command, re.IGNORECASE)), "")
 
 
 def security_gate(root: Path, paths: list[str] | None = None, *,
@@ -192,10 +229,37 @@ def security_gate(root: Path, paths: list[str] | None = None, *,
     false positive rate. Until then a guessed defect must not fail a ticket
     that was correct.
     """
-    hits = scan_unsafe(root, paths)
-    findings = classifier.scan(_sources(root, paths)) if classifier is not None else []
+    return _gate(_sources(root, paths), classifier=classifier, clean=clean)
+
+
+def text_gate(texts: dict[str, str], *, classifier=None, block: bool = False,
+              clean: str = "clean") -> Gate:
+    """The same gate, over text that is not a file on disk.
+
+    What gets screened here is a string the factory is about to act on but
+    has not written down anywhere -- a shell command proposed by a research
+    round, in practice. Reusing :func:`scan_unsafe`'s own pattern list and
+    the same classifier call is deliberate: two security checks that
+    disagreed about what ``curl … | sh`` is would be worse than one.
+
+    *block* promotes the classifier's findings from advisory to blocking.
+    Callers screening untrusted material set it, and the asymmetry with
+    :func:`security_gate` is the point: a false positive there fails a ticket
+    the factory itself wrote and costs a whole generate/verify cycle, while a
+    false positive here refuses one command a fetched page asked for.
+    """
+    return _gate({k: v for k, v in texts.items() if str(v).strip()},
+                 classifier=classifier, clean=clean, block=block)
+
+
+def _gate(sources: dict[str, str], *, classifier=None, clean: str,
+          block: bool = False) -> Gate:
+    """One security verdict over ``{where: text}``, whatever it was read from."""
+    hits = _patterns(sources)
+    findings = classifier.scan(sources) if classifier is not None else []
     advisories = [f.render() for f in findings]
-    blocking = hits + (advisories if classifier is not None and classifier.cfg.block else [])
+    blocking = hits + (advisories if findings and
+                       (block or classifier.cfg.block) else [])
     detail = " | ".join(part for part in (
         "; ".join(hits[:5]),
         ("review: " + "; ".join(advisories[:5])) if advisories else "",

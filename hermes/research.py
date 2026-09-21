@@ -4,6 +4,29 @@ The loop is: explain the problem simply, name the unknowns, attack them,
 challenge the resulting assumptions, and convert what survives into
 decisions, hypotheses and tickets. Output must change what gets built --
 a summary that changes nothing is treated as a failed round.
+
+When the round reads real pages it is also the one place where text the
+factory did not write reaches an agent, so the round is built in three
+layers and only the first of them ever sees a page.
+
+**Quarantine.** :func:`_read` asks one question of the retrieved material on
+a call with no project context and no toolbox -- :class:`hermes.tools.Lookup`
+refuses one to any prompt carrying an untrusted block -- and its answer is
+reduced in Python to at most a handful of short claims, each pinned to a
+source that was really fetched. A claim whose citation does not resolve is
+dropped, so untrusted text can only travel attached to evidence.
+
+**Privilege.** Every later prompt -- the answer, the synthesis, the
+architect reading the summary -- sees the claims, never the page. That is
+the Dual-LLM split, and its published weakness is exactly the thing the
+third layer is for: it constrains what may flow, not what the flowing
+values say.
+
+**Policy.** :func:`_screen` decides in Python what a round that read pages
+is allowed to have proposed. An install is refused outright and every other
+command must clear the project's own security gate and the classifier. None
+of this is expressed as an instruction to a model, because an instruction to
+a model is precisely what the page is competing with.
 """
 from __future__ import annotations
 
@@ -15,9 +38,18 @@ from typing import Any
 
 from . import prompts
 from .agents import Prompt
+from .contextdb import UNTRUSTED
 from .log import Logger, NULL
-from .sources import as_records
+from .sources import as_records, flatten, quarantine
+from .verify import installs, text_gate
 from .workspace import slugify
+
+#: Characters one claim may carry out of the quarantine, and how many claims
+#: one question may take out of it. A claim is a sentence the page supports;
+#: a page quoted whole is the page again, and not travelling whole is the
+#: entire point of reading it behind a wall.
+CLAIM_CHARS = 400
+MAX_CLAIMS = 6
 
 
 @dataclass
@@ -68,12 +100,18 @@ class ResearchLog:
 
 
 def investigate(agents, root: Path, topic: str, context: str, *,
-                max_unknowns: int = 6, log: Logger = NULL, librarian=None) -> dict:
+                max_unknowns: int = 6, log: Logger = NULL, librarian=None,
+                db=None, classifier=None) -> dict:
     """Run one Feynman round on *topic*. Returns findings and actions.
 
     With a *librarian* the round first retrieves real sources and answers
     from them; without one it answers from what the model already knows,
     which is why every finding carries an explicit confidence either way.
+
+    *db* is the context database, where each retrieved page is recorded as
+    an untrusted source so the next agent can see what this round read and
+    where it came from. *classifier* is the security classifier, which joins
+    the gate in screening what a round that read pages proposed.
     """
     researcher = agents["researcher"]
     record = ResearchLog(root)
@@ -94,12 +132,12 @@ def investigate(agents, root: Path, topic: str, context: str, *,
     unknowns = (plan.get("unknowns") or [])[:max_unknowns]
 
     refused_from = len(librarian.refusals) if librarian else 0
-    sources, material = [], ""
+    sources = []
     if librarian is not None:
         librarian.start_round()      # the run's page budget does not reset
     if librarian is not None and unknowns:
         sources = _consult(researcher, librarian, topic, unknowns, context, log)
-        material = librarian.excerpts(sources)
+        _remember_sources(db, sources, topic)
 
     findings = []
     for index, unknown in enumerate(unknowns, 1):
@@ -107,16 +145,17 @@ def investigate(agents, root: Path, topic: str, context: str, *,
         if not question:
             continue
         log.info("research.unknown", n=index, question=question[:80])
+        why = unknown.get("why_it_matters", "") if isinstance(unknown, dict) else ""
+        claims = _read(researcher, librarian, sources, question, log) if sources else []
         ask = Prompt(researcher, log=log)
         ask.add("context", context, priority=20, floor=600)
-        ask.add("question", f"QUESTION: {question}\nWHY IT MATTERS: "
-                + (unknown.get("why_it_matters", "") if isinstance(unknown, dict) else ""),
+        ask.add("question", f"QUESTION: {question}\nWHY IT MATTERS: {why}",
                 required=True)
-        # Retrieved text is the only thing here the model does not already
-        # have, so it outranks the project context it was fetched to answer.
-        ask.add("material", prompts.retrieved_material(material),
-                priority=10, floor=1500)
-        ask.add("instructions", prompts.feynman_answer(bool(material)),
+        # What the pages said, as claims rather than as pages: this prompt has
+        # the project in it, and nothing off the network reaches it unquoted.
+        ask.add("material", prompts.retrieved_material(_quoted(librarian, claims)),
+                priority=10, floor=1500, trust=UNTRUSTED)
+        ask.add("instructions", prompts.feynman_answer(bool(claims)),
                 required=True)
         answer = researcher.ask_json(ask.render())
         findings.append({
@@ -150,11 +189,153 @@ def investigate(agents, root: Path, topic: str, context: str, *,
         **{k: synthesis.get(k, []) for k in
            ("conclusions", "decisions", "hypotheses", "tickets", "remaining_unknowns")},
     }
+    # Only a round that actually read pages is screened. One answering from
+    # the model's own weights proposes what the rest of the factory proposes,
+    # and refusing its setup command would be a regression, not a defence.
+    payload["refused"] = _screen(payload, classifier=classifier,
+                                 log=log) if sources else []
     record.add(topic, payload)
     _write_notes(root, topic, payload)
     log.info("research.done", topic=topic[:60], findings=len(findings),
              sources=len(sources), tickets=len(payload.get("tickets", [])))
     return payload
+
+
+def _read(researcher, librarian, sources: list, question: str,
+          log: Logger) -> list[dict]:
+    """Ask the retrieved pages one question, behind the wall.
+
+    The whole of what this call is given is the question and the fenced
+    material: no project context, no architecture, no build commands, and no
+    toolbox -- a prompt with an untrusted block cannot be handed one. So a
+    page that talks the model into cooperating has bought an agent that
+    cannot read a file, cannot run anything, and can only return claims.
+
+    The material is sized to the room the block actually has before it is
+    rendered, rather than trimmed afterwards, because a trim cuts the tail
+    and the tail is the closing marker.
+    """
+    prompt = Prompt(researcher, log=log)
+    prompt.add("question", f"QUESTION: {question}", required=True)
+    body = prompt.add("material", priority=10, floor=1500, trust=UNTRUSTED)
+    prompt.add("instructions", prompts.quarantined_reading(MAX_CLAIMS),
+               required=True)
+    body.fill(prompts.retrieved_material(
+        librarian.excerpts(sources, budget=max(1000, body.room() - 1000))))
+    claims = _claims(researcher.ask_json(prompt.render()), sources)
+    log.info("research.quarantined_read", question=question[:80],
+             claims=len(claims), sources=len(sources))
+    return claims
+
+
+def _claims(answer: Any, sources: list) -> list[dict]:
+    """What may leave the quarantine: short claims that name a real source.
+
+    Three rules, all enforced here rather than asked for in the prompt. A
+    claim is flattened to one line, so it cannot forge a heading or a fence
+    in whatever prompt quotes it next. It is cut to :data:`CLAIM_CHARS`, so
+    a page cannot escape by being quoted whole. And it is dropped unless its
+    citation resolves to a page this round really fetched, so untrusted text
+    only travels with the evidence for it attached.
+    """
+    if not isinstance(answer, dict):
+        return []
+    kept: list[dict] = []
+    for item in (answer.get("claims") or []):
+        if not isinstance(item, dict):
+            continue
+        claim = flatten(item.get("claim", ""), CLAIM_CHARS)
+        cited = _cited([item.get("source")], sources)
+        if not claim or not cited:
+            continue
+        kept.append({"claim": claim, "source": cited[0]})
+        if len(kept) >= MAX_CLAIMS:
+            break
+    return kept
+
+
+def _quoted(librarian, claims: list[dict]) -> str:
+    """The claims as a fenced block, for the prompts that do hold privilege."""
+    if not claims:
+        return ""
+    return quarantine(librarian.mark,
+                      [(f"<{c['source']}>", c["claim"]) for c in claims])
+
+
+def _remember_sources(db, sources: list, topic: str) -> None:
+    """Record what this round read, marked untrusted, in the context database.
+
+    Metadata only -- the citation, why it was wanted, where the bytes were
+    kept. Not the text: :meth:`hermes.contextdb.ContextDB.search` is what the
+    ``recall`` tool reads, and that tool is offered to agents that *do* hold
+    privilege, so putting page text there would rebuild the channel this
+    module exists to close. The title still comes off the page, which is why
+    the record is untrusted even though it is three lines long.
+    """
+    if db is None:
+        return
+    for source in sources:
+        db.record("source", flatten(source.cite(), 300),
+                  f"retrieved for research on {topic}\n"
+                  f"wanted for: {flatten(source.why, 200) or '(not stated)'}\n"
+                  f"copy kept at: {source.path}",
+                  agent="researcher", paths=[source.path],
+                  trust=source.trust, weight=4,
+                  meta={"url": source.url, "bytes": source.bytes})
+
+
+def _screen(payload: dict, *, classifier=None, log: Logger = NULL) -> list[dict]:
+    """Refuse the executable actions a retrieved page talked the round into.
+
+    A round that read pages may still propose work -- learning something is
+    the point -- but the parts of that work the factory would *run* do not
+    get to arrive unexamined, and no wording in the prompt above can be the
+    thing that examines them.
+
+    Two rules. An install is refused outright: nothing a stranger's page
+    says is a reason to add a package to the sandbox, and research is not
+    where dependencies are chosen -- the architect picks those from the
+    specification and the setup command is where they belong. Everything
+    else must clear the project's own security gate and the classifier over
+    the command text, with the classifier blocking rather than advising,
+    because its false positive here costs one proposed command instead of a
+    correct ticket.
+
+    What is refused is returned rather than dropped silently: a command that
+    vanished without a record reads as a model that forgot to write one.
+    """
+    refused: list[dict] = []
+    for ticket in payload.get("tickets") or []:
+        if not isinstance(ticket, dict):
+            continue
+        raw = ticket.get("validation")
+        commands = [raw] if isinstance(raw, str) else list(raw or [])
+        kept = []
+        for command in commands:
+            command = str(command)
+            why = _refuse_command(command, classifier=classifier)
+            if why:
+                refused.append({"command": flatten(command, 300),
+                                "ticket": flatten(ticket.get("title", ""), 120),
+                                "reason": why})
+            else:
+                kept.append(command)
+        ticket["validation"] = kept
+    if refused:
+        log.warn("research.action_refused", count=len(refused),
+                 first=refused[0]["reason"][:200])
+    return refused
+
+
+def _refuse_command(command: str, *, classifier=None) -> str:
+    """Why this command may not come out of a round that read pages, or ""."""
+    manager = installs(command)
+    if manager:
+        return (f"a research round that read untrusted pages may not install "
+                f"anything ({manager})")
+    gate = text_gate({"proposed command": command}, classifier=classifier,
+                     block=True)
+    return "" if gate.passed else gate.detail
 
 
 def _consult(researcher, librarian, topic: str, unknowns: list, context: str,
@@ -283,6 +464,12 @@ def _write_notes(root: Path, topic: str, payload: dict) -> None:
                 f"retrieved copy: `{s.get('path')}`")
         + block("Could not be retrieved", payload.get("unreachable"), lambda r:
                 f"- {r.get('url')} — {r.get('reason')}")
+        # A refusal is written down where a person will see it: a command that
+        # disappeared silently looks like a model that forgot to propose one,
+        # and the difference matters when a page was trying to place it.
+        + block("Refused after reading untrusted pages", payload.get("refused"),
+                lambda r: f"- `{r.get('command')}` "
+                          f"({r.get('ticket') or 'unnamed ticket'}) — {r.get('reason')}")
     )
     out = Path(root) / "docs" / "research" / f"{stamp}-{slug}.md"
     out.parent.mkdir(parents=True, exist_ok=True)

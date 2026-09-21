@@ -17,6 +17,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
+      - run: docker image pull python:3.11-slim
       # No inference server here: the suite drives the whole state machine
-      # against a stub model and the local sandbox runtime.
-      - run: pytest -q
+      # against a stub model. The runner does have a docker daemon, so the
+      # sandbox and research-fetch tests that need a container run for real:
+      # HERMES_REQUIRE_DOCKER turns a missing daemon into a failure, because
+      # those tests skipping is what left the container path unverified.
+      - run: pytest -q -rs
+        env:
+          HERMES_REQUIRE_DOCKER: "1"

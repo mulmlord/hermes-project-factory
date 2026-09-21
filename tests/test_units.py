@@ -1,5 +1,8 @@
 """Unit checks for the logic that has to be right for the loop to terminate."""
+import contextlib
 import json
+import os
+import shutil
 import subprocess
 import threading
 import time
@@ -7,6 +10,8 @@ import time
 import pytest
 
 from types import SimpleNamespace
+
+from conftest import needs_docker
 
 from hermes.agents import Prompt, build as build_agents, escalate
 from hermes.config import Config, ConfigError, DEFAULTS, deep_merge, is_local_url
@@ -1330,12 +1335,13 @@ RESULTS = ('<html><body><a href="/settings">Settings</a>'
            '<a href="mailto:nobody@example.com">Contact</a></body></html>')
 
 
-@pytest.fixture
-def served():
-    """A real HTTP server on loopback, so a fetch is an actual fetch.
+@contextlib.contextmanager
+def _serving(bind: str, reachable_as: str):
+    """Serve the page set on *bind*, yielding the base URL a fetcher should use.
 
-    Its document root sits outside every project directory: a test that scans
-    a project must find the retrieved copy, never the server's own files.
+    The two differ once the fetcher is in a container: the server has to
+    listen on every interface, while the container reaches it at the bridge
+    gateway rather than at the loopback address the host would use.
     """
     import functools
     import http.server
@@ -1348,9 +1354,9 @@ def served():
 
     with tempfile.TemporaryDirectory() as pages:
         server = http.server.ThreadingHTTPServer(
-            ("127.0.0.1", 0), functools.partial(Quiet, directory=pages))
+            (bind, 0), functools.partial(Quiet, directory=pages))
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        base = f"http://127.0.0.1:{server.server_port}"
+        base = f"http://{reachable_as}:{server.server_port}"
         for name, body in (
                 ("guide.html", GUIDE),
                 ("second.html", "<html><body>another page</body></html>"),
@@ -1365,6 +1371,17 @@ def served():
         finally:
             server.shutdown()
             server.server_close()
+
+
+@pytest.fixture
+def served():
+    """A real HTTP server on loopback, so a fetch is an actual fetch.
+
+    Its document root sits outside every project directory: a test that scans
+    a project must find the retrieved copy, never the server's own files.
+    """
+    with _serving("127.0.0.1", "127.0.0.1") as base:
+        yield base
 
 
 def _search_engine(base: str) -> str:
@@ -1573,6 +1590,124 @@ def test_research_without_a_network_budget_fetches_nothing(tmp_path):
     assert payload["sources"] == []
     assert payload["findings"][0]["sources"] == []
     assert not (tmp_path / "research" / "sources").exists()
+
+
+# -- networked research, under the docker runtime ----------------------------
+#
+# Everything above fetches through ``runtime: local``, where the fetch is a
+# subprocess of the Hermes process and the page is written straight onto the
+# workspace. Under docker it is a different path end to end: a one-shot
+# ``docker run --network bridge`` box, the workspace visible only through a
+# bind mount, the destination interpreted relative to /workspace, the file
+# written by a container process, and a resolver that is not the host's. A
+# fetch can be perfectly correct in ``hermes/sources.py`` and still fail at
+# every one of those, so it is exercised here for real.
+
+
+@pytest.fixture
+def bridge_served():
+    """The page set, at an address a bridge-network container can reach.
+
+    The container's own loopback is the container, so the server has to
+    listen on every interface and be named by the bridge gateway instead.
+    """
+    gateway = _bridge_gateway()
+    if not gateway:
+        needs_docker("the docker bridge network has no gateway address")
+    with _serving("0.0.0.0", gateway) as base:
+        yield base
+
+
+def _bridge_gateway() -> str:
+    """The host address as seen from a container on the default bridge."""
+    if not shutil.which("docker"):
+        return ""
+    proc = subprocess.run(
+        ["docker", "network", "inspect", "bridge",
+         "-f", "{{range .IPAM.Config}}{{.Gateway}}{{end}}"],
+        capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _docker_librarian(root, **cfg):
+    """A librarian whose sandbox really is a container, or a skip."""
+    if not shutil.which("docker"):
+        needs_docker("docker is not installed")
+    root.chmod(0o755)  # the container drops CAP_DAC_OVERRIDE, so 0700 is unreadable
+    sandbox = Sandbox(root, {"runtime": "docker", "timeout": 300,
+                             "image": "python:3.11-slim"}, NULL)
+    # No start(): a fetch always takes the one-shot container, never the
+    # long-lived one, because the long-lived one has no network. Probe the
+    # runtime the way a fetch will use it rather than trusting the daemon.
+    if not sandbox.run("python3 -c ''", network=True).ok:
+        needs_docker("the docker daemon refused to start a container")
+    return Librarian(sandbox, root, cfg, NULL)
+
+
+def test_docker_fetch_lands_in_the_workspace_readable_by_the_host(tmp_path,
+                                                                  bridge_served):
+    """The bytes cross the bind mount, and the host owns what comes back."""
+    workspace.create(tmp_path, "a ring buffer")
+    librarian = _docker_librarian(tmp_path, allow_private=True)
+
+    source = librarian.fetch(f"{bridge_served}/guide.html", why="how the index wraps")
+
+    assert source is not None, librarian.refusals
+    stored = tmp_path / source.path
+    assert source.path.startswith("research/sources/")
+    assert stored.is_file() and stored.stat().st_uid == os.getuid()
+    assert "power-of-two capacity" in librarian.text(source, 4000)
+    # research/sources/ was created by the container, so it too must be ours.
+    assert (tmp_path / "research" / "sources").stat().st_uid == os.getuid()
+
+
+def test_docker_fetch_carries_the_content_type_and_final_url_back(tmp_path,
+                                                                 bridge_served):
+    """The metadata is a line of container stdout; nothing else reports it.
+
+    The suffix comes from the content type and the citation from the URL the
+    redirect ended at, so both losing the container boundary is silent: the
+    page still arrives, mislabelled and cited as the address asked for.
+    """
+    workspace.create(tmp_path, "a ring buffer")
+    librarian = _docker_librarian(tmp_path, allow_private=True)
+
+    # SimpleHTTPRequestHandler redirects a directory to its trailing-slash form.
+    source = librarian.fetch(f"{bridge_served}/guide.html")
+    redirected = librarian.fetch(bridge_served)
+
+    assert source is not None and source.path.endswith(".html")
+    assert source.title == "Ring Buffer Guide"      # the arriving bytes parsed
+    assert redirected is not None, librarian.refusals
+    assert redirected.url == f"{bridge_served}/"    # where it ended, not where it went
+
+
+def test_docker_fetch_refuses_a_private_address_from_inside_the_container(
+        tmp_path, bridge_served):
+    """The guard resolves with the container's resolver, and still says no."""
+    workspace.create(tmp_path, "a ring buffer")
+    librarian = _docker_librarian(tmp_path)         # allow_private defaults off
+
+    assert librarian.fetch(f"{bridge_served}/guide.html") is None
+    assert "non-public" in librarian.refusals[0]["reason"]
+    assert not list((tmp_path / "research" / "sources").glob("*"))
+
+
+def test_docker_fetch_resolves_names_inside_the_container(tmp_path, bridge_served):
+    """A name is resolved where the fetch runs, which is not where Hermes runs.
+
+    ``localhost`` is the host's own server to Hermes and the container itself
+    to the container. The refusal has to come from the container's answer, or
+    the guard is checking an address that was never dialled.
+    """
+    workspace.create(tmp_path, "a ring buffer")
+    port = bridge_served.rsplit(":", 1)[1]
+    librarian = _docker_librarian(tmp_path, allow_private=True)
+
+    # Allowed past the guard, then dialled in the container, where nothing is
+    # listening on its own loopback: a connection error, not a fetched page.
+    assert librarian.fetch(f"http://localhost:{port}/guide.html") is None
+    assert librarian.refusals, "the fetch reached the host's server"
 
 
 # -- experiments -------------------------------------------------------------
@@ -2565,15 +2700,14 @@ def test_decision_records_increment(tmp_path):
 
 def test_docker_install_gets_network_then_loses_it(shared_tmp):
     """Setup installs must persist in the container and leave it offline again."""
-    import shutil
     if not shutil.which("docker"):
-        pytest.skip("docker unavailable")
+        needs_docker("docker is not installed")
     tmp_path = shared_tmp
     sandbox = Sandbox(tmp_path, {"runtime": "docker", "timeout": 300,
                                  "image": "python:3.11-slim"})
     with sandbox:
         if sandbox.runtime != "docker":
-            pytest.skip("docker present but unusable")
+            needs_docker("the docker daemon refused to start a container")
         assert sandbox.install("pip install --quiet pytest").ok
         assert sandbox.run("python -c 'import pytest'").ok
         assert not sandbox.run(
@@ -2583,9 +2717,8 @@ def test_docker_install_gets_network_then_loses_it(shared_tmp):
 
 def test_missing_tool_is_installed_and_recorded(shared_tmp):
     """A gate failing with exit 127 is an absent tool, not a code defect."""
-    import shutil
     if not shutil.which("docker"):
-        pytest.skip("docker unavailable")
+        needs_docker("docker is not installed")
     tmp_path = shared_tmp
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_ok.py").write_text("def test_ok():\n    assert True\n")
@@ -2594,7 +2727,7 @@ def test_missing_tool_is_installed_and_recorded(shared_tmp):
                                  "image": "python:3.11-slim"})
     with sandbox:
         if sandbox.runtime != "docker":
-            pytest.skip("docker present but unusable")
+            needs_docker("the docker daemon refused to start a container")
         verification = verify_project(sandbox, plan)
     assert verification.passed, verification.report()
     assert sandbox.installed == ["pytest"]
@@ -2611,9 +2744,8 @@ def test_src_layout_is_importable(tmp_path):
 
 def test_console_script_triggers_editable_install(shared_tmp):
     """A missing console script means the project is not installed, not broken."""
-    import shutil
     if not shutil.which("docker"):
-        pytest.skip("docker unavailable")
+        needs_docker("docker is not installed")
     (shared_tmp / "greet.py").write_text("def main():\n    print('hi')\n")
     (shared_tmp / "setup.py").write_text(
         "from setuptools import setup\n"
@@ -2624,7 +2756,7 @@ def test_console_script_triggers_editable_install(shared_tmp):
                                    "image": "python:3.11-slim"})
     with sandbox:
         if sandbox.runtime != "docker":
-            pytest.skip("docker present but unusable")
+            needs_docker("the docker daemon refused to start a container")
         verification = verify_project(sandbox, plan)
     assert verification.passed, verification.report()
     assert plan["commands"]["setup"] == "pip install -e ."
@@ -2632,15 +2764,14 @@ def test_console_script_triggers_editable_install(shared_tmp):
 
 def test_unknown_tool_is_not_fetched_from_pypi(shared_tmp):
     """Model-written command text must not become a PyPI install."""
-    import shutil
     if not shutil.which("docker"):
-        pytest.skip("docker unavailable")
+        needs_docker("docker is not installed")
     plan = {"commands": {"build": "true", "test": "definitely-not-a-tool --run"}}
     sandbox = Sandbox(shared_tmp, {"runtime": "docker", "timeout": 120,
                                    "image": "python:3.11-slim"})
     with sandbox:
         if sandbox.runtime != "docker":
-            pytest.skip("docker present but unusable")
+            needs_docker("the docker daemon refused to start a container")
         verification = verify_project(sandbox, plan)
     assert not verification.passed
     assert sandbox.installed == []
@@ -2648,9 +2779,8 @@ def test_unknown_tool_is_not_fetched_from_pypi(shared_tmp):
 
 def test_failed_install_reaches_the_agent(shared_tmp):
     """The install error is the diagnosis, so it must survive into the report."""
-    import shutil
     if not shutil.which("docker"):
-        pytest.skip("docker unavailable")
+        needs_docker("docker is not installed")
     (shared_tmp / "src").mkdir()
     (shared_tmp / "src" / "greet.py").write_text("def main():\n    print('hi')\n")
     # packages=['greet'] with the code under src/ and no package_dir: the
@@ -2664,7 +2794,7 @@ def test_failed_install_reaches_the_agent(shared_tmp):
                                    "image": "python:3.11-slim"})
     with sandbox:
         if sandbox.runtime != "docker":
-            pytest.skip("docker present but unusable")
+            needs_docker("the docker daemon refused to start a container")
         verification = verify_project(sandbox, plan)
     assert not verification.passed
     assert "pip install" in verification.failure_output()

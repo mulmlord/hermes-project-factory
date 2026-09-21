@@ -78,6 +78,16 @@ DEFAULTS: dict[str, Any] = {
         "fetch_bytes": 250000,        # cap on a single retrieved page
         "fetch_timeout": 30,          # seconds one fetch may take
         "allow_private": False,       # reach a LAN/loopback documentation server
+        # A hypothesis nobody measures is a note. These bound what settling
+        # them costs: how many of a round's hypotheses become experiment
+        # tickets, how long one experiment may run, how many times it is
+        # measured (>1 is aggregated by median, for a timing experiment on a
+        # noisy box), and how many tries it gets at a program that runs.
+        "experiments": True,
+        "experiments_per_round": 2,
+        "experiment_timeout": 300,
+        "experiment_repeats": 1,
+        "experiment_attempts": 2,
     },
     "evolution": {
         "enabled": True,
@@ -343,6 +353,15 @@ research:
   max_fetches_per_round: 6   # and what a single round may spend of them
   fetch_bytes: 250000    # cap on a single page
   allow_private: false   # only set for a documentation server you host
+  experiments: true      # a hypothesis the round raises becomes an experiment
+                         # ticket: a program is written, run in the sandbox,
+                         # and its measurement settles the question. Off leaves
+                         # the hypothesis as a note in docs/research/
+  experiments_per_round: 2   # hypotheses from one round that get measured
+  experiment_timeout: 300    # seconds one run of the program may take
+  experiment_repeats: 1      # runs per experiment; >1 reports their median
+  experiment_attempts: 2     # rewrites allowed when the program measures
+                             # nothing it can report
 
 execution:
   candidates: 1          # samples raced through the gates per ticket; >1 costs

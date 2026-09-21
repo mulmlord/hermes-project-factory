@@ -50,6 +50,21 @@ and excluded from the release export, so a clone gets the citations and the
 extracted text without republishing someone else's pages under the project's
 licence.
 
+**Experiments** are how a hypothesis stops being a note. A round that ends in
+a testable claim queues it as an experiment ticket, and that ticket is run
+rather than implemented: the Benchmark Engineer writes the smallest program
+that measures the claim, the sandbox runs it, and a researcher shown both the
+numbers and the program that produced them says what was settled. The verdict
+is about the experiment, not the claim — a refuted hypothesis is a finished
+experiment, and completes its ticket. Each one lands in its own directory
+under `experiments/` with the program, every run's output and a `record.json`
+carrying the hypothesis, parameters, configuration, code version, environment,
+measurement and verdict, which is enough to repeat it without Hermes. Nothing
+is overwritten: running the same hypothesis again gets the next identifier, so
+the two results can be compared rather than one replacing the other. What was
+measured goes back into the research log, which is what stops the next round
+asking the question this one just answered.
+
 **Planning** decomposes the architecture into tickets small enough for one
 agent to implement, test and verify in a single pass. Dependency cycles are
 detected and broken before the scheduler ever sees them.
@@ -376,7 +391,8 @@ project/
 ├── CONTEXT.md          always-current orientation
 ├── AGENTS.md           rules for whoever works on this next
 ├── SPEC.md  PLAN.md    what and how
-├── src/  tests/  benchmarks/  experiments/
+├── src/  tests/  benchmarks/
+├── experiments/        one directory per experiment: program, runs, record
 ├── docs/
 │   ├── architecture/  research/  decisions/  generated/
 ├── tickets/            kanban board, mirrored as markdown

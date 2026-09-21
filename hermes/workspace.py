@@ -56,8 +56,14 @@ any human who picks the project up.
 - Validation commands live in each ticket and in `PLAN.md`.
 - Architectural decisions belong in `docs/decisions/` as numbered records.
 - Research notes belong in `research/`, distilled findings in `docs/research/`.
-- Experiments are reproducible: record hypothesis, config and result under
-  `experiments/`.
+- Experiments are reproducible: each one lives in its own directory under
+  `experiments/`, with the program, every run's output, and a `record.json`
+  carrying the hypothesis, configuration, code version, environment and
+  result. Nothing there is ever overwritten; a repeat run gets its own
+  directory.
+- An experiment program reports what it measured on one line,
+  `RESULT: {"name": <number>}`, so the measurement is its own claim rather
+  than something read out of its prose.
 - Do not add a dependency without recording why in a decision record.
 
 ## Roles

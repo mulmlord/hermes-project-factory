@@ -16,6 +16,7 @@ from . import workspace
 from .agents import Prompt, build as build_agents, context_block
 from .config import Config
 from .evolve import Evolution, objective_from_spec
+from .experiment import Lab, run_ticket as run_experiment_ticket
 from .git_ops import GitHub, Issues, Repo
 from .implement import Change, Ladder, execute_ticket, generate
 from .journal import Journal
@@ -69,6 +70,17 @@ class Factory:
                        budget=int(self.config.get("execution.tool_calls", 6)),
                        rounds=int(self.config.get("execution.tool_rounds", 3)),
                        log=self.log)
+
+    def _lab(self) -> Lab:
+        """Where hypotheses are measured. See :mod:`hermes.experiment`.
+
+        Built per experiment rather than held: it carries no state between
+        them, and the agents and sandbox it works through are attributes the
+        caller may have replaced since the factory was constructed.
+        """
+        return Lab(self.sandbox, self.agents, self.state,
+                   self.config.get("research", {}), self.log,
+                   governor=self.governor)
 
     def context(self, extra: str = "") -> str:
         return context_block(self.state, self.tree(), extra)
@@ -162,6 +174,7 @@ class Factory:
                 log=self.log, librarian=self._librarian())
             self._record_decisions(payload.get("decisions", []))
             self._queue_research_tickets(payload.get("tickets", []))
+            self._queue_hypotheses(payload.get("hypotheses", []), topic)
         self.save("research")
         self.commit("docs: record research findings and decisions", kind="docs")
         self.state.transition("SPECIFICATION", f"{len(topics)} research topic(s)")
@@ -227,6 +240,49 @@ class Factory:
         from .planning import _ingest
         _ingest(self.board, [t for t in raw if isinstance(t, dict)], log=self.log)
 
+    def _queue_hypotheses(self, raw: list, topic: str) -> None:
+        """Turn the round's hypotheses into experiments that will settle them.
+
+        A hypothesis the factory only writes down is a note: it is rendered
+        into `docs/research/`, read by nobody, and the unknown it was meant to
+        close stays open. Queued as tickets they go through the experiment
+        path, and what they measure comes back to the next research round.
+
+        Capped per round, because a round that proposes six claims should not
+        push six measurements ahead of the work they exist to inform. The
+        cheapest and most informative of them is what the board's own scoring
+        picks up first.
+        """
+        if not self.config.get("research.experiments", True):
+            return
+        limit = int(self.config.get("research.experiments_per_round", 2))
+        known = {t.objective for t in self.board.tickets.values()
+                 if t.kind == "experiment"}
+        fresh = []
+        for item in raw:
+            statement = str(item.get("statement", ""))[:300] if isinstance(item, dict) else ""
+            if not statement or statement in known:
+                continue
+            known.add(statement)
+            fresh.append({
+                "title": f"Measure: {statement[:60]}",
+                "objective": statement,
+                "kind": "experiment",
+                "context": f"Hypothesis from research on {topic}.\n"
+                           f"Proposed test: {item.get('test', '(none given)')}",
+                "acceptance": ["the hypothesis is settled by a measurement rather "
+                               "than by assertion",
+                               "the experiment records its result under experiments/"],
+                # Cheap and high information: an experiment exists to change a
+                # decision, and it is worth least once that decision is made.
+                "priority": 2, "cost": 2, "risk": 2, "info_gain": 5,
+            })
+            if len(fresh) >= limit:
+                break
+        if fresh:
+            self._queue_research_tickets(fresh)
+            self.board.save()
+
     def phase_specification(self) -> None:
         plan = architect(self.agents, self.state.spec, self.research_summary(), self.log)
         self.state.plan = plan
@@ -291,25 +347,28 @@ class Factory:
         # Everything below belongs to this ticket, down to the model call that
         # generated a patch and the command that rejected it.
         with scope(ticket=ticket.id):
-            if self.openhands.should_handle(ticket):
-                handled = self._run_openhands(ticket)
-                if handled:
-                    return
-
-            outcome = execute_ticket(
-                self.agents, self.sandbox, self.state, self.board, ticket, self.tree,
-                journal=self.journal,
-                max_attempts=int(self.config.get("execution.max_ticket_attempts", 3)),
-                ladder=self.ladder,
-                allow_edits=bool(self.config.get("execution.edit_protocol", True)),
-                prefetched=self._take_prefetch(ticket),
-                tool_calls=int(self.config.get("execution.tool_calls", 6)),
-                tool_rounds=int(self.config.get("execution.tool_rounds", 3)),
-                on_apply=lambda: self._prefetch_next(ticket),
-                log=self.log)
+            if ticket.kind == "experiment":
+                # An experiment is not implemented and reviewed, it is run and
+                # measured, so it takes its own path to the same verdict shape.
+                outcome = self._run_experiment(ticket)
+            elif self.openhands.should_handle(ticket) and self._run_openhands(ticket):
+                return
+            else:
+                outcome = execute_ticket(
+                    self.agents, self.sandbox, self.state, self.board, ticket, self.tree,
+                    journal=self.journal,
+                    max_attempts=int(self.config.get("execution.max_ticket_attempts", 3)),
+                    ladder=self.ladder,
+                    allow_edits=bool(self.config.get("execution.edit_protocol", True)),
+                    prefetched=self._take_prefetch(ticket),
+                    tool_calls=int(self.config.get("execution.tool_calls", 6)),
+                    tool_rounds=int(self.config.get("execution.tool_rounds", 3)),
+                    on_apply=lambda: self._prefetch_next(ticket),
+                    log=self.log)
 
             if outcome["status"] == "completed":
-                self.board.move(ticket.id, "completed", "all gates passed")
+                self.board.move(ticket.id, "completed",
+                                outcome.get("note", "all gates passed"))
                 self.state.clear_failure(ticket.id)
                 record_evaluation(self.root, ticket.id, outcome["verification"],
                                   {"review": outcome.get("review", {})})
@@ -413,6 +472,25 @@ class Factory:
             self._pool.shutdown(wait=False, cancel_futures=True)
             self._pool = None
         self._prefetch = None
+
+    def _run_experiment(self, ticket) -> dict:
+        """Settle an experiment ticket by measurement instead of implementation.
+
+        Until this existed a ``kind: "experiment"`` ticket was handed to the
+        implementer, which answered acceptance criteria that describe a
+        measurement by writing code that asserts it -- the one thing an
+        experiment must not do.
+        """
+        self.board.move(ticket.id, "active", "running experiment")
+        self.board.save()
+        outcome = run_experiment_ticket(
+            self._lab(), ticket, tree=self.tree(), toolbox=self._toolbox(),
+            version=self.repo.head() if self.repo.available else "")
+        record = outcome["record"]
+        outcome["note"] = f"{record.id}: {record.verdict}"
+        self.log.info("ticket.experiment", experiment=record.id,
+                      verdict=record.verdict, measured=len(record.measurements))
+        return outcome
 
     def _run_openhands(self, ticket) -> bool:
         self.board.move(ticket.id, "active", "delegated to OpenHands")

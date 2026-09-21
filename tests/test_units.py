@@ -12,6 +12,8 @@ from hermes.agents import Prompt, build as build_agents, escalate
 from hermes.config import Config, ConfigError, DEFAULTS, deep_merge, is_local_url
 from hermes.evolve import (Bandit, Candidate, Evolution, NoTargetFits, Objective,
                           parse_score)
+from hermes.experiment import (Lab, Run, aggregate, measurements,
+                               run_ticket as run_experiment_ticket)
 from hermes.implement import (Change, Ladder, Rung, _protected, _race, apply_change,
                               execute_ticket, generate, relevant_files,
                               restore as restore_files, snapshot as snapshot_files)
@@ -21,7 +23,7 @@ from hermes.log import NULL, Logger, current_scope, scope
 from hermes.models import (ModelError, PromptTooLarge, Router, extract_json,
                           strip_reasoning)
 from hermes.openhands import OpenHands
-from hermes.research import investigate
+from hermes.research import ResearchLog, investigate
 from hermes.resources import Governor
 from hermes import harness
 from hermes.sandbox import Sandbox, SandboxError
@@ -1572,6 +1574,228 @@ def test_research_without_a_network_budget_fetches_nothing(tmp_path):
     assert payload["findings"][0]["sources"] == []
     assert not (tmp_path / "research" / "sources").exists()
 
+
+# -- experiments -------------------------------------------------------------
+
+#: A program that measures something and says so in the protocol's own words.
+PROGRAM = (
+    "total = sum(i * i for i in range(1000))\n"
+    "print('summed 1000 squares')\n"
+    "print('RESULT: {\"total\": %d}' % total)\n"
+)
+
+VERDICT = {"verdict": "supported", "finding": "the total is 332833500, as claimed",
+           "confidence": "verified", "implications": ["index with a mask"],
+           "next": ""}
+
+
+def _lab(root, *, files=None, command="python3 run.py", verdict=None, cfg=None):
+    """A lab whose builder returns a fixed program and whose researcher judges it.
+
+    Returns the lab and the prompts each role was sent, which is how a test
+    checks what the next attempt was actually told.
+    """
+    seen = {"design": [], "interpret": []}
+
+    def builder(prompt):
+        seen["design"].append(prompt)
+        return {"design": "sum the squares and report the total",
+                "parameters": {"n": 1000},
+                "files": files if files is not None
+                         else [{"path": "run.py", "content": PROGRAM}],
+                "command": command,
+                "supports": "a total of 332833500",
+                "refutes": "anything else"}
+
+    def researcher(prompt):
+        seen["interpret"].append(prompt)
+        return verdict or VERDICT
+
+    agents = {"benchmarker": _agent(builder),
+              "researcher": _agent(researcher, task="research")}
+    sandbox = Sandbox(root, {"runtime": "local", "timeout": 60})
+    state = State(idea="a ring buffer", plan={"commands": {"test": "true"}})
+    return Lab(sandbox, agents, state, cfg or {}, NULL), seen
+
+
+def test_measurement_lines_are_read_however_close_to_the_protocol_they_came():
+    assert measurements('RESULT: {"ns_per_op": 4.5, "ops": 100}') == {
+        "ns_per_op": 4.5, "ops": 100}
+    assert measurements("noise\nHERMES_RESULT: ns_per_op=4.5\nmore") == {"ns_per_op": 4.5}
+    assert measurements("RESULT: 12") == {"value": 12}
+    # A later line is the program's final word on the same quantity.
+    assert measurements('RESULT: {"n": 1}\nRESULT: {"n": 2}') == {"n": 2}
+    assert measurements("it went well") == {}
+
+
+def test_repeated_runs_are_aggregated_by_median():
+    runs = [Run(measurements={"ns": 10.0}), Run(measurements={"ns": 30.0}),
+            Run(measurements={"ns": 11.0})]
+    assert aggregate(runs) == {"ns": 11.0}
+    # Anything that is not a number everywhere is reported, not averaged.
+    mixed = [Run(measurements={"mode": "fast"}), Run(measurements={"mode": "slow"})]
+    assert aggregate(mixed) == {"mode": "slow"}
+
+
+def test_an_experiment_is_run_and_recorded_so_it_can_be_repeated(tmp_path):
+    """Section 20: the record alone has to be enough to run it again."""
+    workspace.create(tmp_path, "a ring buffer")
+    lab, seen = _lab(tmp_path)
+
+    record = lab.conduct("a bitmask wrap costs less than a modulo",
+                         test="time both over a million iterations",
+                         ticket="T007", version="abc1234")
+
+    assert record.ran and record.verdict == "supported"
+    assert record.measurements == {"total": 332833500}
+    assert record.finding.startswith("the total is")
+
+    stored = json.loads((tmp_path / record.directory / "record.json").read_text())
+    for field in ("id", "hypothesis", "configuration", "code_version", "models",
+                  "parameters", "environment", "at", "measurements", "artifacts"):
+        assert stored[field], f"{field} was not recorded"
+    assert stored["code_version"] == "abc1234"
+    assert stored["ticket"] == "T007"
+    assert stored["configuration"]["runtime"] == "local"
+    assert stored["parameters"] == {"n": 1000}
+    assert stored["runs"][0]["exit_code"] == 0
+
+    # The program, its output and a human-readable copy all survive.
+    assert (tmp_path / record.directory / "run.py").is_file()
+    assert "summed 1000 squares" in (tmp_path / record.runs[0].log).read_text()
+    readme = (tmp_path / record.directory / "README.md").read_text()
+    assert "python3 run.py" in readme and "supported" in readme
+
+    # And the measurement is a metric, which is what .hermes/metrics is for.
+    lines = (tmp_path / ".hermes" / "metrics" / "experiments.jsonl").read_text()
+    assert json.loads(lines.strip())["measurements"] == {"total": 332833500}
+
+
+def test_running_the_same_hypothesis_again_does_not_overwrite_the_first_result(tmp_path):
+    """Section 20: an experiment must not silently replace an earlier one."""
+    workspace.create(tmp_path, "a ring buffer")
+    lab, _ = _lab(tmp_path)
+
+    first = lab.conduct("a bitmask wrap is cheaper", version="aaaaaaa")
+    second = lab.conduct("a bitmask wrap is cheaper", version="bbbbbbb")
+
+    assert first.id == "E001" and second.id == "E002"
+    assert first.directory != second.directory
+    for record, version in ((first, "aaaaaaa"), (second, "bbbbbbb")):
+        stored = json.loads((tmp_path / record.directory / "record.json").read_text())
+        assert stored["code_version"] == version
+    metrics = (tmp_path / ".hermes" / "metrics" / "experiments.jsonl").read_text()
+    assert [json.loads(l)["id"] for l in metrics.splitlines()] == ["E001", "E002"]
+
+    # A fresh lab, as a resumed run would build, keeps counting where disk left off.
+    resumed, _ = _lab(tmp_path)
+    assert resumed.conduct("something else entirely").id == "E003"
+
+
+def test_a_measurement_comes_back_as_something_research_now_knows(tmp_path):
+    """The feedback edge section 7 draws: measure, then update understanding."""
+    workspace.create(tmp_path, "a ring buffer")
+    lab, _ = _lab(tmp_path)
+
+    record = lab.conduct("a bitmask wrap costs less than a modulo")
+
+    known = ResearchLog(tmp_path).known()
+    assert "a bitmask wrap costs less than a modulo" in known
+    assert "the total is 332833500" in known
+    assert "(verified)" in known
+    round_ = ResearchLog(tmp_path).rounds[-1]
+    assert round_["experiment"] == record.id
+    assert round_["remaining_unknowns"] == []      # settled, so no longer open
+    assert record.hypothesis in round_["conclusions"][0]
+
+
+def test_an_inconclusive_experiment_leaves_the_question_open(tmp_path):
+    workspace.create(tmp_path, "a ring buffer")
+    lab, _ = _lab(tmp_path, verdict={
+        "verdict": "inconclusive", "finding": "the program timed the loop overhead",
+        "confidence": "uncertain", "implications": [],
+        "next": "time the two wraps directly"})
+
+    record = lab.conduct("a bitmask wrap costs less than a modulo")
+
+    assert record.ran                      # it measured; it just settled nothing
+    assert record.verdict == "inconclusive"
+    round_ = ResearchLog(tmp_path).rounds[-1]
+    assert round_["conclusions"] == []
+    assert round_["remaining_unknowns"] == ["time the two wraps directly"]
+
+
+def test_a_program_that_writes_outside_its_own_directory_is_refused(tmp_path):
+    """An experiment measures the project; it does not get to edit it."""
+    workspace.create(tmp_path, "a ring buffer")
+    (tmp_path / "src" / "calc.py").write_text("value = 'original'\n")
+    lab, _ = _lab(tmp_path, files=[
+        {"path": "../../src/calc.py", "content": "value = 'hijacked'\n"},
+        {"path": "/etc/passwd", "content": "root\n"}])
+
+    record = lab.conduct("the project can be edited from an experiment")
+
+    assert not record.ran
+    assert len(record.refused) == 2
+    assert (tmp_path / "src" / "calc.py").read_text() == "value = 'original'\n"
+    assert "no files" in record.notes
+
+
+def test_an_unsafe_program_is_never_run(tmp_path):
+    """Generated code is untrusted here too, and this one is about to be executed."""
+    workspace.create(tmp_path, "a ring buffer")
+    lab, seen = _lab(tmp_path, files=[
+        {"path": "run.py", "content": "import os\nos.system('rm -rf /*')\n"}])
+
+    record = lab.conduct("deleting the filesystem is fast")
+
+    assert not record.ran and not record.runs
+    assert "security scan" in record.notes
+    # Refused, discarded, and the next attempt told why rather than repeated blind.
+    assert not list((tmp_path / record.directory).glob("run.py"))
+    assert "security scan" in seen["design"][-1]
+
+
+def test_an_experiment_that_measures_nothing_is_asked_again_then_fails(tmp_path):
+    workspace.create(tmp_path, "a ring buffer")
+    lab, seen = _lab(tmp_path, files=[{"path": "run.py", "content": "print('quiet')\n"}],
+                     cfg={"experiment_attempts": 2})
+    board = Board(tmp_path)
+    ticket = board.add(title="Measure: wrapping", kind="experiment", status="ready",
+                       objective="a bitmask wrap costs less than a modulo",
+                       context="Hypothesis from research on ring buffers.\n"
+                               "Proposed test: time both")
+
+    outcome = run_experiment_ticket(lab, ticket)
+
+    assert outcome["status"] == "failed"
+    assert outcome["action"] == "repair"      # a further attempt can fix this
+    assert len(seen["design"]) == 2
+    assert "printed no RESULT line" in seen["design"][1]
+    assert not outcome["record"].ran
+
+
+def test_an_experiment_ticket_is_completed_by_the_measurement_not_by_the_verdict(tmp_path):
+    """A refuted hypothesis is a finished experiment; re-running only refutes it again."""
+    workspace.create(tmp_path, "a ring buffer")
+    lab, seen = _lab(tmp_path, verdict={
+        "verdict": "refuted", "finding": "the mask was 3% slower, not faster",
+        "confidence": "verified", "implications": ["keep the modulo"], "next": ""})
+    board = Board(tmp_path)
+    ticket = board.add(title="Measure: wrapping", kind="experiment", status="ready",
+                       objective="a bitmask wrap costs less than a modulo",
+                       context="Hypothesis from research on ring buffers.\n"
+                               "Proposed test: time a million wraps")
+
+    outcome = run_experiment_ticket(lab, ticket, version="abc1234")
+
+    assert outcome["status"] == "completed"
+    assert outcome["verification"].passed
+    assert outcome["verification"].gates[0].name == "experiment:E001"
+    assert "record.json" in " ".join(outcome["change"].written)
+    # The ticket's own brief and the test research proposed both reached the builder.
+    assert "time a million wraps" in seen["design"][0]
+    assert "TICKET " + ticket.id in seen["design"][0]
 
 # -- github issue sync -------------------------------------------------------
 

@@ -21,7 +21,8 @@
 #                       [--system] [--bin DIR] [--venv DIR] [--dry-run]
 #
 #   --config           delete ~/.config/hermes/config.yaml instead of
-#                      retiring the endpoint inside it
+#                      retiring the endpoint inside it, and delete what the
+#                      factory learned about its own retries
 #   --docker-image     also delete the pre-pulled sandbox image
 #   --models           also delete the downloaded model weights
 #   --all              --config and --docker-image together (not --models)
@@ -269,6 +270,27 @@ elif [ -f "$CONFIG_FILE" ]; then
     else
       warn "could not rewrite $CONFIG_FILE; it still names the removed server"
     fi
+  fi
+fi
+
+# -- learned ledger ----------------------------------------------------------
+
+# What the factory learned about its own retries across every project it built.
+# It is not configuration and not a cache, and rebuilding it means building
+# those projects again -- so it goes with --config, which is the flag that
+# already means "remove what is mine as well".
+LEDGER_FILE="${HERMES_LEDGER:-${XDG_STATE_HOME:-$HOME/.local/state}/hermes/factory.db}"
+LEDGER_DIR="$(dirname "$LEDGER_FILE")"
+if [ -f "$LEDGER_FILE" ]; then
+  if [ "$CONFIG" -eq 1 ]; then
+    remove "$LEDGER_FILE"
+    remove "$LEDGER_FILE-wal"
+    remove "$LEDGER_FILE-shm"
+    if [ "$DRY" -eq 0 ] && [ -d "$LEDGER_DIR" ]; then
+      rmdir "$LEDGER_DIR" 2>/dev/null && note "removed $LEDGER_DIR" || true
+    fi
+  else
+    note "keeping what the factory learned at $LEDGER_FILE (--config removes it)"
   fi
 fi
 

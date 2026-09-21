@@ -34,3 +34,21 @@ def shared_tmp():
         yield path
     finally:
         shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _ledger_elsewhere():
+    """Keep the suite out of the developer's own ledger.
+
+    The ledger is deliberately outside every workspace -- it is what the
+    factory carries between projects -- so a test that opens the default one
+    would write this run's invented failures into the record the next real
+    project learns from, and leave a file behind on a machine that only ran
+    the tests.
+    """
+    with tempfile.TemporaryDirectory(prefix="hermes-ledger-") as directory:
+        os.environ["HERMES_LEDGER"] = str(Path(directory) / "factory.db")
+        try:
+            yield
+        finally:
+            os.environ.pop("HERMES_LEDGER", None)

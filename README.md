@@ -80,6 +80,18 @@ goes to the reasoning role instead of the implementer, told to work out why
 the approach cannot be made to work rather than resend it. The ladder is
 `execution.escalation`, and it climbs roles rather than models, because
 routing a retry to a second model would unload the resident one mid-ticket.
+
+That ladder is a guess, and the factory checks it. Every attempt is recorded
+in a ledger outside the workspace — the failure it was handed, how it was
+asked, whether that worked — so the record outlives the project that produced
+it. Once the same class of failure has been watched enough times, the rung
+with the better measured record replaces the one the ladder named, and a rung
+that escalates for no measured benefit is dropped for the cheaper one that
+does as well. The policy is deliberately timid: it only overrules a rung it
+has watched fail, it compares lower bounds rather than rates so two lucky
+successes do not outrank forty observed ones, and with no evidence at all it
+falls through to the fixed ladder. `hermes ledger` shows what has been
+learned; `execution.ledger: false` turns it off.
 What an agent is handed of the existing code is a guess — the ticket's
 artifact list was written before any of it existed — so the implementer and
 the reviewer can also look: `read_file`, `grep` and `list_dir` over the workspace, read-only,
@@ -402,6 +414,7 @@ rate against your own code, and `block` is worth setting only after that.
 | `hermes logs -f` | follow the machine-readable log |
 | `hermes inspect [-t T003]` | spec, plan, board, history, or one ticket |
 | `hermes journal` | what each agent did, the record the agents themselves read |
+| `hermes ledger` | which retry actually repaired which failure, across every project |
 | `hermes context catch-up <reader>` | what has changed since that reader last looked, and only that |
 | `hermes test` | run the project's verification gates |
 | `hermes benchmark` | run the project's benchmark and report the score |

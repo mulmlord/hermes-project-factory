@@ -3663,3 +3663,223 @@ def test_the_cli_reports_a_build_step_and_hands_it_to_the_next_reader(tmp_path, 
 
     assert cli.main(argv + ["catch-up", "reviewer"]) == 0
     assert "up to date" in capsys.readouterr().out
+
+
+# -- the attempt ledger ------------------------------------------------------
+
+
+def _ledger(tmp_path):
+    from hermes.ledger import Ledger
+    return Ledger(tmp_path / "factory.db")
+
+
+def _watch(ledger, signature, rung, fixed, failed, **extra):
+    """Record *fixed* successes and *failed* failures of one rung."""
+    from hermes.ledger import FAILED, FIXED
+    for _ in range(fixed):
+        ledger.record(signature, rung, FIXED, **extra)
+    for _ in range(failed):
+        ledger.record(signature, rung, FAILED, following=signature, **extra)
+
+
+CHEAP, SAMPLES, REASONING = (1, 6, ""), (2, 10, ""), (2, 10, "architect")
+RUNGS = [CHEAP, SAMPLES, REASONING]
+
+
+def test_with_nothing_learned_the_ladder_still_decides(tmp_path):
+    """Cold, the factory must behave exactly as it did before this existed."""
+    ledger = _ledger(tmp_path)
+
+    advice = ledger.advice("gates:build", SAMPLES, RUNGS)
+
+    assert advice.rung == SAMPLES and not advice.learned
+
+
+def test_a_rung_is_not_overruled_until_it_has_been_watched(tmp_path):
+    """Evidence about the alternative is not evidence against the incumbent."""
+    ledger = _ledger(tmp_path)
+    _watch(ledger, "gates:build", REASONING, fixed=20, failed=0)
+    _watch(ledger, "gates:build", SAMPLES, fixed=1, failed=2)
+
+    assert ledger.advice("gates:build", SAMPLES, RUNGS).rung == SAMPLES
+
+
+def test_the_rung_that_repairs_this_failure_wins_once_both_are_known(tmp_path):
+    ledger = _ledger(tmp_path)
+    _watch(ledger, "gates:build", SAMPLES, fixed=2, failed=18)
+    _watch(ledger, "gates:build", REASONING, fixed=17, failed=3)
+
+    advice = ledger.advice("gates:build", SAMPLES, RUNGS)
+
+    assert advice.rung == REASONING and advice.learned
+    assert advice.tried == 20 and advice.confidence > 0.6
+
+
+def test_escalation_that_buys_nothing_is_dropped_for_the_cheaper_rung(tmp_path):
+    """The saving is real: a raced rung is two model calls instead of one."""
+    ledger = _ledger(tmp_path)
+    _watch(ledger, "edits:unmatched", SAMPLES, fixed=15, failed=5)
+    _watch(ledger, "edits:unmatched", CHEAP, fixed=15, failed=5)
+
+    advice = ledger.advice("edits:unmatched", SAMPLES, RUNGS)
+
+    assert advice.rung == CHEAP and "cheaper" in advice.reason
+
+
+def test_two_lucky_successes_do_not_outrank_forty_observed_ones(tmp_path):
+    from hermes.ledger import wilson
+    ledger = _ledger(tmp_path)
+    _watch(ledger, "gates:tests", SAMPLES, fixed=30, failed=10)
+    _watch(ledger, "gates:tests", REASONING, fixed=2, failed=0)
+
+    assert wilson(2, 2) < wilson(30, 40)
+    assert ledger.advice("gates:tests", SAMPLES, RUNGS).rung == SAMPLES
+
+
+def test_one_toolchains_lesson_is_not_applied_to_another_once_it_has_its_own(tmp_path):
+    ledger = _ledger(tmp_path)
+    _watch(ledger, "gates:build", REASONING, fixed=20, failed=0, stack="rust")
+    _watch(ledger, "gates:build", SAMPLES, fixed=0, failed=20, stack="rust")
+    _watch(ledger, "gates:build", SAMPLES, fixed=20, failed=0, stack="python")
+    _watch(ledger, "gates:build", REASONING, fixed=0, failed=20, stack="python")
+
+    assert ledger.advice("gates:build", SAMPLES, RUNGS, stack="rust").rung == REASONING
+    assert ledger.advice("gates:build", SAMPLES, RUNGS, stack="python").rung == SAMPLES
+
+
+def test_a_toolchain_nobody_has_measured_borrows_what_the_rest_know(tmp_path):
+    """Thin evidence about this stack is worse than broad evidence about all."""
+    ledger = _ledger(tmp_path)
+    _watch(ledger, "gates:build", SAMPLES, fixed=1, failed=29, stack="python")
+    _watch(ledger, "gates:build", REASONING, fixed=25, failed=5, stack="python")
+    _watch(ledger, "gates:build", SAMPLES, fixed=0, failed=1, stack="haskell")
+
+    assert ledger.advice("gates:build", SAMPLES, RUNGS, stack="haskell").rung == REASONING
+
+
+def test_a_ticket_the_run_gave_up_on_counts_neither_way(tmp_path):
+    """Triage sending a ticket to be decomposed says nothing about the rung."""
+    from hermes.ledger import ABANDONED
+    ledger = _ledger(tmp_path)
+    _watch(ledger, "gates:build", SAMPLES, fixed=10, failed=0)
+    for _ in range(50):
+        ledger.record("gates:build", SAMPLES, ABANDONED)
+
+    evidence = {row.rung: row for row in ledger.evidence("gates:build")}
+
+    assert evidence[SAMPLES].tried == 10 and evidence[SAMPLES].rate == 1.0
+
+
+def test_a_ledger_that_cannot_be_opened_does_not_stop_the_factory(tmp_path):
+    from hermes.ledger import Ledger
+    blocked = tmp_path / "file"
+    blocked.write_text("not a directory")
+
+    ledger = Ledger(blocked / "factory.db")
+
+    assert not ledger.ok
+    ledger.record("gates:build", SAMPLES, "fixed")       # silent, not fatal
+    assert ledger.advice("gates:build", SAMPLES, RUNGS).rung == SAMPLES
+
+
+def test_the_failure_signature_names_the_class_and_not_the_text(tmp_path):
+    from hermes.implement import Change, signature_of
+    from hermes.verify import Gate, Verification
+
+    def failing(*names, detail):
+        return Verification(gates=[Gate(name=n, passed=False, detail=detail)
+                                   for n in names])
+
+    first = signature_of(failing("build", detail="error: undefined ref to foo"))
+    second = signature_of(failing("build", detail="error: undefined ref to bar"))
+
+    assert first == second == "gates:build"
+    assert signature_of(failing("tests", "build", detail="x")) == "gates:build+tests"
+    assert signature_of(change=Change(unmatched=["nope"])) == "edits:unmatched"
+    assert signature_of(failing("build", detail="x"),
+                        prefix="regression") == "regression:build"
+    # A ticket's own validation gate is named for the ticket. Carried into the
+    # signature, every ticket would be its own failure class and the ledger
+    # would never see one twice.
+    assert signature_of(failing("ticket:T-12", detail="x")) == "gates:ticket"
+
+
+def _always_fails(tmp_path, ledger, state=None, ladder=None):
+    """Run one ticket whose gates never pass, recording every attempt."""
+    sandbox, board, ticket, built = _escalating_ticket(tmp_path)
+    asked: list[tuple[str, int]] = []
+
+    def writer(role):
+        def reply(prompt):
+            asked.append((role, prompt.count("--- src/mod")))
+            return {"summary": "carry the value",
+                    "files": [{"path": "src/a.py", "content": "value = 'bad'\n"}]}
+        return reply
+
+    agents = {"implementer": _agent(writer("implementer")),
+              "tester": _agent(writer("implementer")),
+              "architect": _agent(writer("architect"), task="architecture",
+                                  name="architect"),
+              "reviewer": _agent(lambda _p: {"approved": True, "advisory": [],
+                                             "security": [], "blocking": []}),
+              "triager": _agent(lambda _p: {"diagnosis": "wrong value",
+                                            "classification": "implementation",
+                                            "action": "repair", "instructions": ""})}
+    outcome = execute_ticket(agents, sandbox, state or built, board, ticket,
+                             lambda: "src/a.py", max_attempts=3,
+                             ladder=ladder or Ladder.from_config(Config(DEFAULTS)),
+                             ledger=ledger, project="carrier")
+    return outcome, asked
+
+
+def test_running_a_ticket_leaves_the_factory_something_to_learn_from(tmp_path):
+    ledger = _ledger(tmp_path)
+
+    outcome, asked = _always_fails(tmp_path, ledger)
+
+    assert outcome["status"] == "failed"
+    stats = ledger.stats()
+    # Three attempts, though five model calls: the ledger measures the ask,
+    # and racing two samples is one ask that happens to cost two.
+    assert stats["attempts"] == 3 and len(asked) == 5 and stats["projects"] == 1
+    # The first try is recorded against no failure, because it repairs none;
+    # the two after it are recorded against the one they were handed.
+    assert sum(row.tried for row in ledger.evidence("gates:ticket")) == 2
+    assert ledger.evidence("")[0].tried == 1
+
+
+def test_the_toolchain_is_recorded_with_the_attempt(tmp_path):
+    ledger = _ledger(tmp_path)
+    state = State(idea="carry a value",
+                  spec={"technologies": ["Python 3.11", "pytest"]},
+                  plan={"commands": {"build": "true", "test": "true"}})
+
+    _always_fails(tmp_path, ledger, state=state)
+
+    assert ledger.evidence("gates:ticket", stack="python")
+
+
+def test_a_rung_the_ledger_trusts_replaces_the_one_the_ladder_named(tmp_path):
+    """The point of all of it: past projects change what this one tries next."""
+    ledger = _ledger(tmp_path)
+    # Twenty tickets' worth of evidence that racing a second sample does not
+    # fix this failure and that the reasoning role does.
+    _watch(ledger, "gates:ticket", (2, 10, ""), fixed=1, failed=19)
+    _watch(ledger, "gates:ticket", (2, 10, "architect"), fixed=18, failed=2)
+
+    _, asked = _always_fails(tmp_path, ledger)
+
+    # Attempt two would have been the implementer racing two samples; the
+    # ledger sends it straight to the role that has actually been repairing
+    # this, and attempt three stays there.
+    assert [role for role, _ in asked][:1] == ["implementer"]
+    assert set(role for role, _ in asked[1:]) == {"architect"}
+
+
+def test_learning_stays_off_when_the_configuration_says_so(tmp_path):
+    from hermes.ledger import NullLedger, open_ledger
+
+    config = Config(deep_merge(DEFAULTS, {"execution": {"ledger": False}}))
+
+    assert isinstance(open_ledger(config), NullLedger)
+    assert not open_ledger(config).stats()["available"]

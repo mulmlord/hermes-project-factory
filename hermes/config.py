@@ -121,6 +121,12 @@ DEFAULTS: dict[str, Any] = {
             {"candidates": 2, "files": 10},   # attempt 2: race more, read more
             {"role": "architect"},            # attempt 3: ask the reasoning role
         ],
+        # What the factory remembers about its own retries, across every
+        # project it has ever built: which rung actually rescued which kind
+        # of failure. Advisory -- with no evidence the fixed ladder above
+        # decides, exactly as it did before this existed. See hermes.ledger.
+        "ledger": True,
+        "ledger_path": "",      # blank uses $XDG_STATE_HOME/hermes/factory.db
         "edit_protocol": True,  # let agents patch a file instead of rewriting it
         "prefetch": True,       # generate the next ticket while this one verifies
         "tool_calls": 6,        # read-only workspace lookups one answer may make

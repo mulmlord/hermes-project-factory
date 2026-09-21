@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import prompts
 from .agents import Prompt, context_block, escalate, file_protocol, ticket_block
+from .ledger import ABANDONED, FAILED, FIXED, NullLedger
 from .log import Logger, NULL, scope
 from .sandbox import Sandbox, SandboxError
 from .tools import Lookup, Toolbox
@@ -28,6 +31,11 @@ class Rung:
     candidates: int = 1
     files: int = 6
     role: str = ""
+
+    @property
+    def spec(self) -> tuple[int, int, str]:
+        """This rung as the ledger stores it. See :mod:`hermes.ledger`."""
+        return (self.candidates, self.files, self.role)
 
     def harder(self, spec: dict) -> "Rung":
         """This rung with whatever *spec* names overridden, nothing else."""
@@ -332,9 +340,45 @@ def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
     return lookup.ask(**extra)
 
 
+def signature_of(verification: Verification | None = None,
+                 change: "Change | None" = None, *, prefix: str = "gates") -> str:
+    """Name the failure an attempt is handing to the next one.
+
+    A signature is a class of failure, not an instance of one: the ledger
+    learns which retry rescues "the build broke", and no two build failures
+    share their text. So it is the failing gates, in a fixed order, and never
+    their output.
+
+    Gate names are cut at their first colon for the same reason. A ticket's
+    own validation gate is named for the ticket, and a signature carrying
+    ``T-12`` in it is a signature that matches exactly one ticket in one
+    project -- the ledger would fill with rows and never see the same failure
+    twice.
+    """
+    if change is not None and change.empty:
+        return "edits:unmatched" if change.unmatched else "output:empty"
+    gates = sorted({gate.name.split(":", 1)[0]
+                    for gate in verification.failures}) if verification else []
+    return f"{prefix}:{'+'.join(gates[:3])}" if gates else f"{prefix}:unknown"
+
+
+def _stack(state) -> str:
+    """The project's primary toolchain, as the ledger buckets it.
+
+    A repair is shaped by its toolchain -- a failing C++ link and a failing
+    pytest import are not the same problem in different words -- so what the
+    planner named first is kept alongside each attempt.
+    """
+    technologies = (state.spec or {}).get("technologies") or []
+    if isinstance(technologies, str):
+        technologies = [technologies]
+    first = str(technologies[0]).lower() if technologies else ""
+    return (match.group(0) if (match := re.match(r"[a-z+#.]+", first)) else "")[:40]
+
+
 def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
                    *, journal=None, max_attempts: int = 3,
-                   ladder: Ladder | None = None,
+                   ladder: Ladder | None = None, ledger=None, project: str = "",
                    allow_edits: bool = True, prefetched: dict | None = None,
                    tool_calls: int = 6, tool_rounds: int = 3,
                    classifier=None, on_apply=None, log: Logger = NULL) -> dict:
@@ -346,11 +390,19 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
     *ladder* says how each attempt is asked; without one every attempt is the
     cheapest ask, which is what the loop did before escalation existed.
 
+    *ledger* is where those asks are remembered and, once the same failure has
+    been watched often enough, where the next one is chosen from instead. It
+    is advisory in both directions: without one the ladder decides alone, and
+    with one it still decides everything the ledger has no evidence about.
+    See :mod:`hermes.ledger`.
+
     *tool_calls* and *tool_rounds* bound the workspace lookups each generation
     and each review may make. Every one of them is a fresh toolbox: the budget
     is what one answer may spend, not what the ticket may.
     """
     ladder = ladder or Ladder()
+    ledger = ledger or NullLedger()
+    stack = _stack(state)
     def toolbox() -> Toolbox:
         return Toolbox(sandbox, budget=tool_calls, rounds=tool_rounds, log=log)
 
@@ -366,6 +418,11 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
     ) if journal else ""
     hints = journal.suggested_files(ticket, board) if journal else []
     instructions, failure = "", ""
+    #: The class of failure the next attempt is being handed, which is what
+    #: the ledger keys its record on. Empty on the first attempt: nothing has
+    #: gone wrong yet, and a first try is the base rate the rest is judged
+    #: against rather than a repair of anything.
+    signature = ""
     last_verification: Verification | None = None
     last_change: Change | None = None
     notified = False
@@ -396,6 +453,26 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
         with scope(ticket=ticket.id, attempt=attempt):
             ticket.attempts += 1
             rung = ladder.rung(attempt)
+            # What the ladder would do, unless this exact failure has been
+            # watched often enough to know something better -- or something
+            # equally good for fewer model calls.
+            advice = ledger.advice(signature, rung.spec,
+                                   [r.spec for r in ladder.rungs], stack=stack)
+            if advice.learned:
+                rung = Rung(*advice.rung)
+                log.info("ticket.rung_learned", signature=signature,
+                         reason=advice.reason, confidence=round(advice.confidence, 2),
+                         observations=advice.tried, candidates=rung.candidates,
+                         files=rung.files, role=rung.role or "default")
+            started = time.time()
+
+            def learned(outcome: str, following: str = "", _rung=rung,
+                        _attempt=attempt, _signature=signature) -> None:
+                """Tell the ledger how this rung fared against this failure."""
+                ledger.record(_signature, _rung.spec, outcome, project=project,
+                              stack=stack, kind=ticket.kind, attempt=_attempt,
+                              following=following, seconds=time.time() - started)
+
             log.info("ticket.attempt", title=ticket.title[:60],
                      candidates=rung.candidates, files=rung.files,
                      role=rung.role or "default")
@@ -406,6 +483,8 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
                                 toolbox=toolbox, log=log)
             if not payloads:
                 failure = "the implementer produced no usable output"
+                signature = "output:none"
+                learned(FAILED, signature)
                 continue
 
             # A review-driven retry is free to touch files the passing attempt never
@@ -423,6 +502,8 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
                 failure = ("\n".join(change.unmatched) if change and change.unmatched
                            else "no files were written; you must return complete "
                                 "file contents")
+                signature = signature_of(change=change) if change else "output:empty"
+                learned(FAILED, signature)
                 continue
             last_verification = verification
             if any(g.name == "tests" and g.passed and not g.skipped
@@ -437,12 +518,18 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
                     for note in verdict.get("advisory", [])[:3]:
                         ticket.notes.append(f"advisory: {note}")
                     board.save()
+                    learned(FIXED)
                     return {"status": "completed", "verification": verification,
                             "change": change, "review": verdict}
                 instructions = "Address these review findings:\n" + "\n".join(
                     f"- {b}" for b in verdict["blocking"])
                 failure = ""
                 gates_held = True
+                # The gates passed, so what is being repaired from here is a
+                # reviewer's objection and not a broken build: a different
+                # failure, asked of a different attempt, and kept apart.
+                signature = "review:blocking"
+                learned(FAILED, signature)
                 continue
 
             if guard is not None:
@@ -467,18 +554,25 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
                 if change.unmatched:
                     failure += ("\n\nEDITS THAT DID NOT APPLY:\n"
                                 + "\n".join(change.unmatched))
+                signature = signature_of(verification, prefix="regression")
+                learned(FAILED, signature)
                 continue
 
             diagnosis = triage(agents, ticket, verification,
                                context_block(state, tree_fn()), attempt, log=log)
             action = diagnosis.get("action", "repair")
             if action in ("decompose", "reconsider", "research", "rollback"):
+                # The run stopped asking, which says nothing about the rung:
+                # recorded so the attempt is not lost, counted for nothing.
+                learned(ABANDONED, signature_of(verification))
                 return {"status": "failed", "action": action, "diagnosis": diagnosis,
                         "verification": verification, "change": change}
             instructions = diagnosis.get("instructions", "")
             failure = verification.failure_output()
             if change.unmatched:
                 failure += "\n\nEDITS THAT DID NOT APPLY:\n" + "\n".join(change.unmatched)
+            signature = signature_of(verification)
+            learned(FAILED, signature)
 
     return {"status": "failed", "action": "decompose",
             "diagnosis": {"diagnosis": f"exhausted {max_attempts} attempts",

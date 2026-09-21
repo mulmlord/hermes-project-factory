@@ -24,6 +24,7 @@ from .contextdb import open_db
 from .experiment import Lab
 from .git_ops import GitHub, Issues, Repo
 from .implement import Ladder, generate
+from .ledger import open_ledger
 from .journal import Journal
 from .log import Logger, current_scope, for_workspace, scope
 from .models import Router
@@ -63,6 +64,9 @@ class Factory:
         self.openhands = OpenHands(self.config.get("openhands", {}),
                                    self.config.model_for("coding"), self.log)
         self.ladder = Ladder.from_config(self.config)
+        #: What past projects learned about which retry works. See
+        #: :mod:`hermes.ledger`.
+        self.ledger = open_ledger(self.config, self.log)
         self.classifier = Classifier.from_config(self.config, self.log)
         self.resources = self.governor.snapshot()
         self._pool: ThreadPoolExecutor | None = None

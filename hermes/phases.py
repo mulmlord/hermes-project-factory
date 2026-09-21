@@ -180,6 +180,8 @@ def implementation(factory) -> None:
                 journal=factory.journal,
                 max_attempts=int(factory.config.get("execution.max_ticket_attempts", 3)),
                 ladder=factory.ladder,
+                ledger=factory.ledger,
+                project=factory.state.name,
                 allow_edits=bool(factory.config.get("execution.edit_protocol", True)),
                 prefetched=factory._take_prefetch(ticket),
                 tool_calls=int(factory.config.get("execution.tool_calls", 6)),

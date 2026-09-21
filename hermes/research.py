@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import prompts
 from .agents import Prompt
 from .log import Logger, NULL
 from .sources import as_records
@@ -85,21 +86,8 @@ def investigate(agents, root: Path, topic: str, context: str, *,
     # questions, so it outranks the project context; the tail is kept because
     # the latest rounds are the ones this topic follows from.
     established = plan_prompt.add("established", priority=10, floor=800, tail=True)
-    plan_prompt.add(
-        "instructions",
-        "Step 1 of the Feynman method. Return JSON:\n"
-        "{\n"
-        '  "simple_explanation": "explain the problem as if to a smart person '
-        'outside the field, in 3-5 sentences",\n'
-        '  "what_we_know": ["established facts that need no research"],\n'
-        '  "unknowns": [{"question": "specific answerable question", '
-        '"why_it_matters": "what decision it changes", '
-        '"needs_experiment": true|false}],\n'
-        '  "assumptions_to_challenge": ["assumption that could be wrong"]\n'
-        "}\n"
-        f"List at most {max_unknowns} unknowns, ordered by how much each would "
-        "change the implementation. Skip anything already established.",
-        required=True)
+    plan_prompt.add("instructions", prompts.feynman_unknowns(max_unknowns),
+                    required=True)
     header = "ALREADY ESTABLISHED:\n"
     established.fill(header + record.known(max(0, established.room() - len(header))))
     plan = researcher.ask_json(plan_prompt.render())
@@ -126,30 +114,10 @@ def investigate(agents, root: Path, topic: str, context: str, *,
                 required=True)
         # Retrieved text is the only thing here the model does not already
         # have, so it outranks the project context it was fetched to answer.
-        ask.add("material",
-                ("RETRIEVED SOURCES — this text was fetched for this round. "
-                 "Prefer it over memory, and cite the ones you actually used:\n"
-                 f"{material}" if material else ""), priority=10, floor=1500)
-        ask.add("instructions",
-            ("Answer from the retrieved sources where they cover the question, "
-             "and from what you know where they do not. Say which is which.\n"
-             if material else "Answer from what you actually know.\n")
-            + "Return JSON:\n"
-            "{\n"
-            '  "answer": "the substantive answer, with concrete names, algorithms, '
-            'complexities, formats or numbers where they exist",\n'
-            '  "confidence": "verified|inferred|uncertain",\n'
-            + ('  "sources": ["url or [n] of a retrieved source you actually used"],\n'
-               if material else "")
-            + '  "implications": ["what this means for the implementation"],\n'
-            '  "alternatives": [{"option": "name", "pros": "", "cons": ""}],\n'
-            '  "recommendation": "which alternative to take and why",\n'
-            '  "experiment": "a measurable experiment that would settle this, or '
-            'empty string if none is needed"\n'
-            "}\n"
-            "If you are not sure, say so in confidence rather than inventing "
-            "specifics. An honest 'uncertain' plus an experiment is worth more "
-            "than a confident guess.", required=True)
+        ask.add("material", prompts.retrieved_material(material),
+                priority=10, floor=1500)
+        ask.add("instructions", prompts.feynman_answer(bool(material)),
+                required=True)
         answer = researcher.ask_json(ask.render())
         findings.append({
             "question": question,
@@ -166,19 +134,7 @@ def investigate(agents, root: Path, topic: str, context: str, *,
     close.add("context", context, priority=20, floor=600)
     close.add("topic", f"TOPIC: {topic}", required=True)
     answers = close.add("findings", priority=10, floor=2000)
-    close.add("instructions",
-        "Challenge these findings, then convert them into action. Where two "
-        "findings conflict, say which one wins and why. Return JSON:\n"
-        "{\n"
-        '  "conclusions": ["what we now believe, stated as a decision"],\n'
-        '  "decisions": [{"title": "short decision title", "decision": "what we '
-        'will do", "rationale": "why", "alternatives": "what we rejected and why", '
-        '"consequences": "what this commits us to"}],\n'
-        '  "hypotheses": [{"statement": "testable claim", "test": "how to test it"}],\n'
-        '  "tickets": [{"title": "", "objective": "", "kind": "research|experiment|'
-        'implementation|test|optimization", "acceptance": [""], "validation": [""]}],\n'
-        '  "remaining_unknowns": ["what is still genuinely open"]\n'
-        "}", required=True)
+    close.add("instructions", prompts.feynman_synthesis(), required=True)
     header = "FINDINGS:\n"
     answers.fill(header + json.dumps(findings, indent=2)[
         : max(0, answers.room() - len(header))])
@@ -222,17 +178,7 @@ def _consult(researcher, librarian, topic: str, unknowns: list, context: str,
         f"- {u.get('question') if isinstance(u, dict) else u}" for u in unknowns)
     queries = min(3, librarian.searches_left)
     plan = researcher.ask_json(
-        f"{context}\n\nTOPIC: {topic}\n\nQUESTIONS TO ANSWER:\n{questions}\n\n"
-        f"Write at most {queries} web search queries that would find primary "
-        "sources for these questions: official documentation, a specification "
-        "or RFC, a project's own repository or reference manual, a paper. Write "
-        "search queries, not questions — the terms an expert would type, "
-        "including the exact names of the technologies involved. If you are "
-        "certain a specific URL exists and is publicly reachable, you may list "
-        "it as well. Return JSON:\n"
-        '{"queries": ["search terms"], '
-        '"urls": [{"url": "https://...", "why": "what it should settle"}]}'
-    )
+        prompts.search_queries(context, topic, questions, queries))
     candidates: list[dict] = []
     seen: set[str] = set()
     for query in [q for q in (plan.get("queries") or [])
@@ -259,14 +205,7 @@ def _choose(researcher, candidates: list, topic: str, questions: str, limit: int
     listing = "\n".join(f"[{n}] {hit['title'] or '(no title)'}\n    {hit['url']}"
                         for n, hit in enumerate(candidates, 1))
     picked = researcher.ask_json(
-        f"TOPIC: {topic}\n\nQUESTIONS TO ANSWER:\n{questions}\n\n"
-        f"SEARCH RESULTS:\n{listing}\n\n"
-        f"Choose at most {limit} of these results worth reading in full, best "
-        "first. Prefer primary sources over blog posts and aggregators, and "
-        "skip anything that only restates what another result covers. Refer to "
-        "each by its number. Return JSON:\n"
-        '{"pick": [{"n": 1, "why": "what it should settle"}]}'
-    )
+        prompts.choose_sources(topic, questions, listing, limit))
     wanted: list[dict] = []
     for item in (picked.get("pick") or []):
         number = item.get("n") if isinstance(item, dict) else item
@@ -353,17 +292,8 @@ def _write_notes(root: Path, topic: str, payload: dict) -> None:
 def topics_for(agents, context: str, idea: str, spec: dict, limit: int = 3,
                log: Logger = NULL) -> list[str]:
     """Decide what actually needs researching, or nothing if the path is clear."""
-    result = agents["researcher"].ask_json(
-        f"{context}\n\nPROJECT IDEA: {idea}\n"
-        f"UNKNOWNS RECORDED AT INTAKE: {json.dumps(spec.get('unknowns', []))}\n\n"
-        "Decide what genuinely requires research before implementation can "
-        "start. Research is warranted only when the problem is poorly "
-        "understood, several approaches compete, the best method is uncertain, "
-        "or the reasoning is non-obvious. Routine engineering needs no research."
-        f"\n\nReturn JSON: {{\"needed\": true|false, \"topics\": [\"specific "
-        f"research question\"]}}. At most {limit} topics. Return needed=false "
-        "with an empty list when the implementation path is already clear."
-    )
+    result = agents["researcher"].ask_json(prompts.research_topics(
+        context, idea, json.dumps(spec.get("unknowns", [])), limit))
     if not result.get("needed"):
         log.info("research.skipped", reason="path already clear")
         return []

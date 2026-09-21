@@ -1,7 +1,11 @@
 """The autonomous factory loop.
 
-One object owns the whole lifecycle: intake, research, specification,
-planning, implementation, validation, optimisation, documentation, release.
+:class:`Factory` holds a project: its state, the resources the work runs
+through, the scheduling that decides what happens next, and the recovery that
+keeps a failure from ending the run. The work itself lives in
+:mod:`hermes.phases`, one function per phase, and the loop here drives them
+until the project reaches a terminal state.
+
 It never asks the user anything; every branch resolves to a decision.
 """
 from __future__ import annotations
@@ -12,19 +16,19 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
-from . import workspace
+from . import prompts, workspace
 from .agents import Prompt, build as build_agents, context_block
 from .config import Config
-from .evolve import Evolution, objective_from_spec
-from .experiment import Lab, run_ticket as run_experiment_ticket
+from .experiment import Lab
 from .git_ops import GitHub, Issues, Repo
-from .implement import Change, Ladder, execute_ticket, generate
+from .implement import Ladder, generate
 from .journal import Journal
 from .log import Logger, current_scope, for_workspace, scope
 from .models import Router
 from .openhands import OpenHands
-from .planning import architect, decompose, generate_tickets, intake
-from .research import investigate, topics_for
+from .phases import PHASES
+from .planning import decompose
+from .research import investigate
 from .resources import Governor
 from .sandbox import Sandbox
 from .server import running as server_running
@@ -32,7 +36,6 @@ from .sources import STORE as SOURCE_STORE, Librarian
 from .state import State, checkpoint
 from .tickets import Board
 from .tools import Toolbox
-from .verify import record_evaluation, scan_unsafe, verify_project
 
 
 class Factory:
@@ -132,11 +135,8 @@ class Factory:
         summariser = self.agents["summariser"]
         prompt = Prompt(summariser, log=self.log)
         findings_block = prompt.add("findings", priority=10, floor=2000)
-        prompt.add("instructions",
-                   f"Compress this to at most {limit // 12} words for an architect who "
-                   "must choose a design from it. Keep every decision, constraint, "
-                   "measured number, named technology and rejected alternative. "
-                   'Return JSON: {"findings": ["one finding per entry"]}', required=True)
+        prompt.add("instructions", prompts.compress_findings(limit // 12),
+                   required=True)
         # More findings than one pass can hold is a real possibility late in a
         # long project; the oldest are the ones already folded into the spec,
         # so what is kept here is the tail.
@@ -151,34 +151,7 @@ class Factory:
             return text[:limit]
         return "\n".join(findings)[:limit] or text[:limit]
 
-    # -- phases ----------------------------------------------------------
-    def phase_intake(self) -> None:
-        spec = intake(self.agents, self.state.idea, self.log)
-        self.state.spec = spec
-        self.state.name = spec.get("name", self.state.name)
-        workspace.write_spec(self.root, spec)
-        self.save("intake")
-        self.commit(f"chore: specify {self.state.name}\n\n{spec.get('objective','')[:400]}")
-        nxt = "RESEARCH" if self.config.get("research.enabled", True) else "SPECIFICATION"
-        self.state.transition(nxt, "intake complete")
-
-    def phase_research(self) -> None:
-        topics = topics_for(self.agents, self.context(), self.state.idea,
-                            self.state.spec,
-                            limit=int(self.config.get("research.max_rounds", 3)),
-                            log=self.log)
-        for topic in topics:
-            payload = investigate(
-                self.agents, self.root, topic, self.context(),
-                max_unknowns=int(self.config.get("research.max_unknowns", 6)),
-                log=self.log, librarian=self._librarian())
-            self._record_decisions(payload.get("decisions", []))
-            self._queue_research_tickets(payload.get("tickets", []))
-            self._queue_hypotheses(payload.get("hypotheses", []), topic)
-        self.save("research")
-        self.commit("docs: record research findings and decisions", kind="docs")
-        self.state.transition("SPECIFICATION", f"{len(topics)} research topic(s)")
-
+    # -- research resources ----------------------------------------------
     def _librarian(self) -> Librarian | None:
         """The one fetcher for this run, or None: the network is opt-in.
 
@@ -236,154 +209,7 @@ class Factory:
                 decision.get("decision", ""), decision.get("consequences", ""),
                 decision.get("alternatives", ""))
 
-    def _queue_research_tickets(self, raw: list) -> None:
-        from .planning import _ingest
-        _ingest(self.board, [t for t in raw if isinstance(t, dict)], log=self.log)
-
-    def _queue_hypotheses(self, raw: list, topic: str) -> None:
-        """Turn the round's hypotheses into experiments that will settle them.
-
-        A hypothesis the factory only writes down is a note: it is rendered
-        into `docs/research/`, read by nobody, and the unknown it was meant to
-        close stays open. Queued as tickets they go through the experiment
-        path, and what they measure comes back to the next research round.
-
-        Capped per round, because a round that proposes six claims should not
-        push six measurements ahead of the work they exist to inform. The
-        cheapest and most informative of them is what the board's own scoring
-        picks up first.
-        """
-        if not self.config.get("research.experiments", True):
-            return
-        limit = int(self.config.get("research.experiments_per_round", 2))
-        known = {t.objective for t in self.board.tickets.values()
-                 if t.kind == "experiment"}
-        fresh = []
-        for item in raw:
-            statement = str(item.get("statement", ""))[:300] if isinstance(item, dict) else ""
-            if not statement or statement in known:
-                continue
-            known.add(statement)
-            fresh.append({
-                "title": f"Measure: {statement[:60]}",
-                "objective": statement,
-                "kind": "experiment",
-                "context": f"Hypothesis from research on {topic}.\n"
-                           f"Proposed test: {item.get('test', '(none given)')}",
-                "acceptance": ["the hypothesis is settled by a measurement rather "
-                               "than by assertion",
-                               "the experiment records its result under experiments/"],
-                # Cheap and high information: an experiment exists to change a
-                # decision, and it is worth least once that decision is made.
-                "priority": 2, "cost": 2, "risk": 2, "info_gain": 5,
-            })
-            if len(fresh) >= limit:
-                break
-        if fresh:
-            self._queue_research_tickets(fresh)
-            self.board.save()
-
-    def phase_specification(self) -> None:
-        plan = architect(self.agents, self.state.spec, self.research_summary(), self.log)
-        self.state.plan = plan
-        self._record_decisions(plan.get("decisions", []))
-        workspace.write_plan(self.root, plan, self.board.summary())
-        self.save("specification")
-        self.commit("docs: architecture and build plan", kind="docs")
-        self.state.transition("PLANNING", "architecture chosen")
-
-    def phase_planning(self) -> None:
-        generate_tickets(self.agents, self.board, self.state.spec, self.state.plan,
-                         max_tickets=int(self.config.get("planning.max_tickets", 40)),
-                         log=self.log)
-        self.board.unblock()
-        workspace.write_plan(self.root, self.state.plan, self.board.summary())
-        self.save("planning")
-        self.commit(f"chore: plan {len(self.board.tickets)} tickets")
-        self._publish_board()
-        self.state.transition("IMPLEMENTATION", f"{len(self.board.tickets)} tickets")
-
-    def _publish_board(self) -> None:
-        """Create the repository as soon as there is a board worth watching.
-
-        The issue projection can only act once a remote exists, and the remote
-        used to arrive in phase_release -- by which point every ticket is
-        already closed and there is nothing left to observe. So the repository
-        is created here, where the board first exists, and the code is held
-        back until a ticket has passed its gates: repositories are private by
-        default, and a scaffold nobody has validated is not worth showing.
-        """
-        if not (self.config.get("github.enabled", False)
-                and self.config.get("github.early", True)):
-            return
-        url = self.github.create(
-            self.root, self.config.get("github.name") or self.state.name,
-            (self.state.spec.get("objective") or self.state.idea)[:200])
-        if url:
-            self.state.metrics["github_url"] = url
-
-    def _push_first_green(self) -> None:
-        """Push the code once something has actually passed, and only once."""
-        if not self.config.get("github.enabled", False):
-            return
-        if self.state.metrics.get("github_pushed"):
-            return
-        if not self.state.metrics.get("github_url"):
-            return
-        if self.github.push(self.root):
-            self.state.metrics["github_pushed"] = True
-
-    def phase_implementation(self) -> None:
-        """Execute one ticket per call so the outer loop can checkpoint."""
-        self.board.unblock()
-        ticket = self.board.next_ticket()
-        if ticket is None:
-            if self.board.by_status("active", "blocked"):
-                self._recover_stalled()
-                return
-            self.state.transition("VALIDATION", "no ready tickets")
-            return
-
-        # Everything below belongs to this ticket, down to the model call that
-        # generated a patch and the command that rejected it.
-        with scope(ticket=ticket.id):
-            if ticket.kind == "experiment":
-                # An experiment is not implemented and reviewed, it is run and
-                # measured, so it takes its own path to the same verdict shape.
-                outcome = self._run_experiment(ticket)
-            elif self.openhands.should_handle(ticket) and self._run_openhands(ticket):
-                return
-            else:
-                outcome = execute_ticket(
-                    self.agents, self.sandbox, self.state, self.board, ticket, self.tree,
-                    journal=self.journal,
-                    max_attempts=int(self.config.get("execution.max_ticket_attempts", 3)),
-                    ladder=self.ladder,
-                    allow_edits=bool(self.config.get("execution.edit_protocol", True)),
-                    prefetched=self._take_prefetch(ticket),
-                    tool_calls=int(self.config.get("execution.tool_calls", 6)),
-                    tool_rounds=int(self.config.get("execution.tool_rounds", 3)),
-                    on_apply=lambda: self._prefetch_next(ticket),
-                    log=self.log)
-
-            if outcome["status"] == "completed":
-                self.board.move(ticket.id, "completed",
-                                outcome.get("note", "all gates passed"))
-                self.state.clear_failure(ticket.id)
-                record_evaluation(self.root, ticket.id, outcome["verification"],
-                                  {"review": outcome.get("review", {})})
-                sha = self.commit(f"{_commit_kind(ticket.kind)}: {ticket.title}\n\n"
-                                  f"Ticket {ticket.id}. {outcome['change'].summary}",
-                                  kind=_commit_kind(ticket.kind))
-                self.journal.record(ticket, outcome, commit=sha or "")
-                self.log.info("ticket.completed",
-                              progress=f"{self.board.progress():.0%}")
-                self._push_first_green()
-            else:
-                self._handle_ticket_failure(ticket, outcome)
-            self.save(f"ticket-{ticket.id}")
-
-    # -- pipelining ------------------------------------------------------
+    # -- scheduling ------------------------------------------------------
     def _prefetch_next(self, current) -> None:
         """Generate the next ticket's code while this one is being verified.
 
@@ -473,54 +299,7 @@ class Factory:
             self._pool = None
         self._prefetch = None
 
-    def _run_experiment(self, ticket) -> dict:
-        """Settle an experiment ticket by measurement instead of implementation.
-
-        Until this existed a ``kind: "experiment"`` ticket was handed to the
-        implementer, which answered acceptance criteria that describe a
-        measurement by writing code that asserts it -- the one thing an
-        experiment must not do.
-        """
-        self.board.move(ticket.id, "active", "running experiment")
-        self.board.save()
-        outcome = run_experiment_ticket(
-            self._lab(), ticket, tree=self.tree(), toolbox=self._toolbox(),
-            version=self.repo.head() if self.repo.available else "")
-        record = outcome["record"]
-        outcome["note"] = f"{record.id}: {record.verdict}"
-        self.log.info("ticket.experiment", experiment=record.id,
-                      verdict=record.verdict, measured=len(record.measurements))
-        return outcome
-
-    def _run_openhands(self, ticket) -> bool:
-        self.board.move(ticket.id, "active", "delegated to OpenHands")
-        self.board.save()
-        result = self.openhands.run_ticket(self.root, ticket, self.context())
-        if not result["ok"]:
-            self.board.move(ticket.id, "ready", "OpenHands failed; native agent will retry")
-            self.board.save()
-            return False
-        from .verify import verify_ticket
-        verification = verify_ticket(self.sandbox, ticket, self.state.plan, [], self.log)
-        if verification.passed:
-            self.board.move(ticket.id, "completed", "OpenHands + gates passed")
-            sha = self.commit(f"{_commit_kind(ticket.kind)}: {ticket.title}\n\n"
-                              f"Ticket {ticket.id}, implemented via OpenHands.",
-                              kind=_commit_kind(ticket.kind))
-            # OpenHands edits the workspace itself, so the commit is the only
-            # record of which files it actually touched.
-            self.journal.record(
-                ticket,
-                {"status": "completed", "verification": verification,
-                 "change": Change(summary="implemented by the OpenHands agent",
-                                  written=self.repo.files_in())},
-                commit=sha or "")
-            self.save(f"ticket-{ticket.id}")
-            return True
-        self.board.move(ticket.id, "ready", "OpenHands output failed gates")
-        self.board.save()
-        return False
-
+    # -- failure recovery -------------------------------------------------
     def _handle_ticket_failure(self, ticket, outcome: dict) -> None:
         action = outcome.get("action", "repair")
         diagnosis = outcome.get("diagnosis", {})
@@ -593,158 +372,7 @@ class Factory:
             self.state.transition("VALIDATION", "board drained")
         self.board.save()
 
-    def phase_validation(self) -> None:
-        verification = verify_project(self.sandbox, self.state.plan, log=self.log)
-        record_evaluation(self.root, "project-validation", verification)
-        self.log.info("validation", passed=verification.passed,
-                      gates=len(verification.gates))
-        if verification.passed:
-            objective = objective_from_spec(self.state.spec, self.state.plan)
-            if objective and self.config.get("evolution.enabled", True):
-                self.state.transition("OPTIMIZATION", "measurable objective present")
-            else:
-                self.state.transition("DOCUMENTATION", "validation passed")
-            return
-        self._repair_from_validation(verification)
-
-    def _repair_from_validation(self, verification) -> None:
-        count = self.state.record_failure("validation")
-        if count > 4:
-            self.state.transition("DOCUMENTATION",
-                                  "validation still failing; documenting known defects")
-            self.state.notes.append(
-                "Validation did not converge. Known defects:\n" + verification.report())
-            return
-        fix = self.agents["triager"].ask_json(
-            f"{self.context()}\n\nPROJECT VALIDATION FAILED:\n{verification.report()}\n\n"
-            f"OUTPUT:\n{verification.failure_output()}\n\n"
-            "Create repair tickets. Return JSON:\n"
-            '{"tickets": [{"key": "", "title": "", "objective": "", "context": "", '
-            '"kind": "implementation", "acceptance": [""], "validation": [""], '
-            '"artifacts": [""], "priority": 1, "risk": 2, "cost": 2, "info_gain": 1}]}'
-        )
-        from .planning import _ingest
-        created = _ingest(self.board, fix.get("tickets") or [], log=self.log)
-        if not created:
-            self.board.add(title="Fix failing project validation", priority=1,
-                           objective="Make the build and test suite pass.",
-                           context=verification.failure_output(3000),
-                           acceptance=["build succeeds", "all tests pass"],
-                           validation=[(self.state.plan.get("commands") or {}).get("test", "true")],
-                           status="ready")
-            self.board.save()
-        self.state.transition("IMPLEMENTATION", f"validation repair round {count}")
-
-    def phase_optimization(self) -> None:
-        objective = objective_from_spec(self.state.spec, self.state.plan)
-        if objective is None:
-            self.state.transition("DOCUMENTATION", "no measurable objective")
-            return
-        targets = self._evolution_targets()
-        if not targets:
-            self.state.transition("DOCUMENTATION", "no optimisation targets found")
-            return
-        engine = Evolution(self.sandbox, self.agents, self.state, objective, targets,
-                           self.config.get("evolution", {}), self.log,
-                           governor=self.governor)
-        best = engine.run(
-            max_generations=int(self.config.get("evolution.max_generations", 20)),
-            patience=int(self.config.get("evolution.patience", 5)))
-        if best:
-            self.state.metrics["optimization"] = {
-                "metric": objective.metric, "direction": objective.direction,
-                "baseline": engine.history[0].score, "best": best.score,
-                "generations": len(engine.history),
-            }
-            (self.root / "docs" / "generated" / "optimization.md").write_text(
-                f"# Optimisation report\n\n```\n{engine.report()}\n```\n")
-            self.commit(f"perf: evolve {objective.metric} to {best.score}", kind="perf")
-        self.save("optimization")
-        self.state.transition("VALIDATION" if best and best.generation else "DOCUMENTATION",
-                              "evolution finished")
-
-    def _evolution_targets(self) -> list[str]:
-        """Source files that actually influence the benchmark."""
-        result = self.agents["architect"].ask_json(
-            f"{self.context()}\n\n"
-            f"BENCHMARK COMMAND: {(self.state.plan.get('commands') or {}).get('benchmark')}\n\n"
-            "Which existing source files dominate this benchmark's cost? Return "
-            'JSON: {"files": ["src/path.ext"]} with at most 4 files that exist in '
-            "the file listing above. Exclude tests and benchmark harnesses."
-        )
-        return [f for f in (result.get("files") or [])
-                if isinstance(f, str) and (self.root / f).is_file()][:4]
-
-    def phase_documentation(self) -> None:
-        from .docs import write_all
-        write_all(self.agents, self.sandbox, self.state, self.board, self.log)
-        self.save("documentation")
-        self.commit("docs: generate README and project documentation", kind="docs")
-        self.state.transition("RELEASE", "documentation generated")
-
-    def phase_release(self) -> None:
-        from .release import validate_clean_room
-        verification, report = validate_clean_room(self.sandbox, self.state, self.log)
-        record_evaluation(self.root, "release-validation", verification)
-        (self.root / "docs" / "generated" / "release-validation.md").write_text(report)
-        criteria = self.completion_criteria(verification)
-        self.save("release")
-        if all(criteria.values()):
-            version = "v0.1.0"
-            self.commit("chore: release validation passed", kind="chore")
-            if self.repo.available:
-                self.repo.tag(version, f"{self.state.name} {version}")
-            url = self.github.create_and_push(
-                self.root, self.config.get("github.name") or self.state.name,
-                (self.state.spec.get("objective") or self.state.idea)[:200])
-            if url:
-                self.state.metrics["github_url"] = url
-                self.github.release(self.root, version, f"{self.state.name} {version}",
-                                    (self.root / "README.md").read_text()[:5000])
-            self.state.metrics["completion"] = criteria
-            self.state.transition("COMPLETED", "all completion criteria satisfied")
-            return
-        failed = [k for k, v in criteria.items() if not v]
-        count = self.state.record_failure("release")
-        self.log.warn("release.blocked", failed=", ".join(failed), attempt=count)
-        if count > 2:
-            self.state.metrics["completion"] = criteria
-            self.state.transition("FAILED", f"release criteria unmet: {failed}")
-            return
-        self.state.transition("IMPLEMENTATION", f"release blocked on {failed}")
-
-    def completion_criteria(self, verification) -> dict[str, bool]:
-        """Section 25: completion is more than an empty board."""
-        gates = {g.name: (g.passed or g.skipped) for g in verification.gates}
-        readme = (self.root / "README.md").read_text() if (self.root / "README.md").is_file() else ""
-        outstanding = [t for t in self.board.by_status("ready", "active", "blocked")]
-        critical = [t for t in self.board.by_status("abandoned") if t.priority <= 2]
-        metrics = self.state.metrics.get("optimization")
-        return {
-            "requirements_satisfied": not outstanding,
-            "build_succeeds": gates.get("build", False),
-            "tests_pass": gates.get("tests", False),
-            "integration_tests_pass": gates.get("tests", False),
-            "no_critical_defects": not critical,
-            "performance_satisfied": metrics is None or metrics.get("best") is not None,
-            "documentation_exists": len(readme) > 400 and "## " in readme,
-            "reproducible": gates.get("clean-room", False),
-            "secure": not scan_unsafe(self.root),
-        }
-
     # -- driver ----------------------------------------------------------
-    PHASES = {
-        "INTAKE": phase_intake,
-        "RESEARCH": phase_research,
-        "SPECIFICATION": phase_specification,
-        "PLANNING": phase_planning,
-        "IMPLEMENTATION": phase_implementation,
-        "VALIDATION": phase_validation,
-        "OPTIMIZATION": phase_optimization,
-        "DOCUMENTATION": phase_documentation,
-        "RELEASE": phase_release,
-    }
-
     def run(self, max_iterations: int | None = None,
             deadline: float | None = None) -> State:
         """Drive the project to a terminal state without user interaction.
@@ -795,7 +423,7 @@ class Factory:
                 with scope(phase=phase, iteration=self.state.iteration):
                     self.log.info("loop", progress=f"{self.board.progress():.0%}")
                     try:
-                        self.PHASES[phase](self)
+                        PHASES[phase](self)
                     except KeyboardInterrupt:
                         self.log.warn("factory.interrupted")
                         self.save("interrupt")
@@ -829,11 +457,6 @@ class Factory:
         self.state.transition(fallback, f"escalated past failing {phase}")
         self.state.clear_failure(f"phase:{phase}")
 
-
-def _commit_kind(ticket_kind: str) -> str:
-    return {"test": "test", "documentation": "docs", "optimization": "perf",
-            "refactor": "refactor", "research": "docs", "experiment": "chore"}.get(
-        ticket_kind, "feat")
 
 
 def _usage(router: Router) -> dict:

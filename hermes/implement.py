@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import prompts
 from .agents import Prompt, context_block, escalate, file_protocol, ticket_block
 from .log import Logger, NULL, scope
 from .sandbox import Sandbox, SandboxError
@@ -311,19 +312,13 @@ def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
         # the same one the last attempt read, and it argues for the same small
         # patch. Asking a reasoning role to reconsider the approach is the
         # strategy change; the role alone is only who is asked.
-        prompt.add("escalation",
-                   "EARLIER ATTEMPTS AT THIS TICKET FAILED. Do not resend the last "
-                   "approach with small edits: work out why it cannot be made to "
-                   "work, decide how the ticket should be implemented instead, and "
-                   "write that.", priority=15)
+        prompt.add("escalation", prompts.ESCALATION, priority=15)
     if instructions:
         prompt.add("repair", f"REPAIR INSTRUCTIONS:\n{instructions}", priority=10)
     if failure:
         prompt.add("failure", f"PREVIOUS ATTEMPT FAILED:\n{failure}",
                    priority=20, floor=800, tail=True)
-    prompt.add("closing", "Implement this ticket completely. Every file you return "
-               "must be complete and runnable. If the ticket needs tests, write "
-               "real ones.", required=True)
+    prompt.add("closing", prompts.IMPLEMENT, required=True)
     prompt.add("protocol", file_protocol(edits=allow_edits), required=True)
     lookup = Lookup(agent, prompt, toolbox, log=log)
     # Filled last so the room it is given accounts for the repair instructions,

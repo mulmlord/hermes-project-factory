@@ -24,6 +24,7 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from . import prompts
 from .agents import Prompt, context_block
 from .implement import Change
 from .log import Logger, NULL, scope
@@ -287,26 +288,7 @@ class Lab:
                        "Fix the cause; do not resend the same program.",
                        priority=10, floor=800, tail=True)
         prompt.add("instructions",
-            "Build the smallest program that settles this hypothesis by "
-            "measuring it. Requirements:\n"
-            "- self-contained: every file lives in the experiment directory, "
-            "and your command is run from inside that directory\n"
-            "- no network: the sandbox has none\n"
-            "- only the standard library and what the project already depends on\n"
-            "- deterministic: fixed seeds, fixed inputs, so two runs agree\n"
-            f"- finishes well inside {timeout} seconds\n"
-            "- measures the claim rather than asserting it. A program that "
-            "prints what the hypothesis says, without computing it, settles "
-            "nothing and is worse than no experiment.\n\n"
-            + PROTOCOL + "\n\nReturn JSON:\n"
-            "{\n"
-            '  "design": "what is measured, and why that settles the hypothesis",\n'
-            '  "parameters": {"name": value},\n'
-            '  "files": [{"path": "run.py", "content": "<COMPLETE file contents>"}],\n'
-            '  "command": "python3 run.py",\n'
-            '  "supports": "the result that would support the hypothesis",\n'
-            '  "refutes": "the result that would refute it"\n'
-            "}", required=True)
+                   prompts.experiment_design(timeout, PROTOCOL), required=True)
         return Lookup(builder, prompt, toolbox, log=self.log).ask()
 
     def _write(self, directory: str, payload: dict) -> tuple[list[str], list[str]]:
@@ -394,18 +376,7 @@ class Lab:
         program = prompt.add("program", priority=20, floor=800)
         prompt.add("output", "OUTPUT OF THE LAST RUN:\n" + self._tail(record),
                    priority=30, floor=400)
-        prompt.add("instructions",
-            "Judge the hypothesis against this measurement and nothing else. "
-            "If the program does not actually measure the claim, the verdict "
-            "is inconclusive and the finding says why. A refuted hypothesis is "
-            "a good result; do not soften it.\nReturn JSON:\n"
-            "{\n"
-            '  "verdict": "supported|refuted|inconclusive",\n'
-            '  "finding": "what this establishes, with the numbers in it",\n'
-            '  "confidence": "verified|inferred|uncertain",\n'
-            '  "implications": ["what this changes about what gets built"],\n'
-            '  "next": "the action this argues for, or an empty string"\n'
-            "}", required=True)
+        prompt.add("instructions", prompts.EXPERIMENT_VERDICT, required=True)
         header = "THE PROGRAM THAT PRODUCED IT:\n"
         program.fill(header + self._program(record, max(0, program.room() - len(header))))
         verdict = researcher.ask_json(prompt.render())

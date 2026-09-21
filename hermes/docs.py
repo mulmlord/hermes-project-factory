@@ -5,6 +5,7 @@ import json
 import time
 from pathlib import Path
 
+from . import prompts
 from .agents import Prompt, context_block
 from .log import Logger, NULL
 from .sandbox import Sandbox
@@ -78,15 +79,7 @@ def readme(agents, sandbox: Sandbox, state, board, log: Logger = NULL) -> Path:
                  f"build=`{commands.get('build')}` test=`{commands.get('test')}` "
                  f"benchmark=`{commands.get('benchmark')}`", required=True)
     prompt.add("instructions",
-               "Write the project README. Document only what the source above actually "
-               "does; never invent a feature or a flag. Every command must be one a user "
-               "can really run from a clean checkout. Return JSON with a markdown string "
-               "for each key:\n"
-               "{" + ", ".join(f'"{s}": ""' for s in README_SECTIONS) + "}\n"
-               "purpose: 2-3 sentences. features: a bulleted list of what works today. "
-               "architecture: how the pieces fit, with the real file names. examples: at "
-               "least one complete runnable example with its expected output. "
-               "limitations: honest, including anything listed as not implemented.",
+               prompts.readme(", ".join(f'"{s}": ""' for s in README_SECTIONS)),
                required=True)
     # The source outranks everything optional: a README written from the spec
     # instead of the code is exactly the invented documentation this forbids.
@@ -111,11 +104,7 @@ def architecture(agents, sandbox: Sandbox, state, log: Logger = NULL) -> Path:
     prompt.add("context", context_block(state), required=True)
     prompt.add("tree", f"FILES:\n{tree(sandbox.root)}", priority=20, floor=400)
     source = prompt.add("source", priority=10, floor=4000)
-    prompt.add("instructions",
-               "Document the architecture as built. Return JSON:\n"
-               '{"overview": "", "components": [{"name": "", "path": "", '
-               '"responsibility": "", "interfaces": ""}], "data_flow": "", '
-               '"key_decisions": [""], "extension_points": [""]}', required=True)
+    prompt.add("instructions", prompts.ARCHITECTURE_DOC, required=True)
     source.fill("SOURCE:\n" + _source_digest(sandbox, max(0, source.room() - 8)))
     result = documenter.ask_json(prompt.render())
     lines = [f"# Architecture\n", result.get("overview", ""), "", "## Components\n"]

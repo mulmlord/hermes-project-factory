@@ -362,6 +362,33 @@ reaching your inference server, your LAN, or a cloud metadata endpoint.
 A static scan runs over generated sources on every ticket and again at
 release, and it blocks completion regardless of whether the tests pass.
 
+That scan is a pattern list, which means it reads what it was told to look
+for and nothing else. You can put a second opinion behind it: a local text
+classifier that scores each chunk of generated source against a small
+vulnerability taxonomy, for the defects no regex expresses. It is off by
+default, and when on it is advisory — a finding is written into the gate's
+detail, where the reviewer and the triager both read it, and the expensive
+model decides whether it was right. The patterns keep their veto either way,
+and a classifier that is down or unreachable leaves the gate exactly as it
+was.
+
+```yaml
+security:
+  classifier:
+    enabled: true
+    base_url: http://localhost:6768
+    threshold: 0.75      # calibrate the checkpoint before this means anything
+    block: false         # let a finding fail the gate, not merely warn
+```
+
+`contrib/laya_server.py` is a reference adapter serving that endpoint over
+[Laya](https://huggingface.co/convaiinnovations/laya). It is a separate
+process on purpose: the classifier wants torch and Hermes wants no
+dependency beyond PyYAML. Note that an un-tuned checkpoint scores near chance
+on a task it was not trained for — this is worth turning on once you have
+fine-tuned one on labelled vulnerability data and measured its false positive
+rate against your own code, and `block` is worth setting only after that.
+
 ## Commands
 
 | Command | What it does |

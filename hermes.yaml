@@ -56,6 +56,12 @@ evolution:
   population: 3
   baseline_repeats: 3
 
+security:
+  classifier:                      # a second opinion on the security gate,
+    enabled: false                 # advisory unless you set block: true
+    base_url: http://localhost:6768  # contrib/laya_server.py serves this
+    threshold: 0.75
+    block: false
 github:
   enabled: false
   private: true

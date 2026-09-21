@@ -139,8 +139,13 @@ def run_commands(sandbox: Sandbox, commands: list[str], name: str,
     verification.gates.append(Gate(name, True, f"{len(commands)} command(s) ok"))
 
 
-def scan_unsafe(root: Path, paths: list[str] | None = None) -> list[str]:
-    """Static security scan over generated sources. Returns human-readable hits."""
+def _sources(root: Path, paths: list[str] | None = None) -> dict[str, str]:
+    """Generated sources and their text, keyed by the path a hit will name.
+
+    Shared by both scanners so they can never disagree about what counts as
+    project source: a classifier that walked a different tree to the regexes
+    would report findings against files the gate had already excused.
+    """
     root = Path(root)
     targets = ([root / p for p in paths] if paths else
                [p for p in root.rglob("*")
@@ -148,7 +153,7 @@ def scan_unsafe(root: Path, paths: list[str] | None = None) -> list[str]:
                 and not any(part in (".git", ".hermes", "node_modules", ".venv",
                                      "artifacts", "__pycache__")
                             for part in p.parts)])
-    hits = []
+    found: dict[str, str] = {}
     for path in targets:
         if not path.is_file() or path.suffix not in SOURCE_SUFFIXES:
             continue
@@ -156,12 +161,46 @@ def scan_unsafe(root: Path, paths: list[str] | None = None) -> list[str]:
             text = path.read_text(errors="replace")
         except OSError:
             continue
+        rel = path.relative_to(root) if root in path.parents else path
+        found[str(rel)] = text
+    return found
+
+
+def scan_unsafe(root: Path, paths: list[str] | None = None) -> list[str]:
+    """Static security scan over generated sources. Returns human-readable hits."""
+    hits = []
+    for rel, text in _sources(root, paths).items():
         for pattern, description in UNSAFE_PATTERNS:
             for match in re.finditer(pattern, text):
                 line = text[: match.start()].count("\n") + 1
-                rel = path.relative_to(root) if root in path.parents else path
                 hits.append(f"{rel}:{line}: {description}")
     return hits
+
+
+def security_gate(root: Path, paths: list[str] | None = None, *,
+                  classifier=None, clean: str = "no unsafe patterns") -> Gate:
+    """The security gate: patterns that block, plus findings that only warn.
+
+    The pattern list keeps its veto. A classifier is a second opinion on the
+    much larger set of defects no regex expresses, and by default it can only
+    add a line to the detail -- which the reviewer and the triager both read,
+    because both are shown the gate report. That is the point: the cheap model
+    says where to look and the expensive one decides whether it was right.
+
+    ``security.classifier.block`` promotes findings to blocking, for an
+    operator who has tuned a checkpoint against their own code and knows its
+    false positive rate. Until then a guessed defect must not fail a ticket
+    that was correct.
+    """
+    hits = scan_unsafe(root, paths)
+    findings = classifier.scan(_sources(root, paths)) if classifier is not None else []
+    advisories = [f.render() for f in findings]
+    blocking = hits + (advisories if classifier is not None and classifier.cfg.block else [])
+    detail = " | ".join(part for part in (
+        "; ".join(hits[:5]),
+        ("review: " + "; ".join(advisories[:5])) if advisories else "",
+    ) if part) or clean
+    return Gate("security", not blocking, detail)
 
 
 def record_installs(sandbox: Sandbox, plan: dict) -> None:
@@ -180,7 +219,7 @@ def record_installs(sandbox: Sandbox, plan: dict) -> None:
 
 
 def verify_project(sandbox: Sandbox, plan: dict, *, include_benchmark: bool = False,
-                   log: Logger = NULL) -> Verification:
+                   classifier=None, log: Logger = NULL) -> Verification:
     """The full project gate: setup, build, lint, tests, security."""
     commands = plan.get("commands") or {}
     verification = Verification()
@@ -193,15 +232,14 @@ def verify_project(sandbox: Sandbox, plan: dict, *, include_benchmark: bool = Fa
     if include_benchmark and commands.get("benchmark"):
         run_commands(sandbox, [commands["benchmark"]], "benchmark", verification,
                      required=False, log=log)
-    hits = scan_unsafe(sandbox.root)
-    verification.gates.append(
-        Gate("security", not hits, "; ".join(hits[:5]) if hits else "no unsafe patterns"))
+    verification.gates.append(security_gate(sandbox.root, classifier=classifier))
     record_installs(sandbox, plan)
     return verification
 
 
 def verify_ticket(sandbox: Sandbox, ticket, plan: dict, changed: list[str],
-                  log: Logger = NULL, tests_required: bool = True) -> Verification:
+                  log: Logger = NULL, tests_required: bool = True,
+                  classifier=None) -> Verification:
     """Gate a single ticket: its own validation commands plus the project tests.
 
     Early in a project the test suite does not exist yet, so failing it would
@@ -217,9 +255,8 @@ def verify_ticket(sandbox: Sandbox, ticket, plan: dict, changed: list[str],
     run_commands(sandbox, runnable, f"ticket:{ticket.id}", verification, log=log)
     run_commands(sandbox, [commands.get("test", "")], "tests", verification,
                  required=tests_required, log=log)
-    hits = scan_unsafe(sandbox.root, changed)
     verification.gates.append(
-        Gate("security", not hits, "; ".join(hits[:5]) if hits else "clean"))
+        security_gate(sandbox.root, changed, classifier=classifier, clean="clean"))
     record_installs(sandbox, plan)
     return verification
 

@@ -37,7 +37,9 @@ from hermes.sources import Librarian
 from hermes.state import State, StateError, checkpoint, restore
 from hermes.tickets import Board, split_validation
 from hermes.tools import Toolbox
-from hermes.verify import Verification, review, scan_unsafe, verify_project
+from hermes.classify import Classifier, ClassifierConfig, chunks
+from hermes.verify import (Verification, review, scan_unsafe, security_gate,
+                           verify_project)
 from hermes import cli, workspace
 
 
@@ -2143,6 +2145,205 @@ def test_security_scan_flags_real_problems(tmp_path):
     hits = scan_unsafe(tmp_path)
     assert any("bad.py" in h for h in hits)
     assert not any("good.py" in h for h in hits)
+
+
+# -- the classifier second opinion -------------------------------------------
+
+@contextlib.contextmanager
+def _classifier_service(verdict):
+    """A real classification service on loopback, answering the wire contract.
+
+    Real rather than patched for the same reason the librarian's fixture is:
+    the client's job is HTTP, batching and a health probe, and none of that is
+    exercised by a stubbed method.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, code, payload):
+            body = json.dumps(payload).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._send(200, {"ok": True})
+
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(
+                int(self.headers.get("Content-Length") or 0)) or b"{}")
+            served.append(payload)
+            self._send(200, {"results": [
+                dict({"id": item["id"]}, **verdict(item["text"]))
+                for item in payload["items"] if verdict(item["text"])]})
+
+        def log_message(self, *a):
+            pass
+
+    served: list = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", served
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _classifier(url, **over):
+    return Classifier(ClassifierConfig(
+        **dict({"enabled": True, "base_url": url, "threshold": 0.75}, **over)))
+
+
+def _flags(needle, label="sql injection", confidence=0.9, **extra):
+    def verdict(text):
+        if needle not in text:
+            return None
+        return dict({"label": label, "confidence": confidence}, **extra)
+    return verdict
+
+
+def test_chunks_cover_every_line_and_overlap_their_neighbours():
+    """No line may fall between two windows: that line is where the bug is."""
+    text = "\n".join(f"line {n}" for n in range(1, 61))
+    windows = chunks(text, size=100, overlap=2)
+
+    assert len(windows) > 1
+    seen = {line for _, body in windows for line in body.splitlines()}
+    assert seen == set(text.splitlines())
+    assert [start for start, _ in windows] == sorted(start for start, _ in windows)
+    # Each window names the line its text actually starts at.
+    for start, body in windows:
+        assert body.splitlines()[0] == f"line {start}"
+
+
+def test_a_line_longer_than_the_window_does_not_stall_the_walk():
+    """Minified source is still source, and must not loop the chunker."""
+    text = "x = 1\n" + "y" * 5000 + "\nz = 2\n"
+
+    windows = chunks(text, size=100, overlap=2)
+
+    assert any("z = 2" in body for _, body in windows)
+
+
+def test_the_classifier_is_absent_until_it_is_configured():
+    """The gate must cost nothing for an operator who never opted in."""
+    assert Classifier.from_config(Config(deep_merge(DEFAULTS, {}))) is None
+
+
+def test_a_configured_classifier_actually_scans(tmp_path):
+    """Built from config, not from its own dataclass: the flag that says it is
+    on is read once to decide whether to build it, and a classifier that then
+    kept the default would answer nothing while looking configured."""
+    (tmp_path / "app.py").write_text("query = 'SELECT * FROM t WHERE id=' + arg\n")
+
+    with _classifier_service(_flags("SELECT")) as (url, sent):
+        config = Config(deep_merge(DEFAULTS, {"security": {"classifier": {
+            "enabled": True, "base_url": url}}}))
+        gate = security_gate(tmp_path, classifier=Classifier.from_config(config))
+
+    assert sent, "the configured classifier never called the service"
+    assert "sql injection" in gate.detail
+
+
+def test_the_classifier_refuses_a_service_that_is_not_local():
+    """Local-model-only is the whole constraint; a classifier is no exception."""
+    config = Config(deep_merge(DEFAULTS, {"security": {"classifier": {
+        "enabled": True, "base_url": "https://classify.example.com"}}}))
+
+    with pytest.raises(ConfigError, match="local"):
+        Classifier.from_config(config)
+
+
+def test_a_finding_warns_the_reviewer_without_failing_the_ticket(tmp_path):
+    """An un-tuned checkpoint guesses, and a guess must not block good work.
+
+    The finding still has to reach the gate detail, because that is what the
+    reviewer and the triager are shown.
+    """
+    (tmp_path / "app.py").write_text("query = 'SELECT * FROM t WHERE id=' + arg\n")
+
+    with _classifier_service(_flags("SELECT")) as (url, _):
+        gate = security_gate(tmp_path, classifier=_classifier(url))
+
+    assert gate.passed
+    assert "sql injection" in gate.detail
+    assert "unconfirmed" in gate.detail
+
+
+def test_a_finding_blocks_only_when_the_operator_says_so(tmp_path):
+    (tmp_path / "app.py").write_text("query = 'SELECT * FROM t WHERE id=' + arg\n")
+
+    with _classifier_service(_flags("SELECT")) as (url, _):
+        gate = security_gate(tmp_path, classifier=_classifier(url, block=True))
+
+    assert not gate.passed
+
+
+def test_an_unsure_finding_is_dropped_unless_it_asks_for_review(tmp_path):
+    """The threshold is the point of a calibrated score, but 'I don't know'
+    about a possible defect is itself worth showing to the reviewer."""
+    (tmp_path / "app.py").write_text("query = 'SELECT * FROM t WHERE id=' + arg\n")
+
+    with _classifier_service(_flags("SELECT", confidence=0.4)) as (url, _):
+        quiet = security_gate(tmp_path, classifier=_classifier(url))
+    with _classifier_service(
+            _flags("SELECT", confidence=0.4, escalate=True)) as (url, _):
+        raised = security_gate(tmp_path, classifier=_classifier(url))
+
+    assert "sql injection" not in quiet.detail
+    assert "sql injection" in raised.detail
+
+
+def test_a_dead_classifier_leaves_the_gate_exactly_as_it_was(tmp_path):
+    """A security gate that breaks the build when its helper is down is worse
+    than no security gate at all."""
+    (tmp_path / "bad.py").write_text('import os\nos.system("rm " + name)\n')
+    (tmp_path / "fine.py").write_text("x = 1\n")
+
+    # Port 9 discards whatever reaches it, so this is a service that is not there.
+    dead = _classifier("http://127.0.0.1:9", timeout=2)
+    gate = security_gate(tmp_path, classifier=dead)
+
+    assert not gate.passed                       # the patterns still fired
+    assert "bad.py" in gate.detail
+    assert gate.detail == security_gate(tmp_path).detail
+
+
+def test_the_patterns_keep_their_veto_when_the_classifier_sees_nothing(tmp_path):
+    """The second opinion may add findings. It may never excuse one."""
+    (tmp_path / "bad.py").write_text('import os\nos.system("rm " + name)\n')
+
+    with _classifier_service(lambda text: {"label": "safe", "confidence": 0.99}) as (url, _):
+        gate = security_gate(tmp_path, classifier=_classifier(url))
+
+    assert not gate.passed
+
+
+def test_one_defect_is_reported_once_however_many_windows_saw_it(tmp_path):
+    """Windows overlap, so the same finding arrives repeatedly. A gate detail
+    read by a model with a context budget must not spend it on repetition."""
+    body = "\n".join(f"pad_{n} = {n}" for n in range(400))
+    (tmp_path / "app.py").write_text(
+        f"{body}\nquery = 'SELECT * FROM t WHERE id=' + arg\n")
+
+    with _classifier_service(_flags("SELECT")) as (url, sent):
+        gate = security_gate(tmp_path, classifier=_classifier(url))
+
+    assert sum(len(payload["items"]) for payload in sent) > 1   # it was chunked
+    assert gate.detail.count("sql injection") == 1
+
+
+def test_the_scan_is_capped_so_a_large_tree_cannot_run_away(tmp_path):
+    for n in range(40):
+        (tmp_path / f"m{n}.py").write_text("\n".join(f"a_{i} = {i}" for i in range(200)))
+
+    with _classifier_service(lambda text: None) as (url, sent):
+        security_gate(tmp_path, classifier=_classifier(url, max_chunks=25))
+
+    assert sum(len(payload["items"]) for payload in sent) == 25
 
 
 # -- evolution ---------------------------------------------------------------

@@ -133,6 +133,22 @@ DEFAULTS: dict[str, Any] = {
         "max_concurrent_inference": 2,  # 1 stops generation overlapping at all
         "measure_drain_seconds": 120,   # how long a benchmark waits for the GPU to clear
     },
+    "security": {
+        # A second opinion on the security gate, for the defects no regex in
+        # UNSAFE_PATTERNS expresses. Off by default and advisory when on: an
+        # un-tuned checkpoint scores near chance, and a guessed defect that
+        # fails a correct ticket costs more than the miss it prevented.
+        # contrib/laya_server.py serves the endpoint this expects.
+        "classifier": {
+            "enabled": False,
+            "base_url": "http://localhost:6768",
+            "model": "laya",
+            "timeout": 30,
+            "threshold": 0.75,   # calibrate the checkpoint before trusting this
+            "block": False,      # let a finding fail the gate, not just warn
+            "max_chunks": 400,   # windows one scan may classify
+        },
+    },
     "git": {"enabled": True, "author": "Hermes Factory <hermes@localhost>"},
     "github": {
         "enabled": False, "private": True, "owner": None, "name": None,

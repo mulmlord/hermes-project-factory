@@ -16,6 +16,7 @@
 #
 # Usage: ./install.sh [--dev] [--system] [--bin DIR] [--venv DIR]
 #                     [--no-docker-image] [--no-config] [--no-openhands]
+#                     [--classifier] [--classifier-model REPO] [--classifier-port N]
 #                     [--model REPO_OR_NAME] [--model-path DIR] [--models-dir DIR]
 #                     [--port N] [--max-model-len N] [--gpu-util F]
 #                     [--no-server] [--boot] [--force-config]
@@ -27,6 +28,9 @@
 #   --no-docker-image  skip pre-pulling the sandbox image
 #   --no-config        do not write ~/.config/hermes/config.yaml
 #   --no-openhands     skip the optional OpenHands agent layer
+#   --classifier       install the optional security-gate classifier (torch)
+#   --classifier-model REPO  checkpoint it serves (default: a tuned one of yours)
+#   --classifier-port N      port the classifier listens on (default: 6768)
 #   --model REPO       Hugging Face repository to download and serve
 #   --model-path DIR   serve a model directory you already have
 #   --models-dir DIR   where downloaded weights are stored
@@ -42,6 +46,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$REPO/.venv"
 OH_VENV="$REPO/.venv-openhands"
 VLLM_VENV="$REPO/.venv-vllm"
+LAYA_VENV="$REPO/.venv-laya"
 BIN_DIR="$HOME/.local/bin"
 DEV=0
 PULL_IMAGE=1
@@ -61,6 +66,16 @@ MAX_MODEL_LEN=16384
 GPU_UTIL=0.90
 UNIT_NAME="hermes-vllm.service"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+
+# -- security classifier defaults --------------------------------------------
+
+# Off unless asked for. It is a second opinion on the security gate, it costs
+# a torch install, and an un-tuned checkpoint is a source of noise rather than
+# of findings — so nobody gets it by accident.
+CLASSIFIER=0
+CLASSIFIER_PORT=6768
+CLASSIFIER_REPO="convaiinnovations/laya"
+CLASSIFIER_UNIT="hermes-classifier.service"
 
 # A 7B AWQ coder: ~5 GiB of weights, which is what actually fits beside a
 # desktop session on an 8 GiB card. vLLM keeps the whole model resident in
@@ -144,6 +159,9 @@ while [ $# -gt 0 ]; do
     --no-docker-image) PULL_IMAGE=0 ;;
     --no-config)       WRITE_CONFIG=0 ;;
     --no-openhands)    OPENHANDS=0 ;;
+    --classifier)      CLASSIFIER=1 ;;
+    --classifier-model) CLASSIFIER=1; CLASSIFIER_REPO="${2:?--classifier-model needs a repository}"; shift ;;
+    --classifier-port) CLASSIFIER_PORT="${2:?--classifier-port needs a number}"; shift ;;
     --model)           MODEL_REPO="${2:?--model needs a repository or name}"; shift ;;
     --model-path)      MODEL_PATH="${2:?--model-path needs a directory}"; shift ;;
     --models-dir)      MODELS_DIR="${2:?--models-dir needs a directory}"; shift ;;
@@ -153,7 +171,7 @@ while [ $# -gt 0 ]; do
     --no-server)       SERVER=0 ;;
     --boot)            BOOT=1 ;;
     --force-config)    FORCE_CONFIG=1 ;;
-    -h|--help)         sed -n '3,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)         sed -n '3,42p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)                 die "unknown option: $1 (try --help)" ;;
   esac
   shift
@@ -306,6 +324,83 @@ if [ "$OPENHANDS" -eq 1 ]; then
   if command -v openhands >/dev/null 2>&1 || [ -x "$OH_VENV/bin/openhands" ]; then
     note "to use it, set 'enabled: true' under 'openhands' in your hermes.yaml"
   fi
+fi
+
+# -- security classifier -----------------------------------------------------
+
+# A second opinion on the security gate: the pattern list in hermes/verify.py
+# reads what it was told to look for, and a classifier covers some of what no
+# regex expresses. Installed beside Hermes for the same reason vLLM is — it
+# wants torch and transformers, and the factory's own environment has exactly
+# one dependency and should keep it.
+#
+# On CPU by default, deliberately. The coding model has the GPU for the whole
+# run and vLLM pins it; a 400M encoder competing for the same VRAM would cost
+# more than the gate it serves is worth. It classifies a few hundred short
+# chunks after a test suite has already run for minutes.
+if [ "$CLASSIFIER" -eq 1 ]; then
+  note "installing the security-gate classifier"
+  build_classifier() {
+    if command -v uv >/dev/null 2>&1; then
+      uv venv --quiet --python 3.12 "$LAYA_VENV" \
+        && uv pip install --quiet --python "$LAYA_VENV/bin/python" laya
+    else
+      local py=""
+      for candidate in python3.12 python3.11 python3.10; do
+        command -v "$candidate" >/dev/null 2>&1 && { py="$candidate"; break; }
+      done
+      [ -n "$py" ] || return 1
+      "$py" -m venv "$LAYA_VENV" \
+        && "$LAYA_VENV/bin/python" -m pip install --quiet --upgrade pip \
+        && "$LAYA_VENV/bin/python" -m pip install --quiet laya
+    fi
+  }
+  if [ -x "$LAYA_VENV/bin/python" ] \
+     && "$LAYA_VENV/bin/python" -c 'import laya' 2>/dev/null; then
+    note "reusing the classifier environment at $LAYA_VENV"
+  elif spin "installing laya into $LAYA_VENV (torch; a few GB)" build_classifier; then
+    note "installed the classifier into $LAYA_VENV"
+  else
+    warn "could not install the classifier; the security gate keeps its patterns"
+    warn "it needs CPython 3.10-3.12 — install uv (https://docs.astral.sh/uv/) and re-run"
+    CLASSIFIER=0
+  fi
+fi
+
+if [ "$CLASSIFIER" -eq 1 ]; then
+  note "writing the $CLASSIFIER_UNIT user unit"
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT_DIR/$CLASSIFIER_UNIT" <<EOF
+[Unit]
+Description=Hermes Project Factory security classifier (port $CLASSIFIER_PORT)
+After=network-online.target
+
+[Service]
+Type=exec
+# The SDK deadlocks against TensorFlow's abseil init if both get imported.
+Environment=USE_TF=0
+ExecStart=$LAYA_VENV/bin/python $REPO/contrib/laya_server.py \\
+    --model $CLASSIFIER_REPO \\
+    --host 127.0.0.1 --port $CLASSIFIER_PORT \\
+    --device cpu
+Restart=always
+RestartSec=10
+TimeoutStartSec=600
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload || warn "could not reload the user systemd manager"
+  if systemctl --user enable --now "$CLASSIFIER_UNIT" 2>/dev/null; then
+    note "started $CLASSIFIER_UNIT on port $CLASSIFIER_PORT"
+  else
+    warn "could not start $CLASSIFIER_UNIT; start it by hand when you want it"
+  fi
+  note "to use it, set 'enabled: true' under 'security.classifier' in your config"
+  warn "$CLASSIFIER_REPO is not tuned for vulnerability detection: out of the box"
+  warn "it scores near chance and will mostly add noise. Fine-tune a checkpoint"
+  warn "on labelled vulnerability data and pass --classifier-model before you"
+  warn "rely on it, and leave 'block: false' until you have measured it."
 fi
 
 # -- model server ------------------------------------------------------------
@@ -540,6 +635,19 @@ note "checking the local inference server"
 if [ "$SERVER" -eq 1 ] && [ "$BOOT" -eq 0 ] && [ -f "$UNIT_DIR/$UNIT_NAME" ]; then
   note "stopping $UNIT_NAME; Hermes starts it when a project starts"
   systemctl --user stop "$UNIT_NAME" || warn "could not stop $UNIT_NAME"
+fi
+
+if [ "$CLASSIFIER" -eq 1 ]; then
+  cat <<EOF
+
+==> the security classifier runs on CPU as $CLASSIFIER_UNIT, so it never
+    competes with the coding model for VRAM:
+
+    systemctl --user status $CLASSIFIER_UNIT
+    curl -s http://127.0.0.1:$CLASSIFIER_PORT/health
+
+    It does nothing until you set 'enabled: true' under 'security.classifier'.
+EOF
 fi
 
 case ":$PATH:" in

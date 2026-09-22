@@ -15,7 +15,8 @@ MAX_TICKET_FIELDS = 400
 def intake(agents, idea: str, log: Logger = NULL) -> dict:
     """Turn a one-line idea into a formal, self-contained specification."""
     log.info("intake.start", idea=idea[:100])
-    spec = agents["architect"].ask_json(prompts.spec_from_idea(idea))
+    spec = agents["architect"].ask_json(prompts.spec_from_idea(idea),
+                                        schema=prompts.SPEC)
     spec.setdefault("name", slugify(idea))
     spec["name"] = slugify(spec.get("name") or idea)
     log.info("intake.done", name=spec["name"],
@@ -26,8 +27,9 @@ def intake(agents, idea: str, log: Logger = NULL) -> dict:
 def architect(agents, spec: dict, research: str, log: Logger = NULL) -> dict:
     """Choose the architecture and the concrete build/test/benchmark commands."""
     log.info("architecture.start")
-    plan = agents["architect"].ask_json(prompts.system_design(
-        json.dumps(spec, indent=2)[:10000], research))
+    plan = agents["architect"].ask_json(
+        prompts.system_design(json.dumps(spec, indent=2)[:10000], research),
+        schema=prompts.PLAN)
     plan.setdefault("commands", {})
     for key, fallback in (("build", "true"), ("test", "true"), ("setup", "true")):
         if not plan["commands"].get(key):
@@ -42,9 +44,11 @@ def generate_tickets(agents, board: Board, spec: dict, plan: dict, *,
                      max_tickets: int = 40, log: Logger = NULL) -> list[Ticket]:
     """Decompose the plan into an ordered, dependency-aware ticket set."""
     log.info("planning.tickets")
-    result = agents["planner"].ask_json(prompts.ticket_breakdown(
-        json.dumps(spec, indent=2)[:8000], json.dumps(plan, indent=2)[:8000],
-        max_tickets, "|".join(KINDS)))
+    result = agents["planner"].ask_json(
+        prompts.ticket_breakdown(json.dumps(spec, indent=2)[:8000],
+                                 json.dumps(plan, indent=2)[:8000],
+                                 max_tickets, "|".join(KINDS)),
+        schema=prompts.tickets_schema(KINDS))
     return _ingest(board, result.get("tickets") or [], log=log)
 
 
@@ -54,9 +58,10 @@ def decompose(agents, board: Board, ticket: Ticket, reason: str,
     log.info("planning.decompose", ticket=ticket.id, reason=reason[:120])
     fields = ("id", "title", "objective", "context", "acceptance",
               "validation", "artifacts")
-    result = agents["planner"].ask_json(prompts.ticket_split(
-        json.dumps({k: getattr(ticket, k) for k in fields}, indent=2),
-        reason[:4000]))
+    result = agents["planner"].ask_json(
+        prompts.ticket_split(json.dumps({k: getattr(ticket, k) for k in fields},
+                                        indent=2), reason[:4000]),
+        schema=prompts.tickets_schema(KINDS))
     children = _ingest(board, result.get("tickets") or [], parent=ticket,
                        depth=ticket.depth + 1, log=log)
     if children:

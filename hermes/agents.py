@@ -12,6 +12,7 @@ from typing import Any
 from .contextdb import TRUSTED, UNTRUSTED
 from .log import Logger, NULL
 from .models import Allowance, PromptTooLarge, Router
+from .schema import STRING, arr, obj
 
 _PROTOCOL_HEAD = """\
 Return JSON of exactly this shape:
@@ -62,6 +63,34 @@ def file_protocol(edits: bool = True) -> str:
 
 #: The whole-file format, kept as a name for callers that only ever write files.
 FILE_PROTOCOL = file_protocol(edits=False)
+
+_FILE = obj({"path": STRING, "content": STRING}, required=("path", "content"))
+_EDIT = obj({"path": STRING, "find": STRING, "replace": STRING, "symbol": STRING},
+            required=("path", "find", "replace"))
+
+
+def change_schema(edits: bool = True) -> dict:
+    """The shape of a change, matching :func:`file_protocol`.
+
+    ``path`` and ``content`` are required *within* a file rather than at the
+    top: the change itself may legitimately be nothing but a command or a
+    delete, but a file entry missing its body is the one failure that used to
+    cost a whole generation -- the model writes ``{"path": "src/x.py"}`` and
+    means "unchanged", and the applier cannot tell that from a truncation.
+
+    ``summary`` is required because it is what the commit message, the journal
+    and the next ticket's context are all written from.
+    """
+    properties = {
+        "summary": STRING,
+        "files": arr(_FILE),
+        "delete": arr(),
+        "commands": arr(),
+        "dependencies": arr(),
+    }
+    if edits:
+        properties["edits"] = arr(_EDIT)
+    return obj(properties, required=("summary",))
 
 
 @dataclass

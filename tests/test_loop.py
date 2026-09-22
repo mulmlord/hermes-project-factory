@@ -13,6 +13,7 @@ from hermes.config import Config
 from hermes.factory import Factory
 from hermes.journal import Journal
 from hermes.models import Router
+from hermes.schema import check
 
 CALC = '''\
 """Tiny calculator."""
@@ -94,6 +95,7 @@ class StubRouter:
     def __init__(self):
         self.usage = []
         self.calls = []
+        self.asked = []
 
     def describe(self, task):
         return "stub:model"
@@ -114,7 +116,9 @@ class StubRouter:
         return json.dumps(self._answer(prompt))
 
     def complete_json(self, task, system, prompt, **kw):
-        return self._answer(prompt)
+        answer = self._answer(prompt)
+        self.asked.append((prompt[:60], kw.get("schema"), answer))
+        return answer
 
     def _answer(self, prompt):
         self.calls.append(prompt[:60])
@@ -213,6 +217,26 @@ def test_loop_reaches_completed(factory):
     subjects = factory.repo.log_lines(30)
     assert any("feat:" in s for s in subjects), subjects
     assert any("docs:" in s for s in subjects), subjects
+
+
+def test_every_json_request_the_loop_makes_carries_its_shape(factory):
+    """No call site may ask for JSON without saying which JSON.
+
+    The schemas live beside their prompts, but nothing in Python forces a new
+    caller to pass one -- and a caller that forgets gets the weaker
+    ``json_object`` guarantee silently, which is exactly the failure this
+    feature exists to remove. So the whole loop is run and every request it
+    made is inspected: a shape was sent, and a reply of the kind the stub
+    gives satisfies it.
+    """
+    factory.run(max_iterations=40)
+
+    unshaped = [marker for marker, shape, _ in factory.router.asked if not shape]
+    assert not unshaped, unshaped
+
+    wrong = [(marker, faults) for marker, shape, answer in factory.router.asked
+             if (faults := check(shape, answer))]
+    assert not wrong, wrong
 
 
 def test_a_lookup_before_the_code_does_not_derail_the_loop(factory):

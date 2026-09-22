@@ -40,6 +40,7 @@ from typing import Any
 
 from .log import Logger, NULL
 from .sandbox import SandboxError
+from .schema import INTEGER, STRING, any_of, arr, enum, obj
 
 #: What a lookup may name, and the order the protocol lists them in.
 TOOLS = ("read_file", "grep", "list_dir", "recall")
@@ -47,6 +48,18 @@ TOOLS = ("read_file", "grep", "list_dir", "recall")
 #: Keys a model may put its lookups under. The first is what the protocol
 #: asks for; the rest are what models trained on other harnesses reach for.
 REQUEST_KEYS = ("lookup", "lookups", "tool_calls", "tools")
+
+#: The request half of :meth:`Toolbox.protocol`, as a shape. Only ``tool`` is
+#: required: which of the other keys apply depends on which tool it names, and
+#: a lookup missing its path is refused by the toolbox with an explanation the
+#: model gets to read -- which is a better answer than a decoder that cannot
+#: express the request at all.
+LOOKUP_REQUEST = obj(
+    {"lookup": arr(obj({"tool": enum(*TOOLS), "path": STRING, "pattern": STRING,
+                        "query": STRING, "start": INTEGER},
+                       required=("tool",)))},
+    required=("lookup",),
+)
 
 #: Directories a search never walks: version control, build output, installed
 #: packages and the factory's own state. None of them is code the ticket is
@@ -387,7 +400,12 @@ class Lookup:
         """Answer the prompt, serving any lookups asked for along the way."""
         if self.toolbox is None:
             return self.agent.ask_json(self.prompt.render(), **kw)
+        answer = kw.pop("schema", None)
         while True:
+            # Either shape is a valid reply while lookups remain; once they do
+            # not, the protocol has said so and only the answer is.
+            kw["schema"] = (answer if answer is None or self.toolbox.spent
+                            else any_of(answer, LOOKUP_REQUEST))
             payload = self.agent.ask_json(self.prompt.render(), **kw)
             requests = requested(payload)
             if not requests or self.toolbox.spent:

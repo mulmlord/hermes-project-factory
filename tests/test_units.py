@@ -14,7 +14,8 @@ from types import SimpleNamespace
 
 from conftest import needs_docker
 
-from hermes.agents import Prompt, build as build_agents, escalate
+from hermes.agents import (Prompt, build as build_agents, change_schema, escalate,
+                           file_protocol)
 from hermes.config import Config, ConfigError, DEFAULTS, deep_merge, is_local_url
 from hermes.contextdb import UNTRUSTED, ContextDB, open_db, split
 from hermes.anchor import locate
@@ -33,12 +34,12 @@ from hermes.models import (ModelError, PromptTooLarge, Router, extract_json,
 from hermes.openhands import OpenHands
 from hermes.research import ResearchLog, investigate
 from hermes.resources import Governor
-from hermes import harness
+from hermes import harness, prompts, schema
 from hermes.sandbox import Sandbox, SandboxError
 from hermes.sources import Librarian, marker, quarantine
 from hermes.state import State, StateError, checkpoint, restore
 from hermes.tickets import Board, split_validation
-from hermes.tools import Lookup, Quarantined, Toolbox
+from hermes.tools import LOOKUP_REQUEST, Lookup, Quarantined, Toolbox
 from hermes.classify import Classifier, ClassifierConfig, chunks
 from hermes.verify import (Verification, installs, review, scan_unsafe,
                            security_gate, text_gate, verify_project)
@@ -68,6 +69,30 @@ def test_remote_allowed_only_with_explicit_optin(tmp_path):
                     "    base_url: https://inference.example.com/v1\n"
                     "    model: m\n    allow_remote: true\n")
     assert Config.load(path).model_for("coding").model == "m"
+
+
+def test_structured_output_still_reads_the_spelling_it_had_before_schemas(tmp_path):
+    """A config written when this was a boolean is still a correct config.
+
+    ``true`` meant "constrain as hard as you can", which is now ``schema``.
+    Anything unrecognised is refused by name rather than read as truthy: a
+    typo that silently turned the guarantee off would be discovered as a
+    parse failure in the middle of an unattended run.
+    """
+    def level(value):
+        path = tmp_path / f"{value}.yaml"
+        path.write_text("models:\n  default:\n    backend: vllm\n"
+                        "    base_url: http://localhost:6767/v1\n    model: m\n"
+                        f"    structured_output: {value}\n")
+        return Config.load(path).model_for("coding").structured_output
+
+    assert level("true") == "schema"
+    assert level("false") == "off"
+    assert level("schema") == "schema"
+    assert level("json") == "json"
+    assert level("off") == "off"
+    with pytest.raises(ConfigError, match="structured_output"):
+        level("yes-please")
 
 
 def test_deep_merge_keeps_untouched_defaults():
@@ -213,6 +238,10 @@ def refusing_server():
                                 "length of the messages or completion.")
             elif state["refusal"] == "parameter" and "response_format" in payload:
                 self.reply(400, "response_format is not supported by this server")
+            elif (state["refusal"] == "schema"
+                  and payload.get("response_format", {}).get("type") == "json_schema"):
+                # A vLLM older than XGrammar: json_object yes, json_schema no.
+                self.reply(400, "json_schema response_format is not supported")
             else:
                 self.reply(200, None)
 
@@ -244,14 +273,200 @@ def _router_for(server, tmp_path):
     return Router(Config.load(path))
 
 
+def _formats(server) -> list:
+    """What each request asked the server to constrain, in order."""
+    return [r.get("response_format", {}).get("type") for r in server["requests"]]
+
+
+#: The shape the stub server's canned reply actually has. Used where the test
+#: is about the wire format and a shape complaint would add its own retries.
+_OK = schema.obj({"ok": schema.BOOLEAN}, required=("ok",))
+
+
 def test_json_mode_downgrades_instead_of_failing(refusing_server, tmp_path):
     """A server that rejects the JSON parameter must not fail the whole task."""
     refusing_server["refusal"] = "parameter"
     router = _router_for(refusing_server, tmp_path)
 
     assert router.complete_json("coding", "sys", "prompt") == {"ok": True}
-    assert [("response_format" in r) for r in refusing_server["requests"]] == [True, False]
-    assert router.backend("coding").json_mode is False  # and it does not ask again
+    # A call with no schema asks for json_object, so json_object is the rung
+    # that was refused: retrying it on the way down would cost a round trip
+    # to be told the same thing again.
+    assert _formats(refusing_server) == ["json_object", None]
+    assert router.backend("coding").level == "off"  # and it does not ask again
+
+
+def test_every_rung_is_tried_before_the_guarantee_is_given_up(refusing_server,
+                                                              tmp_path):
+    """A server refusing all of it ends up answering, unconstrained."""
+    refusing_server["refusal"] = "parameter"
+    router = _router_for(refusing_server, tmp_path)
+
+    assert router.complete_json("coding", "sys", "prompt",
+                                schema=_OK) == {"ok": True}
+    assert _formats(refusing_server) == ["json_schema", "json_object", None]
+    assert router.backend("coding").level == "off"
+
+
+def test_a_server_that_refuses_schemas_keeps_the_guarantee_it_does_speak(
+        refusing_server, tmp_path):
+    """One refusal costs one rung, not the whole feature.
+
+    A vLLM older than XGrammar answers 400 to json_schema and serves
+    json_object perfectly well. Reading that as "no constrained decoding"
+    would give up free JSON validity for the rest of the run.
+    """
+    refusing_server["refusal"] = "schema"
+    router = _router_for(refusing_server, tmp_path)
+
+    assert router.complete_json("coding", "sys", "prompt",
+                                schema=_OK) == {"ok": True}
+    assert _formats(refusing_server) == ["json_schema", "json_object"]
+    assert router.backend("coding").level == "json"
+
+
+def test_the_schema_reaches_the_server_as_the_shape_asked_for(refusing_server,
+                                                              tmp_path):
+    """The point of the whole change: the shape is sent, not merely described."""
+    router = _router_for(refusing_server, tmp_path)
+    router.complete_json("coding", "sys", "prompt", schema=prompts.TOPICS)
+    sent = refusing_server["requests"][0]["response_format"]
+    assert sent["type"] == "json_schema"
+    assert sent["json_schema"]["schema"]["required"] == ["needed", "topics"]
+    # Never the OpenAI-only flag: it means "every property required, no
+    # others allowed", which is not what any shape here says.
+    assert "strict" not in sent["json_schema"]
+
+
+def test_a_reply_of_the_wrong_shape_is_retried_then_kept(tmp_path, monkeypatch):
+    """A server that ignores the schema still gets one concrete correction.
+
+    And when it will not take the correction, the thin answer is returned
+    anyway: every caller reads its reply with a default, so a missing key
+    costs a field, while raising here would cost the phase.
+    """
+    router = Router(Config.load())
+    replies = ['{"topics": ["a"]}', '{"topics": ["a"]}', '{"topics": ["a"]}']
+    asked = []
+
+    def fake(system, prompt, **kw):
+        asked.append(prompt)
+        return replies.pop(0)
+
+    monkeypatch.setattr(router.backend("research"), "complete", fake)
+    assert router.complete_json("research", "sys", "prompt",
+                                schema=prompts.TOPICS) == {"topics": ["a"]}
+    assert len(asked) == 3
+    assert "'needed'" in asked[1]  # the retry says which key, not just "wrong"
+
+
+# -- the shapes themselves ---------------------------------------------------
+
+#: Every prompt that asks for JSON, beside the shape sent with it. The pairs
+#: are listed here rather than derived, because the thing being tested is
+#: exactly that the two were written to agree.
+SHAPES = [
+    (prompts.spec_from_idea("an idea"), prompts.SPEC),
+    (prompts.system_design("{}", ""), prompts.PLAN),
+    (prompts.ticket_breakdown("{}", "{}", 10, "a|b"), prompts.tickets_schema()),
+    (prompts.ticket_split("{}", "why"), prompts.tickets_schema()),
+    (prompts.repair_tickets("ctx", "report", "out"), prompts.tickets_schema()),
+    (prompts.research_topics("ctx", "idea", "[]", 3), prompts.TOPICS),
+    (prompts.feynman_unknowns(6), prompts.UNKNOWNS),
+    (prompts.quarantined_reading(6), prompts.CLAIMS),
+    (prompts.feynman_answer(True), prompts.answer_schema(True)),
+    (prompts.feynman_answer(False), prompts.answer_schema(False)),
+    (prompts.feynman_synthesis(), prompts.SYNTHESIS),
+    (prompts.search_queries("ctx", "topic", "q", 3), prompts.QUERIES),
+    (prompts.choose_sources("topic", "q", "listing", 3), prompts.PICK),
+    (prompts.compress_findings(500), prompts.FINDINGS),
+    (prompts.REVIEW, prompts.REVIEW_SHAPE),
+    (prompts.TRIAGE, prompts.TRIAGE_SHAPE),
+    (prompts.experiment_design(60, "protocol"), prompts.EXPERIMENT),
+    (prompts.EXPERIMENT_VERDICT, prompts.VERDICT_SHAPE),
+    (prompts.evolution_direction("family"), prompts.PROPOSAL),
+    (prompts.evolution_targets("ctx", "bench"), prompts.TARGETS),
+    (prompts.readme('"purpose": ""'), prompts.readme_schema(["purpose"])),
+    (prompts.ARCHITECTURE_DOC, prompts.ARCHITECTURE_SHAPE),
+    (file_protocol(edits=True), change_schema(edits=True)),
+    (file_protocol(edits=False), change_schema(edits=False)),
+]
+
+
+@pytest.mark.parametrize("text,shape", SHAPES, ids=range(len(SHAPES)))
+def test_every_shape_describes_the_prompt_it_is_sent_with(text, shape):
+    """A schema that has drifted from its prompt is worse than none at all.
+
+    It would constrain the model to a shape the prompt does not ask for and
+    the caller does not read, and the grammar would make that unarguable.
+    So every key in the shape has to be a key the words beside it mention.
+    """
+    for key in _keys(shape):
+        assert f'"{key}"' in text, f"{key!r} is in the shape but not in the prompt"
+
+
+@pytest.mark.parametrize("text,shape", SHAPES, ids=range(len(SHAPES)))
+def test_every_shape_is_satisfied_by_an_empty_object(text, shape):
+    """Required means "the caller cannot work without it", not "please".
+
+    An honest empty answer must fail only on the handful of keys that are
+    genuinely load-bearing, so this pins how wide required is allowed to get.
+    """
+    assert len(schema.check(shape, {}, limit=99)) == len(shape.get("required", []))
+
+
+def _keys(shape) -> set:
+    """Every property name anywhere in *shape*."""
+    found = set()
+    if not isinstance(shape, dict) or not shape:
+        return found
+    found |= set(shape.get("properties", {}))
+    for sub in shape.get("properties", {}).values():
+        found |= _keys(sub)
+    found |= _keys(shape.get("items", {}))
+    for branch in shape.get("anyOf", []):
+        found |= _keys(branch)
+    return found
+
+
+def test_check_names_the_first_thing_a_model_can_act_on():
+    shape = prompts.TRIAGE_SHAPE
+    assert schema.check(shape, {"diagnosis": "d", "classification": "trivial",
+                                "action": "retry"}) == []
+    assert "missing the required key 'action'" in schema.check(
+        shape, {"diagnosis": "d", "classification": "trivial"})[0]
+    # A word outside a closed vocabulary is a branch the factory does not have.
+    assert "should be one of" in schema.check(
+        shape, {"diagnosis": "d", "classification": "trivial",
+                "action": "think about it"})[0]
+
+
+def test_check_reaches_inside_lists_and_objects():
+    shape = prompts.tickets_schema(("implementation", "test"))
+    assert schema.check(shape, {"tickets": [{"title": "t", "objective": "o"}]}) == []
+    faults = schema.check(shape, {"tickets": [{"title": "t", "objective": "o",
+                                               "kind": "vibes"}]})
+    assert "reply.tickets[0].kind" in faults[0]
+    assert "should be a array" in schema.check(shape, {"tickets": "one ticket"})[0]
+
+
+def test_a_boolean_is_not_a_number():
+    """True is an int in Python and in nothing a model is answering about."""
+    shape = schema.obj({"priority": schema.INTEGER})
+    assert schema.check(shape, {"priority": 2}) == []
+    assert schema.check(shape, {"priority": True})
+
+
+def test_either_shape_of_a_tool_using_reply_satisfies_the_union():
+    """An agent holding lookups may answer or may ask, and the grammar
+    must not take the second option away."""
+    union = schema.any_of(prompts.REVIEW_SHAPE, LOOKUP_REQUEST)
+    assert schema.check(union, {"approved": True, "reason": "fine"}) == []
+    assert schema.check(union, {"lookup": [{"tool": "read_file",
+                                            "path": "src/x.py"}]}) == []
+    # Neither: the complaint comes from the nearest branch, not from both.
+    faults = schema.check(union, {"approved": True})
+    assert len(faults) == 1 and "reason" in faults[0]
 
 
 def test_a_context_overflow_is_not_read_as_a_missing_feature(refusing_server, tmp_path):
@@ -265,7 +480,7 @@ def test_a_context_overflow_is_not_read_as_a_missing_feature(refusing_server, tm
 
     with pytest.raises(ModelError, match="maximum context length"):
         router.complete_json("coding", "sys", "prompt")
-    assert router.backend("coding").json_mode is True
+    assert router.backend("coding").level == "schema"
     assert len(refusing_server["requests"]) == 1  # no retry that fails the same way
 
 
@@ -276,7 +491,7 @@ def test_a_server_fault_is_not_mistaken_for_a_missing_feature(monkeypatch):
         ModelError("http://localhost:11434: HTTP 500 out of memory")))
     with pytest.raises(ModelError, match="500"):
         router.complete_json("coding", "sys", "prompt")
-    assert backend.json_mode is True
+    assert backend.level == "schema"
 
 
 def test_only_routed_models_are_preflighted():

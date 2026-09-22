@@ -128,7 +128,7 @@ def investigate(agents, root: Path, topic: str, context: str, *,
                     required=True)
     header = "ALREADY ESTABLISHED:\n"
     established.fill(header + record.known(max(0, established.room() - len(header))))
-    plan = researcher.ask_json(plan_prompt.render())
+    plan = researcher.ask_json(plan_prompt.render(), schema=prompts.UNKNOWNS)
     unknowns = (plan.get("unknowns") or [])[:max_unknowns]
 
     refused_from = len(librarian.refusals) if librarian else 0
@@ -157,7 +157,8 @@ def investigate(agents, root: Path, topic: str, context: str, *,
                 priority=10, floor=1500, trust=UNTRUSTED)
         ask.add("instructions", prompts.feynman_answer(bool(claims)),
                 required=True)
-        answer = researcher.ask_json(ask.render())
+        answer = researcher.ask_json(ask.render(),
+                                     schema=prompts.answer_schema(bool(claims)))
         findings.append({
             "question": question,
             "answer": answer.get("answer", ""),
@@ -177,7 +178,7 @@ def investigate(agents, root: Path, topic: str, context: str, *,
     header = "FINDINGS:\n"
     answers.fill(header + json.dumps(findings, indent=2)[
         : max(0, answers.room() - len(header))])
-    synthesis = researcher.ask_json(close.render())
+    synthesis = researcher.ask_json(close.render(), schema=prompts.SYNTHESIS)
 
     payload = {
         "simple_explanation": plan.get("simple_explanation", ""),
@@ -222,7 +223,8 @@ def _read(researcher, librarian, sources: list, question: str,
                required=True)
     body.fill(prompts.retrieved_material(
         librarian.excerpts(sources, budget=max(1000, body.room() - 1000))))
-    claims = _claims(researcher.ask_json(prompt.render()), sources)
+    claims = _claims(researcher.ask_json(prompt.render(), schema=prompts.CLAIMS),
+                     sources)
     log.info("research.quarantined_read", question=question[:80],
              claims=len(claims), sources=len(sources))
     return claims
@@ -359,7 +361,8 @@ def _consult(researcher, librarian, topic: str, unknowns: list, context: str,
         f"- {u.get('question') if isinstance(u, dict) else u}" for u in unknowns)
     queries = min(3, librarian.searches_left)
     plan = researcher.ask_json(
-        prompts.search_queries(context, topic, questions, queries))
+        prompts.search_queries(context, topic, questions, queries),
+        schema=prompts.QUERIES)
     candidates: list[dict] = []
     seen: set[str] = set()
     for query in [q for q in (plan.get("queries") or [])
@@ -386,7 +389,8 @@ def _choose(researcher, candidates: list, topic: str, questions: str, limit: int
     listing = "\n".join(f"[{n}] {hit['title'] or '(no title)'}\n    {hit['url']}"
                         for n, hit in enumerate(candidates, 1))
     picked = researcher.ask_json(
-        prompts.choose_sources(topic, questions, listing, limit))
+        prompts.choose_sources(topic, questions, listing, limit),
+        schema=prompts.PICK)
     wanted: list[dict] = []
     for item in (picked.get("pick") or []):
         number = item.get("n") if isinstance(item, dict) else item
@@ -479,8 +483,10 @@ def _write_notes(root: Path, topic: str, payload: dict) -> None:
 def topics_for(agents, context: str, idea: str, spec: dict, limit: int = 3,
                log: Logger = NULL) -> list[str]:
     """Decide what actually needs researching, or nothing if the path is clear."""
-    result = agents["researcher"].ask_json(prompts.research_topics(
-        context, idea, json.dumps(spec.get("unknowns", [])), limit))
+    result = agents["researcher"].ask_json(
+        prompts.research_topics(context, idea,
+                                json.dumps(spec.get("unknowns", [])), limit),
+        schema=prompts.TOPICS)
     if not result.get("needed"):
         log.info("research.skipped", reason="path already clear")
         return []

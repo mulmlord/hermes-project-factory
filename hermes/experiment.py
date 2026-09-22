@@ -289,7 +289,8 @@ class Lab:
                        priority=10, floor=800, tail=True)
         prompt.add("instructions",
                    prompts.experiment_design(timeout, PROTOCOL), required=True)
-        return Lookup(builder, prompt, toolbox, log=self.log).ask()
+        return Lookup(builder, prompt, toolbox, log=self.log).ask(
+            schema=prompts.EXPERIMENT)
 
     def _write(self, directory: str, payload: dict) -> tuple[list[str], list[str]]:
         """Write the program inside its own directory, and nowhere else.
@@ -379,7 +380,8 @@ class Lab:
         prompt.add("instructions", prompts.EXPERIMENT_VERDICT, required=True)
         header = "THE PROGRAM THAT PRODUCED IT:\n"
         program.fill(header + self._program(record, max(0, program.room() - len(header))))
-        verdict = researcher.ask_json(prompt.render())
+        verdict = researcher.ask_json(prompt.render(),
+                                      schema=prompts.VERDICT_SHAPE)
         stated = str(verdict.get("verdict", "")).lower().strip()
         record.verdict = (stated if stated in ("supported", "refuted", "inconclusive")
                           else "inconclusive")

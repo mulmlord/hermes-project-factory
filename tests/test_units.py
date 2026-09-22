@@ -4293,9 +4293,14 @@ def test_docker_container_carries_no_host_secrets(shared_tmp, monkeypatch):
         for env in (sandbox.run("env"), sandbox.run("env", network=True)):
             assert env.ok, env.summary()
             assert "leaked" not in env.stdout
-            names = [line.split("=", 1)[0] for line in env.stdout.splitlines()]
-            assert not [n for n in names
-                        if n.endswith(("_TOKEN", "_KEY", "_SECRET", "PASSWORD"))]
+            # By name as well as by value, but only names the host holds: the
+            # image sets its own GPG_KEY, the public key Python releases are
+            # signed with, and that one came from the image, not from us.
+            names = {line.split("=", 1)[0] for line in env.stdout.splitlines()}
+            carried = {n for n in os.environ
+                       if n.endswith(("_TOKEN", "_KEY", "_SECRET", "PASSWORD"))}
+            assert "HERMES_PROBE_TOKEN" in carried
+            assert not names & carried
 
 
 def test_missing_tool_is_installed_and_recorded(shared_tmp):

@@ -5920,3 +5920,230 @@ def test_learning_stays_off_when_the_configuration_says_so(tmp_path):
 
     assert isinstance(open_ledger(config), NullLedger)
     assert not open_ledger(config).stats()["available"]
+
+
+# -- doctor --probe ------------------------------------------------------------
+
+@pytest.fixture
+def probed_server():
+    """A loopback server whose every answer the test decides.
+
+    Speaks both dialects -- ``/v1`` for vLLM and llama.cpp, ``/api`` for
+    ollama -- because the layers under probe are reported in different
+    places by each, and what is being tested is reading those places.
+    """
+    import http.server
+
+    state = {"reply": lambda payload: "{}", "requests": [], "models": None,
+             "props": None, "ps": None}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            body = {"/v1/models": state["models"] or {"data": [{"id": "stub"}]},
+                    "/api/tags": {"models": [{"name": "stub"}]},
+                    "/props": state["props"],
+                    "/api/ps": state["ps"]}.get(self.path)
+            self.send(200 if body is not None else 404, body or {})
+
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            state["requests"].append(payload)
+            reply = state["reply"](payload)
+            if isinstance(reply, tuple):
+                self.send(reply[0], {"error": {"message": reply[1]}})
+            elif self.path == "/api/chat":
+                self.send(200, {"message": {"content": reply}})
+            else:
+                self.send(200, {"choices": [{"message": {"content": reply}}]})
+
+        def send(self, code, body):
+            raw = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    state["url"] = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _probe_backend(server, backend="vllm", context=16384, level="schema"):
+    from hermes.models import BACKENDS
+    from hermes.config import ModelConfig
+    url = server["url"] + ("/v1" if backend != "ollama" else "")
+    return BACKENDS[backend](ModelConfig(role="default", backend=backend, model="stub",
+                                         base_url=url, context=context,
+                                         structured_output=level))
+
+
+def _lookup_asked(payload) -> bool:
+    return "BEFORE YOU ANSWER" in payload["messages"][-1]["content"]
+
+
+def _enforcing(payload):
+    """What a grammar-constrained decoder does: the schema wins over the prompt."""
+    if _lookup_asked(payload):
+        return '{"lookup": [{"tool": "read_file", "path": "src/settings.py"}]}'
+    fmt = payload.get("response_format", {})
+    return ('{"probe": "hermes-schema-held"}' if fmt.get("type") == "json_schema"
+            else '{"status": "ready"}')
+
+
+def _layers(findings) -> dict:
+    return {f.layer: f for f in findings}
+
+
+def test_probe_passes_a_server_that_enforces_the_schema_and_a_model_that_looks(
+        probed_server):
+    from hermes.probe import ANSWER, OK, probe
+    probed_server["reply"] = _enforcing
+    probed_server["models"] = {"data": [{"id": "stub", "max_model_len": 16384}]}
+
+    found = probe(_probe_backend(probed_server))
+
+    assert [f.verdict for f in found] == [OK, OK, OK]
+    assert "16384 of the 16384" in _layers(found)["context"].text
+    assert "enforced" in _layers(found)["schema"].text
+    # The lookup was asked the way a run asks it: under the combined shape.
+    asked = probed_server["requests"][-1]["response_format"]["json_schema"]["schema"]
+    assert asked == schema.any_of(ANSWER, LOOKUP_REQUEST)
+
+
+def test_probe_catches_a_schema_accepted_and_ignored_and_a_model_that_guesses(
+        probed_server):
+    """The two failures no HTTP status would ever reveal."""
+    from hermes.probe import WARN, probe
+    probed_server["reply"] = lambda p: ('{"timeout": 30}' if _lookup_asked(p)
+                                        else '{"status": "ready"}')
+
+    found = _layers(probe(_probe_backend(probed_server)))
+
+    assert found["schema"].verdict == WARN and "ignored" in found["schema"].text
+    assert found["lookup"].verdict == WARN and "without looking" in found["lookup"].text
+    assert "timeout=30" in found["lookup"].text
+
+
+def test_probe_fails_a_config_that_sizes_prompts_past_the_server(probed_server):
+    from hermes.probe import FAIL, OK, context
+    probed_server["models"] = {"data": [{"id": "stub", "max_model_len": 8192}]}
+    over = context(_probe_backend(probed_server, context=16384))
+    assert over.verdict == FAIL and "models.default.context: 8192" in over.text
+
+    # llama.cpp says it on /props instead, and a silent server is unchecked,
+    # never failed: not reporting a window is not having a small one.
+    probed_server["models"] = None
+    probed_server["props"] = {"default_generation_settings": {"n_ctx": 4096}}
+    assert context(_probe_backend(probed_server, "llamacpp", 8192)).verdict == FAIL
+    probed_server["props"] = None
+    unknown = context(_probe_backend(probed_server, "llamacpp", 8192))
+    assert unknown.verdict == OK and "unchecked" in unknown.text
+
+
+def test_probe_walks_down_a_refused_schema_the_way_a_run_would(probed_server):
+    from hermes.probe import OK, WARN, probe
+
+    def refuse(payload):
+        if payload.get("response_format", {}).get("type") == "json_schema":
+            return 400, "json_schema response_format is not supported"
+        return _enforcing(payload)
+
+    probed_server["reply"] = refuse
+    backend = _probe_backend(probed_server)
+    found = probe(backend)
+
+    schema_findings = [f for f in found if f.layer == "schema"]
+    assert [f.verdict for f in schema_findings] == [WARN, OK]
+    assert "structured_output" in schema_findings[0].text
+    assert backend.level == "json"
+    # And the lookup that followed went out at the level that survived.
+    assert probed_server["requests"][-1]["response_format"] == {"type": "json_object"}
+
+
+def test_probe_names_a_lookup_the_toolbox_could_not_run(probed_server):
+    from hermes.probe import WARN, lookup
+    for bad in ('{"lookup": [{"tool": "cat", "path": "src/settings.py"}]}',
+                '{"lookup": [{"tool": "read_file"}]}',
+                # An index tool, offered only where a database exists.
+                '{"lookup": [{"tool": "find_symbol", "name": "TIMEOUT"}]}'):
+        probed_server["reply"] = lambda p, bad=bad: bad
+        found = lookup(_probe_backend(probed_server))
+        assert found.verdict == WARN and "refuses" in found.text, bad
+
+
+def test_probe_stops_at_a_reply_that_is_not_json(probed_server):
+    from hermes.probe import FAIL, probe
+    probed_server["reply"] = lambda p: "Sure! Here is the status you asked for."
+    found = probe(_probe_backend(probed_server))
+    assert _layers(found)["schema"].verdict == FAIL
+    assert "Sure!" in _layers(found)["schema"].text
+    # Asking the lookup question of a server that cannot answer JSON at all
+    # would only report the same fault twice.
+    assert "lookup" not in _layers(found)
+    assert len(probed_server["requests"]) == 1
+
+
+def test_probe_reports_an_ollama_model_spilled_out_of_vram(probed_server):
+    from hermes.probe import OK, WARN, memory
+    backend = _probe_backend(probed_server, "ollama", context=32768)
+    assert memory(backend) is None  # not loaded: nothing to say
+
+    probed_server["ps"] = {"models": [{"name": "stub:latest", "model": "stub:latest",
+                                       "size": 10 << 30, "size_vram": 7 << 30}]}
+    spilled = memory(backend)
+    assert spilled.verdict == WARN and "30%" in spilled.text
+    assert "32768-token context" in spilled.text
+
+    probed_server["ps"]["models"][0]["size_vram"] = 10 << 30
+    assert memory(backend).verdict == OK
+    # vLLM places its weights once and fails loudly when they do not fit.
+    assert memory(_probe_backend(probed_server)) is None
+
+
+def test_ollama_probe_sends_the_schema_where_ollama_reads_it(probed_server):
+    from hermes.probe import SHAPE, shape
+    probed_server["reply"] = lambda p: ('{"probe": "hermes-schema-held"}'
+                                        if isinstance(p.get("format"), dict)
+                                        else '{"status": "ready"}')
+    assert shape(_probe_backend(probed_server, "ollama"))[-1].verdict == "ok"
+    assert probed_server["requests"][-1]["format"] == SHAPE
+
+
+def test_doctor_probes_only_on_request_and_only_a_server_that_answers(
+        probed_server, tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("hermes.server.unit_state", lambda unit, run=None: "inactive")
+    probed_server["reply"] = _enforcing
+    probed_server["models"] = {"data": [{"id": "stub", "max_model_len": 8192}]}
+    config = tmp_path / "hermes.yaml"
+    config.write_text("models:\n  default:\n    backend: vllm\n"
+                      f"    base_url: {probed_server['url']}/v1\n    model: stub\n"
+                      "    context: 8192\n")
+
+    assert cli.cmd_doctor(SimpleNamespace(config=None, probe=False)) == 0
+    assert not probed_server["requests"]
+    capsys.readouterr()
+
+    assert cli.cmd_doctor(SimpleNamespace(config=None, probe=True)) == 0
+    out = capsys.readouterr().out
+    assert "probe     stub schema: enforced" in out
+    # One model behind every role is asked once, not once per role.
+    assert len(probed_server["requests"]) == 2
+
+    config.write_text(config.read_text().replace("8192", "16384"))
+    assert cli.cmd_doctor(SimpleNamespace(config=None, probe=True)) == 1
+    assert "FAIL models.default.context is 16384" in capsys.readouterr().err
+
+    config.write_text("models:\n  default:\n    backend: vllm\n"
+                      "    base_url: http://127.0.0.1:1/v1\n    model: stub\n")
+    assert cli.cmd_doctor(SimpleNamespace(config=None, probe=True)) == 0
+    assert "probe     skipped" in capsys.readouterr().err

@@ -1,12 +1,13 @@
 """Isolated execution of generated code.
 
 Generated code is untrusted. The default runtime is a long-lived Docker
-container with no network, capped CPU/RAM/PIDs and only the project
-workspace mounted. ``runtime: local`` exists for hosts without Docker and
+container with no network, capped CPU/RAM/PIDs, a read-only root with a
+bounded ``/tmp``, and only the project workspace mounted. ``runtime: local`` exists for hosts without Docker and
 is explicitly a weaker guarantee.
 """
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -59,6 +60,12 @@ class Sandbox:
         self.log = log
         self.runtime = cfg.get("runtime", "docker")
         self.workdir = cfg.get("workdir", "/workspace")
+        #: A named OCI runtime -- ``runsc`` (gVisor), ``kata-runtime`` --
+        #: for a kernel boundary a shared-kernel container does not have.
+        #: A name rather than a free list of flags: a list would take
+        #: ``--privileged`` as readily as ``--runtime``, and this knob exists
+        #: only to add isolation.
+        self.oci_runtime = str(cfg.get("oci_runtime") or "")
         self.container: str | None = None
         self.installed: list[str] = []  # tools Hermes had to add for the gates to run
         #: Seconds spent executing generated code. Paired with the router's
@@ -77,23 +84,22 @@ class Sandbox:
         if self.runtime != "docker" or self.container:
             return
         name = f"hermes-{self.root.name}-{uuid.uuid4().hex[:8]}"
-        cmd = [
-            "docker", "run", "-d", "--rm", "--name", name,
-            "--network", "none" if self.cfg.get("network", "none") != "host" else "bridge",
-            "--memory", str(self.cfg.get("memory", "8g")),
-            "--cpus", self._cpu_limit(),
-            "--pids-limit", str(self.cfg.get("pids", 512)),
-            "--cap-drop", "ALL",
-            "--security-opt", "no-new-privileges",
-            "-v", f"{self.root}:{self.workdir}",
-            "-w", self.workdir,
-            *self._user_args(),
-            "-e", "HOME=/tmp", "-e", f"PYTHONPATH={self.workdir}/src",
-            "-e", "PIP_USER=1", "-e", f"PATH={_PATH}",
-            self.cfg.get("image", "python:3.11-slim"),
-            "sleep", "infinity",
-        ]
+        network = "none" if self.cfg.get("network", "none") != "host" else "bridge"
+        cmd = ["docker", "run", "-d", "--rm", "--name", name,
+               *self._confinement(network, self.workdir), "sleep", "infinity"]
         proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0 and self.oci_runtime and self.oci_runtime in proc.stderr:
+            # The hardened runtime is not registered with this engine. Plain
+            # docker is still a container; ``local`` would be no box at all,
+            # so step down one rung, not two, and say which one was lost.
+            refused = self.oci_runtime
+            self.oci_runtime = ""
+            self.fallback = f"docker refused runtime {refused}: {proc.stderr.strip()[:200]}"
+            self.log.warn("sandbox.runtime_refused", runtime=refused,
+                          error=proc.stderr.strip()[:300], using="runc")
+            cmd = ["docker", "run", "-d", "--rm", "--name", name,
+                   *self._confinement(network, self.workdir), "sleep", "infinity"]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
             self._fall_back("sandbox.start_failed", proc.stderr.strip()[:300])
             return
@@ -232,20 +238,45 @@ class Sandbox:
                     "/bin/sh", "-c", command]
         # One-shot container: used when the caller needs network (dependency
         # installs, research fetches) which the long-lived box does not have.
-        return [
-            "docker", "run", "--rm",
-            "--network", "bridge" if network else "none",
-            "--memory", str(self.cfg.get("memory", "8g")),
+        work = self.workdir if not cwd else f"{self.workdir}/{cwd}"
+        return ["docker", "run", "--rm",
+                *self._confinement("bridge" if network else "none", work),
+                "/bin/sh", "-c", command]
+
+    def _confinement(self, network: str, work: str) -> list[str]:
+        """Every ``docker run`` flag that bounds the box, ending in the image.
+
+        One list for the long-lived container and the one-shot box alike, so
+        a limit added to one cannot be forgotten on the other.
+
+        The root filesystem is read-only and ``/tmp`` -- which is ``$HOME``,
+        and so where ``pip install --user`` lands -- is a tmpfs capped at
+        ``sandbox.tmp``. Without that, a write to ``/tmp`` goes to the host's
+        overlay store with no ceiling at all. The tmpfs is ``exec`` because
+        installed console scripts run from it; docker's default is not.
+        tmpfs pages count against ``--memory``, and ``--memory-swap`` equal
+        to it means the cap is RAM rather than RAM plus as much swap again.
+        """
+        memory = str(self.cfg.get("memory", "8g"))
+        flags = [
+            "--network", network,
+            "--memory", memory, "--memory-swap", memory,
             "--cpus", self._cpu_limit(),
             "--pids-limit", str(self.cfg.get("pids", 512)),
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+        ]
+        if self.oci_runtime:
+            flags += ["--runtime", self.oci_runtime]
+        if self.cfg.get("read_only", True):
+            flags += ["--read-only", "--tmpfs",
+                      f"/tmp:rw,exec,nosuid,nodev,mode=1777,size={self.cfg.get('tmp', '2g')}"]
+        return flags + [
             "-v", f"{self.root}:{self.workdir}",
-            "-w", self.workdir if not cwd else f"{self.workdir}/{cwd}",
+            "-w", work,
             *self._user_args(),
             "-e", "HOME=/tmp", "-e", f"PYTHONPATH={self.workdir}/src",
             "-e", "PIP_USER=1", "-e", f"PATH={_PATH}",
             self.cfg.get("image", "python:3.11-slim"),
-            "/bin/sh", "-c", command,
         ]
 
     def _local_env(self) -> dict:
@@ -295,6 +326,20 @@ def _text(value) -> str:
     if value is None:
         return ""
     return value.decode(errors="replace") if isinstance(value, bytes) else str(value)
+
+
+def registered_runtimes() -> set[str] | None:
+    """OCI runtimes the docker engine will accept by name; None if it won't say."""
+    if not shutil.which("docker"):
+        return None
+    proc = subprocess.run(["docker", "info", "--format", "{{json .Runtimes}}"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    try:
+        return set(json.loads(proc.stdout or "{}"))
+    except ValueError:
+        return None
 
 
 def probe_resources() -> dict:

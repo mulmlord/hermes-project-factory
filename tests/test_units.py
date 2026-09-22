@@ -935,6 +935,93 @@ def test_a_cpu_cap_above_the_host_does_not_cost_the_container(tmp_path, monkeypa
     assert Sandbox(tmp_path, {"cpus": 1.5}, NULL)._cpu_limit() == "1.5"
 
 
+def _docker_sandbox(root, monkeypatch, **cfg):
+    """A docker-runtime Sandbox on a host that need not have docker."""
+    monkeypatch.setattr("hermes.sandbox.shutil.which", lambda name: "/usr/bin/" + name)
+    return Sandbox(root, {"runtime": "docker", "timeout": 10, **cfg}, NULL)
+
+
+def test_both_kinds_of_container_are_bounded_the_same_way(tmp_path, monkeypatch):
+    """The long-lived box and the one-shot box used to be two literal lists.
+
+    A limit added to one and not the other is a hole only the rarer path
+    has, so both are now read from one place -- and this pins what it holds.
+    """
+    sandbox = _docker_sandbox(tmp_path, monkeypatch, memory="3g", tmp="256m")
+    started = []
+    monkeypatch.setattr("hermes.sandbox.subprocess.run", lambda argv, **kw: (
+        started.append(argv) or SimpleNamespace(returncode=0, stdout="", stderr="")))
+    monkeypatch.setattr(sandbox, "_workspace_visible", lambda: True)
+    sandbox.start()
+    one_shot = sandbox._docker_argv("true", None, True)
+
+    for argv in (started[0], one_shot):
+        assert "--read-only" in argv
+        tmpfs = argv[argv.index("--tmpfs") + 1]
+        # exec, because pip --user puts console scripts under $HOME=/tmp.
+        assert tmpfs.startswith("/tmp:") and "exec" in tmpfs.split(",")
+        assert "noexec" not in tmpfs and "size=256m" in tmpfs
+        # Swap equal to memory: the cap is 3g, not 3g plus 3g of swap.
+        assert argv[argv.index("--memory") + 1] == "3g"
+        assert argv[argv.index("--memory-swap") + 1] == "3g"
+        assert "--runtime" not in argv          # runc unless asked otherwise
+    assert started[0][started[0].index("--network") + 1] == "none"
+    assert one_shot[one_shot.index("--network") + 1] == "bridge"
+
+
+def test_a_writable_root_is_still_available_when_asked_for(tmp_path, monkeypatch):
+    argv = _docker_sandbox(tmp_path, monkeypatch, read_only=False)._docker_argv(
+        "true", None, False)
+    assert "--read-only" not in argv and "--tmpfs" not in argv
+
+
+def test_an_oci_runtime_is_named_not_spelled_as_flags(tmp_path, monkeypatch):
+    argv = _docker_sandbox(tmp_path, monkeypatch, oci_runtime="runsc")._docker_argv(
+        "true", None, True)
+    assert argv[argv.index("--runtime") + 1] == "runsc"
+    assert argv.index("--runtime") < argv.index("python:3.11-slim")
+
+
+def test_an_unregistered_runtime_steps_down_to_runc_not_to_local(tmp_path, monkeypatch):
+    """Asking for more isolation must never end with none.
+
+    ``local`` runs generated code on the host. Docker without gVisor is
+    less than was asked for, but it is still a box; one rung, not two.
+    """
+    sandbox = _docker_sandbox(tmp_path, monkeypatch, oci_runtime="runsc")
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if "--runtime" in argv:
+            return SimpleNamespace(returncode=125, stdout="", stderr=(
+                "docker: Error response from daemon: unknown or invalid "
+                "runtime name: runsc."))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("hermes.sandbox.subprocess.run", run)
+    monkeypatch.setattr(sandbox, "_workspace_visible", lambda: True)
+    sandbox.start()
+
+    assert sandbox.runtime == "docker" and sandbox.container
+    assert len(calls) == 2 and "--runtime" not in calls[1]
+    assert "--read-only" in calls[1]            # nothing else was given up
+    assert "runsc" in sandbox.fallback
+    # Every later box is started the way the one that worked was.
+    assert "--runtime" not in sandbox._docker_argv("true", None, True)
+
+
+def test_an_unrelated_start_failure_is_not_blamed_on_the_runtime(tmp_path, monkeypatch):
+    sandbox = _docker_sandbox(tmp_path, monkeypatch, oci_runtime="runsc")
+    calls = []
+    monkeypatch.setattr("hermes.sandbox.subprocess.run", lambda argv, **kw: (
+        calls.append(argv) or SimpleNamespace(
+            returncode=125, stdout="", stderr="Unable to find image 'nope:latest'")))
+    sandbox.start()
+    assert len(calls) == 1                      # no retry without runsc
+    assert sandbox.runtime == "local" and "nope" in sandbox.fallback
+
+
 def test_sandbox_strips_secrets_from_local_env(tmp_path):
     sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
     import os
@@ -4161,6 +4248,59 @@ def test_docker_install_gets_network_then_loses_it(shared_tmp):
         assert not sandbox.run(
             "python -c \"import urllib.request as u; u.urlopen('http://example.com', timeout=4)\""
         ).ok
+
+
+def test_docker_root_is_read_only_and_tmp_is_bounded_but_runnable(shared_tmp):
+    """The writable places are the workspace and a capped /tmp, nothing else.
+
+    /var/tmp is world-writable in the image, so it is the write the host
+    user could otherwise make outside the workspace, onto the host's disk.
+    """
+    if not shutil.which("docker"):
+        needs_docker("docker is not installed")
+    sandbox = Sandbox(shared_tmp, {"runtime": "docker", "timeout": 120,
+                                   "image": "python:3.11-slim", "tmp": "64m"})
+    with sandbox:
+        if sandbox.runtime != "docker":
+            needs_docker(f"docker did not run a container: {sandbox.fallback}")
+        assert not sandbox.run("touch /var/tmp/escape").ok
+        assert sandbox.run("touch built.txt").ok
+        assert (shared_tmp / "built.txt").is_file()
+        # A console script installed into $HOME=/tmp has to run from there.
+        assert sandbox.run("mkdir -p /tmp/.local/bin && printf '#!/bin/sh\\necho ran\\n'"
+                           " > /tmp/.local/bin/tool && chmod +x /tmp/.local/bin/tool"
+                           " && tool").stdout.strip() == "ran"
+        size = sandbox.run("df -k /tmp | tail -1").stdout.split()
+        assert int(size[1]) <= 64 * 1024
+        assert not sandbox.run("head -c 80M /dev/zero > /tmp/fill").ok
+
+
+def test_docker_container_carries_no_host_secrets(shared_tmp, monkeypatch):
+    """The sandbox isolates the code; it must not also be handed the key.
+
+    GitHub work happens on the host, so nothing inside ever needs a token.
+    Both the long-lived box and the networked one-shot box are checked.
+    """
+    if not shutil.which("docker"):
+        needs_docker("docker is not installed")
+    monkeypatch.setenv("HERMES_PROBE_TOKEN", "leaked-token-value")
+    monkeypatch.setenv("HERMES_PROBE_API_KEY", "leaked-key-value")
+    sandbox = Sandbox(shared_tmp, {"runtime": "docker", "timeout": 120,
+                                   "image": "python:3.11-slim"})
+    with sandbox:
+        if sandbox.runtime != "docker":
+            needs_docker(f"docker did not run a container: {sandbox.fallback}")
+        for env in (sandbox.run("env"), sandbox.run("env", network=True)):
+            assert env.ok, env.summary()
+            assert "leaked" not in env.stdout
+            # By name as well as by value, but only names the host holds: the
+            # image sets its own GPG_KEY, the public key Python releases are
+            # signed with, and that one came from the image, not from us.
+            names = {line.split("=", 1)[0] for line in env.stdout.splitlines()}
+            carried = {n for n in os.environ
+                       if n.endswith(("_TOKEN", "_KEY", "_SECRET", "PASSWORD"))}
+            assert "HERMES_PROBE_TOKEN" in carried
+            assert not names & carried
 
 
 def test_missing_tool_is_installed_and_recorded(shared_tmp):

@@ -431,9 +431,15 @@ sandbox:
   runtime: docker                    # docker | local
   image: python:3.11-slim
   network: none
-  memory: 8g
+  memory: 8g                         # RAM, and the swap cap too: no swap beyond it
   cpus: 4
   timeout: 900
+  read_only: true                    # root filesystem read-only; writes go to
+                                     # the workspace or to /tmp
+  tmp: 2g                            # size of /tmp ($HOME, where pip --user
+                                     # installs land); counts against memory
+  oci_runtime: ""                    # runsc (gVisor) or kata-runtime for a
+                                     # kernel boundary; blank is docker's runc
 
 research:
   enabled: true

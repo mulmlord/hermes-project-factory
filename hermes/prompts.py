@@ -754,6 +754,27 @@ def evolution_repeat(mutation: str, outcome: str) -> str:
             "of that one.")
 
 
+def evolution_inspiration(mutation: str, mechanism: str, score, own_score,
+                          diff: str) -> str:
+    """Show a second, differently-good candidate as a source of ideas.
+
+    As a diff against the code being mutated rather than as a second copy of
+    the targets: the difference is the idea, it costs a fraction of the room,
+    and its removed lines are the only part of it that is also an anchor.
+    """
+    return (
+        f"ANOTHER CORRECT CANDIDATE, FROM A DIFFERENT LINE OF CHANGES "
+        f"(score {score}; the code above scores {own_score}):\n"
+        f"- change: {mutation}\n"
+        + (f"- mechanism: {mechanism}\n" if mechanism else "")
+        + "How it differs from the code above ('-' lines are in the code above, "
+        "'+' lines are not):\n"
+        f"{diff}\n"
+        "Borrow an idea from it if one serves this generation's direction. It "
+        "is not a patch to copy: anchor your edits in CURRENT CODE only."
+    )
+
+
 #: A proposal with no edit and no file is a paragraph about optimisation, and
 #: the generation that produced it is spent. Neither key can be required on
 #: its own, though -- a patch and a rewrite are both valid answers -- so the

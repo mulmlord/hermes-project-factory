@@ -586,15 +586,22 @@ def cmd_doctor(args) -> int:
     # rung names a role that exists: a typo there is otherwise discovered on
     # the third attempt of some ticket in the middle of an unattended run.
     from .agents import PROMPTS
-    from .implement import Ladder
+    from .implement import Ladder, edit_format
     ladder = Ladder.from_config(config)
     for index, rung in enumerate(ladder.rungs, 1):
         attempt = f"{index}+" if index == len(ladder.rungs) else str(index)
         print(f"ladder    attempt {attempt}: {rung.candidates} sample(s), "
-              f"{rung.files} files, {rung.role or 'implementer'}")
+              f"{rung.files} files, {rung.role or 'implementer'}, "
+              f"{'whole files' if rung.whole else 'patches'}")
     for role in sorted({r.role for r in ladder.rungs if r.role} - set(PROMPTS)):
         print(f"ladder    WARN execution.escalation names no role {role!r}; "
               "that rung falls back to the implementer", file=sys.stderr)
+    for spec in config.get("execution.escalation") or []:
+        named = spec.get("format") if isinstance(spec, dict) else None
+        if named is not None and edit_format(named) is None:
+            print(f"ladder    WARN execution.escalation names no format "
+                  f"{named!r}; that rung keeps the format below it",
+                  file=sys.stderr)
     from .ledger import open_ledger
     learned = open_ledger(config).stats()
     print(f"ledger    {learned['attempts']} attempt(s) from "

@@ -117,9 +117,17 @@ DEFAULTS: dict[str, Any] = {
         # Roles are deliberately the knob rather than models: routing a retry
         # to a second model reloads weights, which costs more than the retry
         # saves. [] disables escalation.
+        # The format is a rung of its own kind: a patch and a whole file fail
+        # in different ways, so asking for the other one is a different
+        # question rather than a louder one. It rides with the reasoning role
+        # because that rung is already told to reconsider the approach, and
+        # reconsidering an approach is the one thing a search/replace edit
+        # cannot express. It applies only to the files the last attempt
+        # already failed on.
         "escalation": [
             {"candidates": 2, "files": 10},   # attempt 2: race more, read more
-            {"role": "architect"},            # attempt 3: ask the reasoning role
+            {"role": "architect",             # attempt 3: ask the reasoning role
+             "format": "whole"},              # for the whole file, not a patch
         ],
         # What the factory remembers about its own retries, across every
         # project it has ever built: which rung actually rescued which kind
@@ -394,9 +402,13 @@ execution:
                          # rung inheriting the one below it. The top rung
                          # repeats; [] retries identically instead
     - {candidates: 2, files: 10}   # attempt 2: race more samples, read more code
-    - {role: architect}            # attempt 3: ask the reasoning role instead,
-                                   # on the model already resident -- a rung
-                                   # never reloads weights mid-ticket
+    - {role: architect,            # attempt 3: ask the reasoning role instead,
+       format: whole}              # on the model already resident -- a rung
+                                   # never reloads weights mid-ticket -- and
+                                   # ask it for whole files rather than
+                                   # patches, for the files the last attempt
+                                   # already failed on. format: patch asks
+                                   # for search/replace edits again
   edit_protocol: true    # let agents patch a file instead of rewriting it whole
   prefetch: true         # generate the next ticket while this one verifies
   tool_calls: 6          # read-only lookups (read_file, grep, list_dir) the

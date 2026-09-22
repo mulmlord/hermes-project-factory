@@ -10,7 +10,7 @@ from pathlib import Path
 from . import prompts
 from .agents import Prompt, context_block, escalate, file_protocol, ticket_block
 from .anchor import locate
-from .ledger import ABANDONED, FAILED, FIXED, NullLedger
+from .ledger import ABANDONED, FAILED, FIXED, NullLedger, Spec
 from .log import Logger, NULL, scope
 from .sandbox import Sandbox, SandboxError
 from .tools import Lookup, Toolbox
@@ -19,30 +19,56 @@ from .verify import Verification, review, triage, verify_ticket
 #: Files an agent may never write, regardless of what it asks for.
 PROTECTED = (".hermes/", ".git/", "hermes.yaml")
 
+#: What a rung's ``format`` key may say, and which answer format it selects.
+#: Several spellings each, because the cost of rejecting one is a rung that
+#: keeps asking in the format that has already failed, hours into a run
+#: nobody is watching.
+FORMATS = {"whole": True, "whole-file": True, "whole_file": True, "file": True,
+           "files": True, "patch": False, "patches": False, "edit": False,
+           "edits": False, "diff": False}
+
+
+def edit_format(value) -> bool | None:
+    """Whether *value* names the whole-file format, or None if it names neither."""
+    return FORMATS.get(str(value).strip().lower()) if value is not None else None
+
 
 @dataclass(frozen=True)
 class Rung:
     """How hard one attempt at a ticket tries.
 
     *candidates* is how many samples are raced through the gates, *files* how
-    many existing sources the prompt may show, and *role* which agent is
-    asked -- empty meaning the ticket's own implementer or tester.
+    many existing sources the prompt may show, *role* which agent is asked --
+    empty meaning the ticket's own implementer or tester -- and *whole*
+    whether the answer is demanded as complete files rather than as patches.
     """
 
     candidates: int = 1
     files: int = 6
     role: str = ""
+    whole: bool = False
 
     @property
-    def spec(self) -> tuple[int, int, str]:
+    def spec(self) -> Spec:
         """This rung as the ledger stores it. See :mod:`hermes.ledger`."""
-        return (self.candidates, self.files, self.role)
+        return (self.candidates, self.files, self.role, self.whole)
 
     def harder(self, spec: dict) -> "Rung":
-        """This rung with whatever *spec* names overridden, nothing else."""
-        return Rung(candidates=max(1, int(spec.get("candidates", self.candidates))),
-                    files=max(1, int(spec.get("files", self.files))),
-                    role=str(spec.get("role", self.role)))
+        """This rung with whatever *spec* names overridden, nothing else.
+
+        A value that cannot be read -- ``candidates: two``, ``format: hole``
+        -- keeps the rung below's rather than raising. The ladder is built
+        once at startup but a typo in it is otherwise a crash on whichever
+        attempt first climbs to that rung, which is to say in the middle of an
+        unattended run rather than at ``hermes doctor``, which warns about it.
+        """
+        candidates, files = _int(spec.get("candidates")), _int(spec.get("files"))
+        role, whole = spec.get("role"), edit_format(spec.get("format"))
+        return Rung(candidates=max(1, candidates) if candidates is not None
+                    else self.candidates,
+                    files=max(1, files) if files is not None else self.files,
+                    role=role if isinstance(role, str) else self.role,
+                    whole=self.whole if whole is None else whole)
 
 
 @dataclass
@@ -53,7 +79,10 @@ class Ladder:
     same model, the same prompt and the same decoding produce the same answer
     often enough that three attempts cost three times one attempt's chance.
     So attempt two races more samples and is shown more of the code, and
-    attempt three is asked of a reasoning role rather than the implementer.
+    attempt three is asked of a reasoning role rather than the implementer,
+    in the other edit format: a patch and a whole file fail in different ways,
+    so which one is asked for is a different question and not only a louder
+    one. Which of those rungs actually pays is :mod:`hermes.ledger`'s to say.
 
     Later rungs inherit the one below them, so a ladder never quietly
     de-escalates, and the top rung repeats once the list runs out: effort
@@ -71,12 +100,21 @@ class Ladder:
 
     @classmethod
     def from_config(cls, config) -> "Ladder":
-        """Build the ladder from ``execution.candidates/files/escalation``."""
-        rungs = [Rung(candidates=max(1, int(config.get("execution.candidates", 1))),
-                      files=max(1, int(config.get("execution.files", 6))))]
+        """Build the ladder from ``execution.candidates/files/escalation``.
+
+        With ``execution.edit_protocol`` off every answer is already a whole
+        file, so a rung that asks for one changes nothing; its format is
+        dropped rather than recorded, because a ledger that tells two
+        identical rungs apart needs twice the evidence to learn anything about
+        either.
+        """
+        rungs = [Rung(candidates=_at_least(config.get("execution.candidates", 1), 1),
+                      files=_at_least(config.get("execution.files", 6), 6))]
+        patches = bool(config.get("execution.edit_protocol", True))
         for spec in config.get("execution.escalation") or []:
             if isinstance(spec, dict):
-                rungs.append(rungs[-1].harder(spec))
+                rungs.append(rungs[-1].harder(
+                    spec if patches else {**spec, "format": "patch"}))
         return cls(rungs)
 
 
@@ -93,6 +131,12 @@ class Change:
     #: Edits that only landed because the applier widened the search, with how.
     #: Nothing depends on this; it is what says whether widening pays.
     repaired: list[str] = field(default_factory=list)
+    #: What the patch format was used on: the paths an edit changed, and the
+    #: paths whose edit found nothing to change. The ladder's format rung
+    #: takes that format away from exactly these, so they are lists to act on
+    #: rather than the prose in *unmatched*, which is written for a model.
+    patched: list[str] = field(default_factory=list)
+    unanchored: list[str] = field(default_factory=list)
 
     @property
     def touched(self) -> list[str]:
@@ -190,13 +234,16 @@ def _apply_edit(sandbox: Sandbox, item: dict, change: Change, log: Logger) -> No
         change.unmatched.append(
             f"{path}: the file does not exist yet, so it cannot be edited. "
             "Return its complete contents under \"files\".")
+        change.unanchored.append(path)
         return
     found, reason = locate(text, find, replace, line=_int(item.get("line")),
                            symbol=str(item.get("symbol") or ""))
     if found is None:
         change.unmatched.append(f"{path}: {reason}")
+        change.unanchored.append(path)
         return
     sandbox.write(path, found.splice(text))
+    change.patched.append(path)
     if not found.exact:
         change.repaired.append(f"{path} ({found.how})")
         log.info("implement.edit_relocated", path=path, how=found.how)
@@ -210,6 +257,31 @@ def _int(value) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _at_least(value, default: int) -> int:
+    """*value* as a rung size of one or more, or *default* if it is not one."""
+    parsed = _int(value)
+    return max(1, parsed) if parsed is not None else default
+
+
+def offending(change: "Change | None", limit: int = 3) -> list[str]:
+    """The files a format rung takes the patch format away from, and no others.
+
+    An edit that did not anchor names its file exactly, and that file is where
+    the patch format failed. When every edit anchored and a gate failed
+    instead, the files it patched are the next-best answer: the format was at
+    least used on them, which a file the attempt returned whole cannot say --
+    demanding that one whole again is a rung that changes nothing.
+
+    Narrow on purpose. Re-emitting every file a ticket touches is how a large
+    one quietly loses the code nobody meant to change, which is the failure
+    the patch format exists to prevent -- so a rung that switches format must
+    not hand that failure to the files that were never the problem.
+    """
+    if change is None:
+        return []
+    return list(dict.fromkeys(change.unanchored or change.patched))[:limit]
 
 
 def _protected(path: str) -> bool:
@@ -297,12 +369,15 @@ def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
              instructions: str = "", failure: str = "", prior: str = "",
              hints: list[str] | None = None, *, allow_edits: bool = True,
              temperature: float | None = None, toolbox: Toolbox | None = None,
-             role: str = "", files: int = 6, log: Logger = NULL) -> dict:
+             role: str = "", files: int = 6, whole: list[str] | None = None,
+             log: Logger = NULL) -> dict:
     """Ask the right agent for the code that satisfies *ticket*.
 
     *role* overrides which agent is asked, which is how a repeated failure
     escalates onto a reasoning role; see :func:`~hermes.agents.escalate`.
-    *files* is how many existing sources the prompt may show it.
+    *files* is how many existing sources the prompt may show it. *whole* names
+    the files this attempt must return complete rather than patch, which is
+    the ladder's other way of asking a repeated failure differently.
 
     *toolbox* lets the agent read the rest of the workspace before it answers.
     The sources below are a guess at what the ticket needs, made from a list
@@ -340,6 +415,12 @@ def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
                    priority=20, floor=800, tail=True)
     prompt.add("closing", prompts.IMPLEMENT, required=True)
     prompt.add("protocol", file_protocol(edits=allow_edits), required=True)
+    if allow_edits and whole:
+        # Required rather than merely urgent: it is an exception to a protocol
+        # block that cannot be dropped either, and a format instruction that
+        # is trimmed away leaves the attempt asking in the format that already
+        # failed while the ledger records a rung that never ran.
+        prompt.add("format", prompts.whole_file(whole), required=True)
     lookup = Lookup(agent, prompt, toolbox, log=log)
     # Filled last so the room it is given accounts for the repair instructions,
     # the failure and the lookup protocol, all of which outrank it: knowing
@@ -475,7 +556,8 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
                 log.info("ticket.rung_learned", signature=signature,
                          reason=advice.reason, confidence=round(advice.confidence, 2),
                          observations=advice.tried, candidates=rung.candidates,
-                         files=rung.files, role=rung.role or "default")
+                         files=rung.files, role=rung.role or "default",
+                         format="whole" if rung.whole else "patch")
             started = time.time()
 
             def learned(outcome: str, following: str = "", _rung=rung,
@@ -485,12 +567,21 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
                               stack=stack, kind=ticket.kind, attempt=_attempt,
                               following=following, seconds=time.time() - started)
 
+            # The format rung takes the patch format away from the files it
+            # has already failed on. With nothing to take it from -- an
+            # attempt that patched nothing, or produced nothing at all -- it
+            # applies to the whole answer instead, because a rung that quietly
+            # did nothing is a row the ledger cannot read.
+            whole = offending(last_change) if rung.whole else []
+            edits = allow_edits and (bool(whole) or not rung.whole)
             log.info("ticket.attempt", title=ticket.title[:60],
                      candidates=rung.candidates, files=rung.files,
                      role=rung.role or "default")
+            if rung.whole:
+                log.info("ticket.format_whole", paths=", ".join(whole) or "every file")
             payloads = _propose(agents, sandbox, state, ticket, tree_fn, instructions,
-                                failure, prior, hints, allow_edits=allow_edits,
-                                rung=rung,
+                                failure, prior, hints, allow_edits=edits,
+                                rung=rung, whole=whole,
                                 prefetched=prefetched if attempt == 1 else None,
                                 toolbox=toolbox, log=log)
             if not payloads:
@@ -593,8 +684,8 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
 
 
 def _propose(agents, sandbox, state, ticket, tree_fn, instructions, failure, prior,
-             hints, *, allow_edits: bool, rung: Rung, prefetched: dict | None,
-             toolbox, log: Logger) -> list[dict]:
+             hints, *, allow_edits: bool, rung: Rung, whole: list[str],
+             prefetched: dict | None, toolbox, log: Logger) -> list[dict]:
     """Collect the candidate changes to race through the gates.
 
     The extra samples are drawn hotter than the first: two candidates from the
@@ -609,7 +700,7 @@ def _propose(agents, sandbox, state, ticket, tree_fn, instructions, failure, pri
                 agents, sandbox, state, ticket, tree_fn(), instructions, failure,
                 prior, hints, allow_edits=allow_edits,
                 temperature=None if not payloads else 0.6, toolbox=toolbox(),
-                role=rung.role, files=rung.files, log=log))
+                role=rung.role, files=rung.files, whole=whole, log=log))
         except Exception as exc:  # model returned nothing usable
             log.error("ticket.generate_failed", ticket=ticket.id, error=str(exc)[:200])
             break

@@ -1,7 +1,8 @@
 """What the factory learned about its own retries, kept across projects.
 
 The escalation ladder in :mod:`hermes.implement` is a hypothesis: attempt two
-races more samples and reads more code, attempt three asks a reasoning role.
+races more samples and reads more code, attempt three asks a reasoning role
+for a whole file rather than a patch.
 It is a reasonable hypothesis and nothing in the factory has ever checked it.
 Each project starts from the same fixed guess, and everything it discovers
 about which second try actually rescues which kind of failure dies with the
@@ -46,7 +47,12 @@ from pathlib import Path
 
 from .log import Logger, NULL
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+#: A rung as the ledger stores it: samples raced, existing sources shown, the
+#: role asked, and whether the answer was demanded as complete files rather
+#: than as patches. Mirrors :class:`hermes.implement.Rung`.
+Spec = tuple[int, int, str, bool]
 
 #: Times a rung must have been watched under a signature before its record is
 #: allowed to mean anything. Low enough to learn inside a few projects, high
@@ -90,13 +96,14 @@ class Evidence:
     candidates: int = 1
     files: int = 6
     role: str = ""
+    whole: bool = False
     fixed: int = 0
     tried: int = 0
     seconds: float = 0.0
 
     @property
-    def rung(self) -> tuple[int, int, str]:
-        return (self.candidates, self.files, self.role)
+    def rung(self) -> Spec:
+        return (self.candidates, self.files, self.role, self.whole)
 
     @property
     def rate(self) -> float:
@@ -119,6 +126,7 @@ class Evidence:
 
     def describe(self) -> str:
         role = self.role or "default role"
+        role += ", whole-file" if self.whole else ""
         return (f"{self.candidates}x{self.files} {role}: "
                 f"{self.fixed}/{self.tried} fixed ({self.rate:.0%}, "
                 f"confidence {self.confidence:.0%})")
@@ -128,7 +136,7 @@ class Evidence:
 class Advice:
     """A rung to try next, and why it was chosen."""
 
-    rung: tuple[int, int, str]
+    rung: Spec
     reason: str = "ladder"
     confidence: float = 0.0
     tried: int = 0
@@ -185,6 +193,7 @@ class Ledger:
 
     def _setup(self) -> None:
         conn = self._conn()
+        self._migrate(conn)
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS attempt (
                 id         INTEGER PRIMARY KEY,
@@ -197,18 +206,39 @@ class Ledger:
                 candidates INTEGER NOT NULL DEFAULT 1,
                 files      INTEGER NOT NULL DEFAULT 6,
                 role       TEXT    NOT NULL DEFAULT '',
+                whole      INTEGER NOT NULL DEFAULT 0,
                 outcome    TEXT    NOT NULL DEFAULT '',
                 next       TEXT    NOT NULL DEFAULT '',
                 seconds    REAL    NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS attempt_lookup
-                ON attempt(signature, stack, candidates, files, role);
+                ON attempt(signature, stack, candidates, files, role, whole);
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
             );
         """)
-        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('schema', ?)",
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema', ?)",
                      (str(SCHEMA_VERSION),))
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Carry a ledger written by an older factory onto this schema.
+
+        This is the one file that outlives every workspace, so a rung that
+        gains a dimension has to reach the rows already in it: starting the
+        record again would throw away exactly the history the ladder is
+        judged against. A row written before the format rung existed was
+        asked in whatever format its run configured, which is what 0 means --
+        the same thing it means for a ladder that never switches format.
+        """
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(attempt)")}
+        if columns and "whole" not in columns:
+            conn.execute("ALTER TABLE attempt ADD COLUMN whole"
+                         " INTEGER NOT NULL DEFAULT 0")
+            # The lookup index is keyed on the rung, which just grew a column;
+            # dropping it here is what lets the schema below rebuild it.
+            conn.execute("DROP INDEX IF EXISTS attempt_lookup")
+            self.log.info("ledger.migrated", path=str(self.path),
+                          schema=SCHEMA_VERSION)
 
     def close(self) -> None:
         conn = getattr(self._local, "conn", None)
@@ -223,7 +253,7 @@ class Ledger:
         self.close()
 
     # -- writing ---------------------------------------------------------
-    def record(self, signature: str, rung: tuple[int, int, str], outcome: str, *,
+    def record(self, signature: str, rung: Spec, outcome: str, *,
                project: str = "", stack: str = "", kind: str = "",
                attempt: int = 1, following: str = "", seconds: float = 0.0) -> None:
         """Record that *rung*, asked after *signature*, ended in *outcome*.
@@ -234,15 +264,15 @@ class Ledger:
         """
         if not self.ok:
             return
-        candidates, files, role = rung
+        candidates, files, role, whole = rung
         try:
             self._conn().execute(
                 "INSERT INTO attempt(at, project, stack, kind, signature, attempt,"
-                " candidates, files, role, outcome, next, seconds)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                " candidates, files, role, whole, outcome, next, seconds)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), project[:80], stack[:40], kind[:40], signature[:80],
-                 attempt, candidates, files, role[:40], outcome, following[:80],
-                 round(seconds, 2)))
+                 attempt, candidates, files, role[:40], int(whole), outcome,
+                 following[:80], round(seconds, 2)))
         except sqlite3.Error as exc:
             self.log.warn("ledger.write_failed", error=str(exc)[:200])
 
@@ -275,17 +305,18 @@ class Ledger:
             where += " AND stack = ?"
             params.append(stack)
         rows = self._conn().execute(
-            f"SELECT candidates, files, role, COUNT(*) AS tried,"
+            f"SELECT candidates, files, role, whole, COUNT(*) AS tried,"
             f" SUM(outcome = ?) AS fixed, AVG(seconds) AS seconds"
             f" FROM attempt WHERE {where}"
-            f" GROUP BY candidates, files, role", [FIXED] + params).fetchall()
+            f" GROUP BY candidates, files, role, whole", [FIXED] + params).fetchall()
         return [Evidence(candidates=row["candidates"], files=row["files"],
-                         role=row["role"], fixed=row["fixed"] or 0,
-                         tried=row["tried"], seconds=row["seconds"] or 0.0)
+                         role=row["role"], whole=bool(row["whole"]),
+                         fixed=row["fixed"] or 0, tried=row["tried"],
+                         seconds=row["seconds"] or 0.0)
                 for row in rows]
 
-    def advice(self, signature: str, default: tuple[int, int, str],
-               options: list[tuple[int, int, str]], *, stack: str = "") -> Advice:
+    def advice(self, signature: str, default: Spec,
+               options: list[Spec], *, stack: str = "") -> Advice:
         """Which rung to try against *signature*, out of *options*.
 
         Returns *default* -- the ladder's own answer -- unless the evidence
@@ -381,8 +412,8 @@ class NullLedger:
     def evidence(self, *_args, **_kwargs) -> list[Evidence]:
         return []
 
-    def advice(self, signature: str, default: tuple[int, int, str],
-               options: list[tuple[int, int, str]], **_kwargs) -> Advice:
+    def advice(self, signature: str, default: Spec,
+               options: list[Spec], **_kwargs) -> Advice:
         return Advice(default)
 
     def signatures(self, limit: int = 20) -> list[tuple[str, int, float]]:

@@ -17,8 +17,8 @@ from types import SimpleNamespace
 
 from conftest import needs_docker
 
-from hermes.agents import (Prompt, build as build_agents, change_schema, escalate,
-                           file_protocol)
+from hermes.agents import (Prompt, build as build_agents, change_schema, context_block,
+                           escalate, file_protocol, ticket_block)
 from hermes.config import Config, ConfigError, DEFAULTS, deep_merge, is_local_url
 from hermes.contextdb import UNTRUSTED, ContextDB, open_db, split
 from hermes.anchor import locate
@@ -774,6 +774,47 @@ def test_generate_fits_a_tight_context_and_keeps_what_the_ticket_needs(tmp_path)
     assert ("prompt.block_dropped", "tree") in dropped   # and said so
 
 
+def test_two_asks_about_one_project_share_the_prefix_the_server_caches(tmp_path):
+    """What ``--enable-prefix-caching`` is paid for, asserted in the text.
+
+    A KV cache is reused up to the first token that differs, so "stable
+    blocks first" is not a matter of taste: move the file listing above the
+    ticket and every call in the run recomputes the whole prompt. Two
+    different tickets must therefore still begin with the same project block,
+    and two attempts at one ticket must agree for longer than that.
+    """
+    import os
+
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    state = State(idea="parse the config",
+                  plan={"commands": {"build": "true", "test": "true"}})
+    board = Board(tmp_path)
+    first = board.add(title="read the file", status="ready")
+    second = board.add(title="write the file", status="ready")
+
+    seen = []
+    agent = _agent(lambda prompt: seen.append(prompt) or {"summary": "", "files": []})
+    agents = {"implementer": agent, "tester": agent}
+    generate(agents, sandbox, state, first, tree="src/a.py", prior="did a thing")
+    generate(agents, sandbox, state, second, tree="src/a.py", prior="did a thing")
+    generate(agents, sandbox, state, first, tree="src/a.py\nsrc/b.py",
+             prior="did a thing", failure="AssertionError")
+
+    project = context_block(state)
+    assert all(prompt.startswith(project) for prompt in seen)
+
+    # Two tickets: everything they can share, they do.
+    across = os.path.commonprefix([seen[0], seen[1]])
+    assert across == project + "\n\nTICKET T00"
+
+    # Two attempts at one ticket: the ticket and the journal are shared too,
+    # and only the tail that actually changed -- the listing, the sources, the
+    # failure being repaired -- falls outside the prefix.
+    retry = os.path.commonprefix([seen[0], seen[2]])
+    assert ticket_block(first) in retry and "did a thing" in retry
+    assert "AssertionError" not in retry and "src/b.py" not in retry
+
+
 # -- state -------------------------------------------------------------------
 
 def test_illegal_transition_rejected():
@@ -893,6 +934,93 @@ def test_a_cpu_cap_above_the_host_does_not_cost_the_container(tmp_path, monkeypa
     assert "4" not in sandbox._docker_argv("true", None, True)
     # A request the host can meet is passed through untouched, fractions and all.
     assert Sandbox(tmp_path, {"cpus": 1.5}, NULL)._cpu_limit() == "1.5"
+
+
+def _docker_sandbox(root, monkeypatch, **cfg):
+    """A docker-runtime Sandbox on a host that need not have docker."""
+    monkeypatch.setattr("hermes.sandbox.shutil.which", lambda name: "/usr/bin/" + name)
+    return Sandbox(root, {"runtime": "docker", "timeout": 10, **cfg}, NULL)
+
+
+def test_both_kinds_of_container_are_bounded_the_same_way(tmp_path, monkeypatch):
+    """The long-lived box and the one-shot box used to be two literal lists.
+
+    A limit added to one and not the other is a hole only the rarer path
+    has, so both are now read from one place -- and this pins what it holds.
+    """
+    sandbox = _docker_sandbox(tmp_path, monkeypatch, memory="3g", tmp="256m")
+    started = []
+    monkeypatch.setattr("hermes.sandbox.subprocess.run", lambda argv, **kw: (
+        started.append(argv) or SimpleNamespace(returncode=0, stdout="", stderr="")))
+    monkeypatch.setattr(sandbox, "_workspace_visible", lambda: True)
+    sandbox.start()
+    one_shot = sandbox._docker_argv("true", None, True)
+
+    for argv in (started[0], one_shot):
+        assert "--read-only" in argv
+        tmpfs = argv[argv.index("--tmpfs") + 1]
+        # exec, because pip --user puts console scripts under $HOME=/tmp.
+        assert tmpfs.startswith("/tmp:") and "exec" in tmpfs.split(",")
+        assert "noexec" not in tmpfs and "size=256m" in tmpfs
+        # Swap equal to memory: the cap is 3g, not 3g plus 3g of swap.
+        assert argv[argv.index("--memory") + 1] == "3g"
+        assert argv[argv.index("--memory-swap") + 1] == "3g"
+        assert "--runtime" not in argv          # runc unless asked otherwise
+    assert started[0][started[0].index("--network") + 1] == "none"
+    assert one_shot[one_shot.index("--network") + 1] == "bridge"
+
+
+def test_a_writable_root_is_still_available_when_asked_for(tmp_path, monkeypatch):
+    argv = _docker_sandbox(tmp_path, monkeypatch, read_only=False)._docker_argv(
+        "true", None, False)
+    assert "--read-only" not in argv and "--tmpfs" not in argv
+
+
+def test_an_oci_runtime_is_named_not_spelled_as_flags(tmp_path, monkeypatch):
+    argv = _docker_sandbox(tmp_path, monkeypatch, oci_runtime="runsc")._docker_argv(
+        "true", None, True)
+    assert argv[argv.index("--runtime") + 1] == "runsc"
+    assert argv.index("--runtime") < argv.index("python:3.11-slim")
+
+
+def test_an_unregistered_runtime_steps_down_to_runc_not_to_local(tmp_path, monkeypatch):
+    """Asking for more isolation must never end with none.
+
+    ``local`` runs generated code on the host. Docker without gVisor is
+    less than was asked for, but it is still a box; one rung, not two.
+    """
+    sandbox = _docker_sandbox(tmp_path, monkeypatch, oci_runtime="runsc")
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if "--runtime" in argv:
+            return SimpleNamespace(returncode=125, stdout="", stderr=(
+                "docker: Error response from daemon: unknown or invalid "
+                "runtime name: runsc."))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("hermes.sandbox.subprocess.run", run)
+    monkeypatch.setattr(sandbox, "_workspace_visible", lambda: True)
+    sandbox.start()
+
+    assert sandbox.runtime == "docker" and sandbox.container
+    assert len(calls) == 2 and "--runtime" not in calls[1]
+    assert "--read-only" in calls[1]            # nothing else was given up
+    assert "runsc" in sandbox.fallback
+    # Every later box is started the way the one that worked was.
+    assert "--runtime" not in sandbox._docker_argv("true", None, True)
+
+
+def test_an_unrelated_start_failure_is_not_blamed_on_the_runtime(tmp_path, monkeypatch):
+    sandbox = _docker_sandbox(tmp_path, monkeypatch, oci_runtime="runsc")
+    calls = []
+    monkeypatch.setattr("hermes.sandbox.subprocess.run", lambda argv, **kw: (
+        calls.append(argv) or SimpleNamespace(
+            returncode=125, stdout="", stderr="Unable to find image 'nope:latest'")))
+    sandbox.start()
+    assert len(calls) == 1                      # no retry without runsc
+    assert sandbox.runtime == "local" and "nope" in sandbox.fallback
 
 
 def test_sandbox_strips_secrets_from_local_env(tmp_path):
@@ -4228,6 +4356,59 @@ def test_docker_install_gets_network_then_loses_it(shared_tmp):
         ).ok
 
 
+def test_docker_root_is_read_only_and_tmp_is_bounded_but_runnable(shared_tmp):
+    """The writable places are the workspace and a capped /tmp, nothing else.
+
+    /var/tmp is world-writable in the image, so it is the write the host
+    user could otherwise make outside the workspace, onto the host's disk.
+    """
+    if not shutil.which("docker"):
+        needs_docker("docker is not installed")
+    sandbox = Sandbox(shared_tmp, {"runtime": "docker", "timeout": 120,
+                                   "image": "python:3.11-slim", "tmp": "64m"})
+    with sandbox:
+        if sandbox.runtime != "docker":
+            needs_docker(f"docker did not run a container: {sandbox.fallback}")
+        assert not sandbox.run("touch /var/tmp/escape").ok
+        assert sandbox.run("touch built.txt").ok
+        assert (shared_tmp / "built.txt").is_file()
+        # A console script installed into $HOME=/tmp has to run from there.
+        assert sandbox.run("mkdir -p /tmp/.local/bin && printf '#!/bin/sh\\necho ran\\n'"
+                           " > /tmp/.local/bin/tool && chmod +x /tmp/.local/bin/tool"
+                           " && tool").stdout.strip() == "ran"
+        size = sandbox.run("df -k /tmp | tail -1").stdout.split()
+        assert int(size[1]) <= 64 * 1024
+        assert not sandbox.run("head -c 80M /dev/zero > /tmp/fill").ok
+
+
+def test_docker_container_carries_no_host_secrets(shared_tmp, monkeypatch):
+    """The sandbox isolates the code; it must not also be handed the key.
+
+    GitHub work happens on the host, so nothing inside ever needs a token.
+    Both the long-lived box and the networked one-shot box are checked.
+    """
+    if not shutil.which("docker"):
+        needs_docker("docker is not installed")
+    monkeypatch.setenv("HERMES_PROBE_TOKEN", "leaked-token-value")
+    monkeypatch.setenv("HERMES_PROBE_API_KEY", "leaked-key-value")
+    sandbox = Sandbox(shared_tmp, {"runtime": "docker", "timeout": 120,
+                                   "image": "python:3.11-slim"})
+    with sandbox:
+        if sandbox.runtime != "docker":
+            needs_docker(f"docker did not run a container: {sandbox.fallback}")
+        for env in (sandbox.run("env"), sandbox.run("env", network=True)):
+            assert env.ok, env.summary()
+            assert "leaked" not in env.stdout
+            # By name as well as by value, but only names the host holds: the
+            # image sets its own GPG_KEY, the public key Python releases are
+            # signed with, and that one came from the image, not from us.
+            names = {line.split("=", 1)[0] for line in env.stdout.splitlines()}
+            carried = {n for n in os.environ
+                       if n.endswith(("_TOKEN", "_KEY", "_SECRET", "PASSWORD"))}
+            assert "HERMES_PROBE_TOKEN" in carried
+            assert not names & carried
+
+
 def test_missing_tool_is_installed_and_recorded(shared_tmp):
     """A gate failing with exit 127 is an absent tool, not a code defect."""
     if not shutil.which("docker"):
@@ -4603,6 +4784,84 @@ def test_running_holds_the_server_for_exactly_one_block(monkeypatch):
     off = Config(deep_merge(DEFAULTS, {"server": {"autostart": False}}))
     with running(off, router) as server:
         assert server is None
+
+
+def _serve_flags(vllm_version="0.11.2", log=NULL, **server):
+    from hermes.config import DEFAULTS
+    from hermes.server import serve_flags
+    return serve_flags(Config(deep_merge(DEFAULTS, {"server": server})),
+                       vllm_version, log)
+
+
+def test_the_unit_serves_with_the_two_flags_this_workload_pays_for():
+    """Prefix caching and n-gram speculation, and the JSON must survive.
+
+    ``--speculative-config`` takes a JSON document, and systemd tokenises
+    ExecStart itself with its own quoting rules before vLLM ever sees it: an
+    unquoted document arrives with its double quotes eaten and parses as
+    nothing. So the flag carries its own single quotes, and this asserts what
+    is left after systemd has done its half.
+    """
+    flags = _serve_flags()
+    assert "--enable-prefix-caching" in flags
+    name, document = shlex.split(next(f for f in flags if "speculative" in f))
+    assert name == "--speculative-config"
+    settings = json.loads(document)
+    assert settings["method"] == "ngram"
+    # A draft model would be the other way to speculate, and the card this
+    # unit targets has no VRAM to spare for one.
+    assert "model" not in settings
+    assert 0 < settings["prompt_lookup_min"] < settings["prompt_lookup_max"]
+    assert settings["num_speculative_tokens"] >= settings["prompt_lookup_min"]
+
+
+def test_a_vllm_too_old_for_the_flag_is_not_given_it():
+    """It spells the same setting across four others, and a flag vLLM does not
+    know is not a slower server but an absent one."""
+    old = _serve_flags("0.8.5")
+    assert old == ["--enable-prefix-caching"]
+    # Unreadable is not old: start.sh drops these and restarts if the server
+    # refuses them, so a guess costs a restart while refusing to guess costs
+    # the speedup on every version whose string we cannot parse.
+    assert _serve_flags("") == _serve_flags("0.11.2")
+
+
+def test_both_flags_are_switches_the_operator_holds(tmp_path):
+    log = Logger(tmp_path / "log.jsonl", quiet=True)
+    assert _serve_flags(speculative="off") == ["--enable-prefix-caching"]
+    assert len(_serve_flags(prefix_caching=False)) == 1
+    assert _serve_flags(prefix_caching=False, speculative="off") == []
+    # `--set server.speculative=off` is the advice the failed-start path
+    # gives, and YAML stores that answer as a boolean.
+    assert _serve_flags(speculative=False) == _serve_flags(speculative="off")
+    assert _serve_flags(speculative=True) == _serve_flags(speculative="ngram")
+    # A method nobody implements is reported, not invented: the alternative is
+    # a unit file that names a vLLM feature by guess.
+    assert _serve_flags(speculative="eagle3", log=log) == ["--enable-prefix-caching"]
+    assert _records(tmp_path / "log.jsonl")[0]["event"] == "server.speculative_unknown"
+
+
+def test_start_sh_can_serve_without_the_flags_it_wrote():
+    """The tuning must never cost the server it is tuning.
+
+    These flags are written on a version check, which is a guess about a
+    binary this repo does not pin. The guess is survivable only because the
+    unit is written by a function that can be called a second time with
+    nothing, so this pins that arrangement rather than the flags themselves.
+    """
+    start = (Path(__file__).resolve().parent.parent / "start.sh").read_text()
+
+    assert "serve_flags" in start                  # composed in Python, not here
+    assert 'write_unit "$SERVE_FLAGS"' in start    # and the first attempt uses it
+    assert 'write_unit ""' in start                # the second one does not
+    # The flags go last on the ExecStart, because each arrives as its own
+    # continuation line and a flag after them would need a backslash nothing
+    # would have written.
+    exec_start = start[start.index("ExecStart=$VLLM_VENV"):]
+    assert exec_start[:exec_start.index("\n#")].rstrip().endswith("$GPU_UTIL$1")
+    # A refusal is diagnosed from the server's own log rather than assumed:
+    # the same failed wait is far more often a model too big for the card.
+    assert "rejected_flags" in start and "journalctl" in start
 
 
 # -- the context database ----------------------------------------------------

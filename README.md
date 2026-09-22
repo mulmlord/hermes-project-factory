@@ -285,7 +285,35 @@ server:
   unit: hermes-vllm.service
   wait: 600                    # seconds allowed for the weights to load
   stop_after_run: true         # false keeps the model resident between runs
+  prefix_caching: true         # reuse the KV cache across calls that share a prefix
+  speculative: ngram           # draft from text already in the prompt | off
 ```
+
+The last two are how the unit serves, and they are defaults rather than
+suggestions because of two things this workload does that serving in general
+does not.
+
+Every prompt is assembled stable-first — the project, then the ticket, then the
+volatile tail of file listings and failures — so the calls in a run share a
+long prefix verbatim, and a cache that is reused up to the first differing
+token gets most of each prompt for free. That ordering is load-bearing, not
+tidiness, and the suite asserts it: two tickets in one project must still begin
+with the same block, and two attempts at one ticket must agree past the ticket.
+
+Most of what the factory decodes is text it was just shown — a search/replace
+`find` copied character for character out of the file in the prompt, a
+whole-file rewrite that re-emits the file around a small change, the fixed keys
+of the change protocol. vLLM's n-gram proposer drafts exactly that: it looks
+for the tokens it just generated somewhere earlier in the prompt and offers
+what followed them there. It is chosen over a draft model because it has no
+weights, on a card `start.sh` already warns is too small for the model itself,
+and because a miss costs a lookup rather than a forward pass.
+
+Neither is written blindly. `start.sh` reads which vLLM is installed and omits
+speculation from a version too old to spell it this way; if the server refuses
+the flags anyway, it rewrites the unit without them, restarts, and says which
+knob makes that permanent. A flag that is there to make the server faster is
+never allowed to make it absent.
 
 Set `stop_after_run: false` to pay the load once and keep the model in VRAM,
 which is also what you want when two projects share one server — Hermes only
@@ -424,8 +452,23 @@ the model will not fix it, because a thin answer beats a failed phase.
 ## Isolation
 
 Generated code is treated as hostile. It runs in a container with no network,
-capped memory, CPU and process count, all capabilities dropped, and only the
-project workspace mounted. Agent file writes are checked against path escapes
+capped memory (swap included), CPU and process count, all capabilities
+dropped, a read-only root filesystem, and only the project workspace mounted.
+The one other writable place is `/tmp`, which is also `$HOME` and where
+`pip install --user` lands: a tmpfs capped at `sandbox.tmp` (2g), so a
+runaway write fills a bounded buffer rather than the host's disk. Nothing from
+the host environment is passed in, so no token or key is inside to be used.
+
+A container shares the host's kernel. For a kernel boundary as well, install
+gVisor or Kata Containers and name the runtime at `sandbox.oci_runtime`
+(`runsc`, `kata-runtime`); `hermes doctor` says whether docker has it
+registered. It is a name rather than a list of `docker run` flags, so the
+setting can only add isolation. If the engine does not know the runtime,
+Hermes runs under docker's default `runc` and logs `sandbox.runtime_refused` —
+never the `local` runtime, which would be no container at all. gVisor blocks
+GPU passthrough; the sandbox is given none, so nothing is lost.
+
+Agent file writes are checked against path escapes
 and a protected-path list, so generated code cannot reach Hermes state, the
 git directory, or anything on the host. In the local fallback runtime the
 environment is stripped of anything resembling a key, token or credential.

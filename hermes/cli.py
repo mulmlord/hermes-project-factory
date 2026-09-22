@@ -22,7 +22,7 @@ from .config import (
 from .contextdb import open_db
 from .journal import Journal
 from .log import for_workspace, scope
-from .sandbox import Sandbox, probe_resources
+from .sandbox import Sandbox, probe_resources, registered_runtimes
 from .state import PHASES, State, checkpoint, restore
 from .tickets import Board
 
@@ -657,6 +657,16 @@ def cmd_doctor(args) -> int:
           f"network={sandbox_cfg.get('network')}")
     if probe.runtime != sandbox_cfg.get("runtime"):
         print("sandbox   WARN docker unavailable; falling back to local execution")
+    elif probe.runtime == "docker" and probe.oci_runtime:
+        known = registered_runtimes()
+        if known is None:
+            print(f"sandbox   oci_runtime={probe.oci_runtime}, unchecked: docker info failed")
+        elif probe.oci_runtime in known:
+            print(f"sandbox   oci_runtime={probe.oci_runtime} registered")
+        else:
+            print(f"sandbox   WARN oci_runtime={probe.oci_runtime} is not registered "
+                  f"with docker (has: {', '.join(sorted(known)) or 'none'}); "
+                  f"runs will fall back to runc", file=sys.stderr)
     import shutil as _shutil
     for tool in ("git", "gh", "docker"):
         print(f"tool      {tool}: {_shutil.which(tool) or 'not found'}")

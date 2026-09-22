@@ -19,6 +19,8 @@ detail it already does.
 """
 from __future__ import annotations
 
+import json
+import re
 import shutil
 import subprocess
 import time
@@ -27,6 +29,100 @@ from contextlib import contextmanager
 from .config import Config, is_local_url
 from .log import NULL, Logger
 from .models import Router
+
+# -- what the unit serves with -----------------------------------------------
+
+#: How the n-gram proposer drafts. It looks for the last ``prompt_lookup_min``
+#: tokens of the generation somewhere earlier in the prompt and, on a hit,
+#: offers whatever followed them there as the next ``num_speculative_tokens``.
+#: The minimum is the knob that matters: below three the matches are noise, and
+#: high above it the copied runs this factory produces are missed entirely.
+NGRAM = {"method": "ngram", "num_speculative_tokens": 5,
+         "prompt_lookup_min": 3, "prompt_lookup_max": 8}
+
+#: First vLLM release that takes the dictionary above as ``--speculative-config``.
+#: Older ones spell the same thing across four separate flags.
+SPECULATIVE_SINCE = (0, 9)
+
+
+def serve_flags(config: Config, vllm_version: str = "", log: Logger = NULL) -> list[str]:
+    """Optional ``vllm serve`` flags for the unit ``start.sh`` writes.
+
+    Each item is one continuation line of the unit's ``ExecStart``, not one
+    argv word: the speculation settings are a JSON document that has to reach
+    vLLM whole.
+
+    Two flags, for two properties of this workload that are not true of
+    serving in general.
+
+    *Prefix caching* pays because the factory asks one model about one project
+    dozens of times, and :class:`hermes.agents.Prompt` assembles every one of
+    those calls stable-first — identity and architecture, then the ticket, then
+    the volatile tail of failures and repair instructions. The shared prefix is
+    therefore long and genuinely shared, which is the condition the cache needs
+    and the reason the block order is not free to change. Recent vLLM enables
+    it anyway; the flag is written because the unit is also the record of what
+    is being relied on, and an older engine has it off.
+
+    *Speculation* pays because most of what this factory decodes is text it was
+    just shown: a search/replace ``find`` copied character for character out of
+    the file in the prompt, a whole-file rewrite that re-emits the file around
+    a small change, the fixed keys of the change protocol. The n-gram proposer
+    is chosen over a draft model deliberately — ``start.sh`` warns at cards
+    under 10 GiB, and a draft model wants VRAM that such a card does not have,
+    while n-gram has no weights at all. Its miss case is cheap in the same way:
+    no match in the prompt means no draft proposed, so the cost is a lookup
+    rather than a forward pass spent on tokens that get rejected.
+
+    A vLLM old enough to want the four-flag spelling is given no speculation
+    rather than a second spelling to keep correct. A version that cannot be
+    read at all is treated as new enough, because ``start.sh`` rewrites the
+    unit without these flags and restarts when the server refuses them — which
+    is the same safety net that makes defaulting them on defensible.
+    """
+    spec = config.get("server", {}) or {}
+    flags = []
+    if spec.get("prefix_caching", True):
+        flags.append("--enable-prefix-caching")
+
+    method = spec.get("speculative", "ngram")
+    if isinstance(method, bool):
+        # YAML reads a bare `off` as False, so the spelling that turns this
+        # off arrives here as a boolean; and someone who writes `true` means
+        # the method there is, not an unknown one.
+        method = "ngram" if method else "off"
+    method = str(method or "off").strip().lower()
+    if method in ("off", "none", "false", ""):
+        return flags
+    if method != "ngram":
+        log.warn("server.speculative_unknown", method=method)
+        return flags
+
+    release = _release(vllm_version)
+    if release and release < SPECULATIVE_SINCE:
+        log.info("server.speculative_unsupported", version=vllm_version,
+                 since=".".join(str(part) for part in SPECULATIVE_SINCE))
+        return flags
+    flags.append("--speculative-config " + _quote(json.dumps(NGRAM, separators=(",", ":"))))
+    return flags
+
+
+def _release(version: str) -> tuple[int, int] | None:
+    """Major and minor of a vLLM version string, or None if it says nothing."""
+    match = re.match(r"\s*(\d+)\.(\d+)", version or "")
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def _quote(value: str) -> str:
+    """Protect *value* from systemd's own tokeniser.
+
+    systemd splits ``ExecStart`` itself and strips double quotes as it goes,
+    which would hand vLLM ``{method:ngram}`` — valid to a shell reader, not to
+    a JSON parser. Single quotes survive whatever they wrap.
+    """
+    if "'" in value:
+        raise ValueError(f"cannot put {value!r} in a unit file: it contains a quote")
+    return f"'{value}'"
 
 
 def _systemctl(args: list[str]) -> tuple[int, str]:

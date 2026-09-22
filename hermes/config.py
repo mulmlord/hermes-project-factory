@@ -64,6 +64,12 @@ DEFAULTS: dict[str, Any] = {
         # which start.sh keeps equal to the server's --max-model-len.
         "model_path": "",        # weights directory the unit serves
         "gpu_util": 0.90,        # fraction of VRAM vLLM may use
+        # How the unit serves, for the two things this workload does that
+        # serving in general does not: the same project asked about over and
+        # over behind one stable prompt prefix, and answers that copy long
+        # runs out of the prompt. See hermes.server.serve_flags.
+        "prefix_caching": True,
+        "speculative": "ngram",  # ngram | off
     },
     "sandbox": {
         "runtime": "docker",          # docker | local
@@ -423,14 +429,24 @@ server:
   # --config` can rebuild the unit from this file without asking again.
   model_path: ""               # weights directory the unit serves
   gpu_util: 0.90               # fraction of VRAM vLLM may use
+  prefix_caching: true         # reuse the KV cache across calls that share a
+                               # prompt prefix, which most of ours do
+  speculative: ngram           # draft from text already in the prompt, which
+                               # is where most edits come from | off
 
 sandbox:
   runtime: docker                    # docker | local
   image: python:3.11-slim
   network: none
-  memory: 8g
+  memory: 8g                         # RAM, and the swap cap too: no swap beyond it
   cpus: 4
   timeout: 900
+  read_only: true                    # root filesystem read-only; writes go to
+                                     # the workspace or to /tmp
+  tmp: 2g                            # size of /tmp ($HOME, where pip --user
+                                     # installs land); counts against memory
+  oci_runtime: ""                    # runsc (gVisor) or kata-runtime for a
+                                     # kernel boundary; blank is docker's runc
 
 research:
   enabled: true

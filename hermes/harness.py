@@ -12,12 +12,27 @@ rest of Hermes already requires.
 """
 from __future__ import annotations
 
+import ast
 import json
+import shlex
+import shutil
+import sys
+import tempfile
 import time
+import xml.etree.ElementTree as ElementTree
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .config import Config
+
+#: Requirements documents and the held-out tests that score them, one folder
+#: per library task. Shipped with the package and protected from
+#: ``hermes improve``, because they are the instrument, not the subject.
+SUITE_DIR = Path(__file__).with_name("suite")
+
+#: Where the held-out tests are dropped inside the scored copy. Not a dot
+#: directory, so pytest names the tests after it rather than after nothing.
+HOLDOUT_DIR = "hermes_holdout"
 
 @dataclass
 class Task:
@@ -30,6 +45,29 @@ class Task:
     #: one takes: a single stuck command is bounded only by the sandbox
     #: timeout, so without this one bad idea can consume a whole suite run.
     budget_seconds: float = 1800.0
+    #: Folder under :data:`SUITE_DIR` whose tests score the finished project.
+    #: Empty for the small ideas, which are judged only by whether the
+    #: factory says it finished.
+    holdout: str = ""
+
+    @property
+    def summary(self) -> str:
+        return self.idea.splitlines()[0].lstrip("# ").strip()
+
+
+def library(name: str) -> Task:
+    """A task shaped like NL2Repo-Bench: a requirements document, an empty
+    workspace, and tests the factory never sees.
+
+    The document is the whole idea -- it pins the package, its modules and
+    its public API, because a held-out suite can only import what was named.
+    Scoring is the share of held-out tests that pass, which is dense where
+    ``completed`` is a single bit, and independent of the factory's own
+    verdict, which is the point: the failure these tasks exist to catch is a
+    factory that stops early and calls a half-built library done.
+    """
+    return Task(name, (SUITE_DIR / name / "REQUIREMENTS.md").read_text(),
+                iterations=120, budget_seconds=5400.0, holdout=name)
 
 
 #: Ideas small enough to finish on local models, chosen to differ in what they
@@ -53,7 +91,131 @@ SUITE = (
          iterations=50),
     Task("task-queue", "Build an in-memory Python task queue with priorities, "
                        "retries and a persistent JSON log."),
+    # Multi-module libraries from a requirements document: date arithmetic
+    # and a small grammar, a lexer-parser-renderer pipeline, and a data model
+    # whose invariants span modules.
+    library("cronspec"),
+    library("stencil"),
+    library("tally"),
 )
+
+
+@dataclass
+class Holdout:
+    """How a finished workspace did against tests it never saw."""
+
+    passed: int = 0
+    total: int = 0
+    #: Why the score is not a measurement of the project, when it is not:
+    #: a suite that could not run says nothing about the code it would test.
+    note: str = ""
+
+
+def expected_tests(folder: Path) -> dict[tuple[str, str], int]:
+    """Cases per held-out test function, read from the source.
+
+    The denominator comes from here rather than from what pytest reports,
+    because a project that fails to import collects nothing, and a rate
+    measured against what was collected would score that project 0/0.
+    Only module-level functions count, and a parametrize whose cases are not
+    a literal list is refused rather than guessed at.
+    """
+    counts: dict[tuple[str, str], int] = {}
+    for path in sorted(Path(folder).glob("test_*.py")):
+        for node in ast.parse(path.read_text()).body:
+            if not (isinstance(node, ast.FunctionDef) and node.name.startswith("test_")):
+                continue
+            cases = 1
+            for decorator in node.decorator_list:
+                if (isinstance(decorator, ast.Call)
+                        and getattr(decorator.func, "attr", "") == "parametrize"):
+                    values = decorator.args[1] if len(decorator.args) > 1 else None
+                    if not isinstance(values, (ast.List, ast.Tuple)):
+                        raise ValueError(f"{path.name}:{node.name}: parametrize "
+                                         "cases must be a literal list")
+                    cases *= len(values.elts)
+            counts[(path.stem, node.name)] = cases
+    return counts
+
+
+def passed_tests(junit: str, expected: dict[tuple[str, str], int]) -> int:
+    """Count passing cases in a JUnit report, and only the ones we wrote.
+
+    A case is keyed by its module and function, so a test the project
+    smuggled in beside ours adds nothing, and no function is credited more
+    cases than its source declares.
+    """
+    try:
+        root = ElementTree.fromstring(junit)
+    except ElementTree.ParseError:
+        return 0
+    credited: dict[tuple[str, str], int] = {}
+    for case in root.iter("testcase"):
+        if any(child.tag in ("failure", "error", "skipped") for child in case):
+            continue
+        key = (case.get("classname", "").rsplit(".", 1)[-1],
+               case.get("name", "").split("[", 1)[0])
+        if key in expected:
+            credited[key] = min(expected[key], credited.get(key, 0) + 1)
+    return sum(credited.values())
+
+
+def score(task: Task, root: Path, sandbox_cfg: dict, setup: str = "") -> Holdout:
+    """Run the held-out tests against a pristine export of the workspace.
+
+    The export is what a release would ship, so a file the factory wrote and
+    never committed does not count. The run is the generated project's code,
+    so it happens in a fresh sandbox, and pytest is told to ignore every
+    ``conftest.py``, the project's own pytest configuration and any plugin
+    the project installed: those are the three ways a project can change
+    what a test run reports without changing what its code does.
+    """
+    from .release import export
+    from .sandbox import Sandbox
+
+    folder = SUITE_DIR / task.holdout
+    expected = expected_tests(folder)
+    total = sum(expected.values())
+    root = Path(root)
+    if not root.is_dir():
+        return Holdout(0, total, "no workspace to score")
+    staging = Path(tempfile.mkdtemp(prefix="hermes-holdout-", dir=root.parent))
+    try:
+        export(root, staging)
+        target = staging / HOLDOUT_DIR
+        shutil.rmtree(target, ignore_errors=True)
+        target.mkdir()
+        files = sorted(folder.glob("test_*.py"))
+        for path in files:
+            shutil.copy2(path, target / path.name)
+        (target / "pytest.ini").write_text("[pytest]\n")
+        box = Sandbox(staging, dict(sandbox_cfg))
+        # The host's interpreter when the box is the host, since a bare
+        # ``python`` there may be one without pytest.
+        python = "python" if box.runtime == "docker" else shlex.quote(sys.executable)
+        with box:
+            if setup.strip():
+                box.install(setup)
+            if not box.run(f"{python} -m pytest --version").ok:
+                if box.runtime != "docker" or not box.install(
+                        "pip install --quiet pytest").ok:
+                    return Holdout(0, total, "pytest is not available to run "
+                                             "the held-out tests")
+            report = f"{HOLDOUT_DIR}/junit.xml"
+            run = box.run(
+                f"PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 {python} -m pytest -q "
+                f"-p no:cacheprovider --noconftest -c {HOLDOUT_DIR}/pytest.ini "
+                f"--rootdir . --junitxml {report} "
+                + " ".join(f"{HOLDOUT_DIR}/{p.name}" for p in files),
+                timeout=600)
+        junit = staging / report
+        if not junit.is_file():
+            return Holdout(0, total, "the held-out run wrote no report: "
+                                     + run.summary(300))
+        return Holdout(passed_tests(junit.read_text(errors="replace"), expected),
+                       total)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 @dataclass
@@ -88,13 +250,20 @@ class Trial:
     overlap_seconds: float = 0.0
     error: str = ""
     root: str = ""
+    #: Held-out tests passed, of those the task's suite declares. Zero of
+    #: zero for a task with no held-out suite.
+    holdout_passed: int = 0
+    holdout_total: int = 0
+    holdout_note: str = ""
 
     def row(self) -> str:
         mark = "pass" if self.completed else ("TIME" if self.timed_out else "FAIL")
         return (f"{self.name:<14} {mark:>4} {self.phase:<14} "
                 f"tickets={self.tickets_completed}/{self.tickets} "
                 f"first_pass={self.first_pass:.0%} "
-                f"{self.seconds / 60:.1f}m "
+                + (f"held-out={self.holdout_passed}/{self.holdout_total} "
+                   if self.holdout_total else "")
+                + f"{self.seconds / 60:.1f}m "
                 f"(gpu {self.inference_seconds / 60:.1f}m, "
                 f"cpu {self.sandbox_seconds / 60:.1f}m)"
                 + (f" error={self.error[:60]}" if self.error else ""))
@@ -102,7 +271,7 @@ class Trial:
 
 def collect(name: str, state, board, usage: list[dict], sandbox_seconds: float,
             seconds: float, error: str = "", root: str = "",
-            timed_out: bool = False) -> Trial:
+            timed_out: bool = False, holdout: Holdout | None = None) -> Trial:
     """Turn a finished run into numbers.
 
     Kept free of the factory so the accounting can be tested without standing
@@ -114,6 +283,7 @@ def collect(name: str, state, board, usage: list[dict], sandbox_seconds: float,
     done = board.by_status("completed")
     inference = round(sum(c.get("seconds", 0.0) for c in usage), 1)
     ledgers = inference + sandbox_seconds
+    holdout = holdout or Holdout()
     return Trial(
         name=name,
         phase=getattr(state, "phase", "UNKNOWN"),
@@ -133,6 +303,9 @@ def collect(name: str, state, board, usage: list[dict], sandbox_seconds: float,
         overlap_seconds=round(max(0.0, ledgers - seconds), 1),
         error=error,
         root=root,
+        holdout_passed=holdout.passed,
+        holdout_total=holdout.total,
+        holdout_note=holdout.note,
     )
 
 
@@ -155,14 +328,28 @@ def run_task(task: Task, root: Path, config: Config | None = None,
                     deadline=started + (budget or task.budget_seconds))
     except Exception as exc:  # noqa: BLE001 - a crashed entry is a result, not a stop
         error = f"{type(exc).__name__}: {exc}"[:300]
+    seconds = time.time() - started  # the scoring is ours, not the factory's
+    holdout = None
+    if task.holdout:
+        # Scored whatever state the run ended in: a crashed or timed-out run
+        # is exactly the one whose partial library is worth counting.
+        config = factory.config if factory is not None else (config or Config.load())
+        setup = ((factory.state.plan.get("commands") or {}).get("setup", "")
+                 if factory is not None else "")
+        try:
+            holdout = score(task, root, config.data.get("sandbox", {}), setup)
+        except Exception as exc:  # noqa: BLE001 - a scoring fault is reported, not raised
+            holdout = Holdout(0, sum(expected_tests(SUITE_DIR / task.holdout).values()),
+                              f"scoring failed: {type(exc).__name__}: {exc}"[:300])
     if factory is None:
         return collect(task.name, State(idea=task.idea), Board(root), [], 0.0,
-                       time.time() - started, error, str(root))
+                       seconds, error, str(root), holdout=holdout)
     return collect(task.name, factory.state, factory.board,
                    list(getattr(factory.router, "usage", [])),
                    float(getattr(getattr(factory, "sandbox", None), "spent", 0.0)),
-                   time.time() - started, error, str(root),
-                   timed_out=bool(factory.state.metrics.get("deadline_reached")))
+                   seconds, error, str(root),
+                   timed_out=bool(factory.state.metrics.get("deadline_reached")),
+                   holdout=holdout)
 
 
 def run_suite(root: Path, config: Config | None = None,
@@ -216,6 +403,23 @@ def summarise(trials: list[Trial]) -> str:
         f"claimed by both ledgers, which prefetch makes possible",
         resolution(trials),
     ]
+    scored = [t for t in trials if t.holdout_total]
+    if scored:
+        passed = sum(t.holdout_passed for t in scored)
+        total = sum(t.holdout_total for t in scored)
+        lines.append(f"held-out       {passed / total:.0%} of {total} tests across "
+                     f"{len(scored)} library task(s)")
+        # The failure NL2Repo-Bench names first: stopping early and calling
+        # a half-built library done. Only tests the factory never saw show it.
+        claimed = [t.name for t in scored
+                   if t.completed and t.holdout_passed < t.holdout_total]
+        if claimed:
+            lines.append(f"overclaimed    {len(claimed)} task(s) reached COMPLETED "
+                         f"while failing held-out tests: {', '.join(claimed)}")
+        unmeasured = [t.name for t in scored if t.holdout_note]
+        if unmeasured:
+            lines.append(f"unscored       {', '.join(unmeasured)}: the held-out "
+                         "run did not measure the project (see holdout_note)")
     if timed:
         lines.append(f"timed out      {timed} task(s) stopped on their budget, "
                      "so their numbers are a floor rather than a result")
@@ -238,14 +442,19 @@ def resolution(trials: list[Trial]) -> str:
         return "resolution     too few tasks to rank anything"
     completed = sum(1 for t in trials if t.completed)
     rates = {round(t.first_pass, 2) for t in trials if t.tickets_completed}
-    if completed == 0:
+    # Partial credit is what lets a suite nobody finishes still rank: two
+    # factories that both fail can differ in how much of the library works.
+    held = {round(t.holdout_passed / t.holdout_total, 2)
+            for t in trials if t.holdout_total}
+    if completed == 0 and len(held) <= 1:
         return ("resolution     NONE: no task completed. Nothing here can rank "
                 "a change; fix the factory or the model first")
-    if completed == len(trials) and len(rates) <= 1:
+    if completed == len(trials) and len(rates) <= 1 and len(held) <= 1:
         return ("resolution     NONE: every task completed at one first-pass "
                 "rate, so this suite cannot tell two factories apart")
     return (f"resolution     {completed}/{len(trials)} completed, "
-            f"{len(rates)} distinct first-pass rate(s)")
+            f"{len(rates)} distinct first-pass rate(s)"
+            + (f", {len(held)} distinct held-out rate(s)" if held else ""))
 
 
 def write_report(directory: Path, trials: list[Trial]) -> Path:
@@ -282,7 +491,10 @@ def compare(before: Path, after: Path) -> str:
         done = "{} -> {}".format(a["completed"], b["completed"])
         passed = "{:.0%} -> {:.0%}".format(a["first_pass"], b["first_pass"])
         clock = "{:.1f}m -> {:.1f}m".format(a["seconds"] / 60, b["seconds"] / 60)
-        lines.append(f"{name:<14} {done:>18} {passed:>16} {clock:>18}")
+        held = ("  held-out {} -> {}".format(a.get("holdout_passed", 0),
+                                           b.get("holdout_passed", 0))
+                if a.get("holdout_total") or b.get("holdout_total") else "")
+        lines.append(f"{name:<14} {done:>18} {passed:>16} {clock:>18}{held}")
     return "\n".join(lines + ["", _verdict(old, new)])
 
 
@@ -298,8 +510,10 @@ def _verdict(old: dict, new: dict) -> str:
         name for name in shared
         if old[name]["completed"] != new[name]["completed"]
         or abs(old[name].get("first_pass", 0) - new[name].get("first_pass", 0)) > 0.01
+        or old[name].get("holdout_passed", 0) != new[name].get("holdout_passed", 0)
     )
     if not moved:
-        return ("no task changed completion or first-pass rate: this pair does "
-                "not support accepting or rejecting the change")
+        return ("no task changed completion, first-pass rate or held-out "
+                "tests: this pair does not support accepting or rejecting the "
+                "change")
     return f"{len(moved)} of {len(shared)} task(s) moved: {', '.join(moved)}"

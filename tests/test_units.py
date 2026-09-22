@@ -4084,6 +4084,133 @@ def test_eval_compare_refuses_to_read_meaning_into_an_unmoved_pair(tmp_path):
     stubs = harness.compare(report("b3", model_calls=0), report("a3", model_calls=0))
     assert "compares two stubs" in stubs
 
+    held = harness.compare(report("b4", holdout_passed=3, holdout_total=9),
+                           report("a4", holdout_passed=5, holdout_total=9))
+    assert "held-out 3 -> 5" in held and "1 of 1 task(s) moved" in held
+
+
+# -- held-out library tasks --------------------------------------------------
+
+LIBRARIES = [t for t in harness.SUITE if t.holdout]
+REFERENCE = Path(__file__).parent / "reference"
+
+
+def test_the_suite_carries_library_tasks_with_held_out_tests():
+    assert {t.name for t in LIBRARIES} == {"cronspec", "stencil", "tally"}
+    for task in LIBRARIES:
+        assert task.idea.startswith(f"# {task.name}")
+        assert sum(harness.expected_tests(harness.SUITE_DIR / task.name).values()) >= 20
+
+
+@pytest.mark.parametrize("task", LIBRARIES, ids=lambda t: t.name)
+def test_a_reference_solution_passes_every_held_out_test(task, tmp_path):
+    """The instrument is calibrated: a library that meets the document scores
+    full marks, so a lower score is the factory's, never the tests'."""
+    root = tmp_path / task.name
+    shutil.copytree(REFERENCE / task.name, root)
+    held = harness.score(task, root, {"runtime": "local"})
+    assert held.note == ""
+    assert held.total == sum(harness.expected_tests(harness.SUITE_DIR / task.name).values())
+    assert held.passed == held.total
+
+
+@pytest.mark.parametrize("task", LIBRARIES, ids=lambda t: t.name)
+def test_an_empty_workspace_scores_nothing(task, tmp_path):
+    """The denominator is the source's, so a library that never imports is
+    0 of N rather than 0 of 0."""
+    root = tmp_path / task.name
+    root.mkdir()
+    held = harness.score(task, root, {"runtime": "local"})
+    assert held.note == "" and held.passed == 0 and held.total > 0
+
+
+def test_held_out_tests_name_only_what_the_document_names():
+    """A hidden test may only ask for what the requirements promised."""
+    for task in LIBRARIES:
+        document = task.idea
+        for path in (harness.SUITE_DIR / task.name).glob("test_*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.ImportFrom) and node.module.startswith(task.name):
+                    if "." in node.module:
+                        assert node.module.replace(".", "/") + ".py" in document
+                    for alias in node.names:
+                        assert f"`{alias.name}" in document, (task.name, alias.name)
+
+
+def test_a_project_cannot_rewrite_what_the_held_out_run_reports(tmp_path):
+    """conftest.py, a pytest config and a stray test of the same name are the
+    ways a project could change the count without changing its code."""
+    task = next(t for t in LIBRARIES if t.name == "cronspec")
+    root = tmp_path / "rigged"
+    # Importable and wrong, so the held-out tests run and fail: a rig that
+    # cannot be imported is never asked for a report to rewrite.
+    (root / "src" / "cronspec").mkdir(parents=True)
+    (root / "src" / "cronspec" / "__init__.py").write_text(
+        "class CronError(RuntimeError):\n    pass\n\n"
+        "class Cron:\n    pass\n\n"
+        "def parse(expression):\n    return Cron()\n")
+    (root / "conftest.py").write_text(
+        "import pytest\n"
+        "@pytest.hookimpl(hookwrapper=True)\n"
+        "def pytest_runtest_makereport(item, call):\n"
+        "    outcome = yield\n"
+        "    report = outcome.get_result()\n"
+        "    report.outcome = 'passed'\n")
+    (root / "pytest.ini").write_text("[pytest]\naddopts = -p no:junitxml\n")
+    (root / harness.HOLDOUT_DIR).mkdir()
+    (root / harness.HOLDOUT_DIR / "test_cronspec.py").write_text(
+        "def test_every_minute_expands_every_field():\n    pass\n")
+    held = harness.score(task, root, {"runtime": "local"})
+    assert held.note == "" and held.passed == 0
+
+
+def test_passed_tests_credits_only_declared_cases():
+    expected = {("test_a", "test_one"): 1, ("test_a", "test_many"): 2}
+    junit = """<testsuites><testsuite>
+      <testcase classname="hermes_holdout.test_a" name="test_one"/>
+      <testcase classname="hermes_holdout.test_a" name="test_one"/>
+      <testcase classname="hermes_holdout.test_a" name="test_many[x]"/>
+      <testcase classname="hermes_holdout.test_a" name="test_many[y]"><failure/></testcase>
+      <testcase classname="hermes_holdout.test_b" name="test_extra"/>
+    </testsuite></testsuites>"""
+    assert harness.passed_tests(junit, expected) == 2
+    assert harness.passed_tests("not xml", expected) == 0
+
+
+def test_expected_tests_refuses_a_parametrize_it_cannot_count(tmp_path):
+    (tmp_path / "test_x.py").write_text(
+        "import pytest\n"
+        "@pytest.mark.parametrize('a', [1, 2, 3])\n"
+        "@pytest.mark.parametrize('b', (4, 5))\n"
+        "def test_grid(a, b):\n    pass\n")
+    assert harness.expected_tests(tmp_path) == {("test_x", "test_grid"): 6}
+    (tmp_path / "test_y.py").write_text(
+        "import pytest\nCASES = [1]\n"
+        "@pytest.mark.parametrize('a', CASES)\ndef test_y(a):\n    pass\n")
+    with pytest.raises(ValueError):
+        harness.expected_tests(tmp_path)
+
+
+def test_eval_names_a_library_the_factory_called_done_too_early():
+    trials = [harness.Trial(name="stencil", completed=True, tickets_completed=3,
+                            first_pass=1.0, holdout_passed=10, holdout_total=23),
+              harness.Trial(name="tally", completed=True, tickets_completed=3,
+                            first_pass=1.0, holdout_passed=24, holdout_total=24)]
+    text = harness.summarise(trials)
+    assert "held-out       72% of 47 tests across 2 library task(s)" in text
+    assert "overclaimed    1 task(s) reached COMPLETED while failing held-out tests: stencil" in text
+    # One first-pass rate, but the libraries differ in how much of them works.
+    assert "resolution     2/2 completed, 1 distinct first-pass rate(s), 2 distinct held-out" in text
+    assert "held-out=10/23" in trials[0].row()
+
+
+def test_partial_credit_ranks_a_suite_nobody_finished():
+    trials = [harness.Trial(name="a", holdout_passed=4, holdout_total=20),
+              harness.Trial(name="b", holdout_passed=9, holdout_total=20)]
+    assert "resolution     NONE" not in harness.summarise(trials)
+    unscored = [harness.Trial(name="a", holdout_total=20, holdout_note="pytest missing")]
+    assert "unscored       a" in harness.summarise(unscored)
+
 
 # -- self-improvement --------------------------------------------------------
 
@@ -4107,6 +4234,7 @@ def test_a_change_to_what_judges_it_is_refused_unevaluated():
 
     assert "judges it" in admissible(["tests/test_units.py"])
     assert "judges it" in admissible(["hermes/harness.py"])
+    assert "judges it" in admissible(["hermes/suite/tally/test_tally.py"])
     assert "judges it" in admissible(["hermes/improve.py"])
     assert "judges it" in admissible(["pyproject.toml"])
     assert admissible(["hermes/planning.py"]) == ""
@@ -4140,6 +4268,12 @@ def test_measured_gain_reads_two_evaluations_strictly(tmp_path):
     assert measured_gain(base, report("better", first_pass=1.0))[0]
     assert not measured_gain(base, report("same"))[0]
     assert not measured_gain(base, report("worse", completed=False))[0]
+    # Tests the factory never saw outrank the first-pass rate, both ways.
+    held = report("held", holdout_passed=10, holdout_total=24)
+    assert measured_gain(held, report("more", holdout_passed=12, holdout_total=24))[0]
+    ok, why = measured_gain(held, report("less", first_pass=1.0,
+                                         holdout_passed=9, holdout_total=24))
+    assert not ok and "held-out" in why
     # Two stub runs describe the stub, not the factory.
     stub_a, stub_b = report("sa", model_calls=0), report("sb", model_calls=0)
     ok, why = measured_gain(stub_a, stub_b)

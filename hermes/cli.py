@@ -494,7 +494,8 @@ def cmd_eval(args) -> int:
         return 0
     if args.list:
         for task in SUITE:
-            print(f"{task.name:<14} {task.idea}")
+            print(f"{task.name:<14} {task.summary}"
+                  + (" (requirements document, held-out tests)" if task.holdout else ""))
         return 0
     root = Path(args.into).resolve() if args.into else (
         Path.cwd() / "evaluations" / time.strftime("%Y%m%d-%H%M%S"))

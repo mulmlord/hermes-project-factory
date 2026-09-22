@@ -19,5 +19,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["hermes*"]
 
+[tool.setuptools.package-data]
+# The eval suite's requirements documents and held-out tests (hermes/harness.py).
+hermes = ["suite/*/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

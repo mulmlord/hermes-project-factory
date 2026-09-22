@@ -601,6 +601,7 @@ def cmd_doctor(args) -> int:
     autostart = bool(config.get("server.autostart", True))
     state = unit_state(unit) if unit else "not configured"
     router = Router(config)
+    reachable = False
     # Resolved in its own pass, and before any endpoint is probed, so that a
     # config fault — an empty model name, a hosted base_url — can never be
     # excused below as a server that has merely not been started yet. Only
@@ -615,6 +616,7 @@ def cmd_doctor(args) -> int:
         try:
             for line in router.preflight():
                 print(f"model     {line}")
+            reachable = True
         except ConfigError as exc:
             if autostart and state in ("inactive", "activating", "deactivating"):
                 # Not a fault: the run that needs the server is what starts
@@ -626,6 +628,11 @@ def cmd_doctor(args) -> int:
     if unit:
         print(f"server    {unit} {state}"
               f"{'' if autostart else ' (autostart off: start it yourself)'}")
+    if getattr(args, "probe", False):
+        if reachable:
+            ok = _probe(router) and ok
+        else:
+            print("probe     skipped: no server answering to ask", file=sys.stderr)
     # What a ticket that keeps failing will be asked next, and whether every
     # rung names a role that exists: a typo there is otherwise discovered on
     # the third attempt of some ticket in the middle of an unattended run.
@@ -672,6 +679,29 @@ def cmd_doctor(args) -> int:
     for tool in ("git", "gh", "docker"):
         print(f"tool      {tool}: {_shutil.which(tool) or 'not found'}")
     return 0 if ok else 1
+
+
+def _probe(router) -> bool:
+    """Ask each distinct served model the questions in :mod:`hermes.probe`.
+
+    One backend per model rather than per role: every role routed to the same
+    weights on the same server would only be asked the same question again.
+    """
+    from .probe import FAIL, WARN, probe
+    served: dict[tuple, list[str]] = {}
+    for task in router.routed_tasks():
+        cfg = router.backend(task).cfg
+        served.setdefault((cfg.backend, cfg.base_url, cfg.model), []).append(task)
+    print("probe     one sample per layer at temperature 0; a WARN is a tendency")
+    ok = True
+    for (_, _, model), tasks in served.items():
+        for finding in probe(router.backend(tasks[0])):
+            line = (f"probe     {model} {finding.layer}: "
+                    f"{'' if finding.verdict == 'ok' else finding.verdict.upper() + ' '}"
+                    f"{finding.text}")
+            print(line, file=sys.stderr if finding.verdict in (WARN, FAIL) else sys.stdout)
+            ok = ok and finding.verdict != FAIL
+    return ok
 
 
 def config_write_path(args) -> Path:
@@ -904,8 +934,11 @@ def build_parser() -> argparse.ArgumentParser:
     ckpt.add_argument("--restore", metavar="NAME")
     ckpt.set_defaults(func=cmd_checkpoint)
 
-    sub.add_parser("doctor", help="verify models, sandbox and tooling").set_defaults(
-        func=cmd_doctor)
+    doctor = sub.add_parser("doctor", help="verify models, sandbox and tooling")
+    doctor.add_argument("--probe", action="store_true",
+                        help="also ask the running server a few small questions "
+                             "(two short generations per served model)")
+    doctor.set_defaults(func=cmd_doctor)
 
     cfg = sub.add_parser("config", help="show or edit the configuration")
     cfg.add_argument("--sample", action="store_true", help="print a starter hermes.yaml")

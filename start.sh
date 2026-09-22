@@ -597,7 +597,12 @@ fi
 # -- check -------------------------------------------------------------------
 
 note "checking what Hermes sees"
-"$VENV/bin/hermes" -c "$CONFIG" doctor \
+# Having waited, the server is known to answer, so it is worth asking it the
+# questions that only a live server can: whether it holds a reply to a schema,
+# whether its window is the one the config sizes prompts to.
+PROBE=""
+[ "$WAIT" -eq 1 ] && PROBE="--probe"
+"$VENV/bin/hermes" -c "$CONFIG" doctor $PROBE \
   || warn "doctor found problems above. Hermes will not fall back to a cloud API."
 
 cat <<EOF

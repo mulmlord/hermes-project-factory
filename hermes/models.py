@@ -98,6 +98,22 @@ class Backend:
     def available_models(self) -> list[str]:
         raise NotImplementedError
 
+    def served_context(self) -> int | None:
+        """The context window the server was started with, where it says.
+
+        None means the server does not report one, not that it has none.
+        """
+        return None
+
+    def placement(self) -> tuple[int, int] | None:
+        """Bytes of the loaded model in all, and of those in VRAM.
+
+        None where the question does not arise. vLLM and llama.cpp place the
+        weights once at startup and fail loudly when they do not fit; only a
+        server that re-places the model per request can quietly spill it.
+        """
+        return None
+
 
 class OllamaBackend(Backend):
     def complete(self, system, prompt, *, temperature=None, max_tokens=None,
@@ -132,6 +148,21 @@ class OllamaBackend(Backend):
     def available_models(self):
         data = _get(f"{self.cfg.base_url.rstrip('/')}/api/tags")
         return [m["name"] for m in data.get("models", [])]
+
+    def placement(self):
+        # ollama sizes the KV cache from the num_ctx each request sends, and a
+        # context that no longer fits beside the weights pushes layers onto
+        # the CPU without a word. /api/ps is the only place that shows, and
+        # it lists a model only while it is loaded.
+        try:
+            data = _get(f"{self.cfg.base_url.rstrip('/')}/api/ps")
+        except ModelError:
+            return None
+        for entry in data.get("models", []):
+            names = [str(entry.get("name", "")), str(entry.get("model", ""))]
+            if _model_present(self.cfg.model, names):
+                return _int(entry.get("size")), _int(entry.get("size_vram"))
+        return None
 
 
 class OpenAICompatBackend(Backend):
@@ -178,6 +209,23 @@ class OpenAICompatBackend(Backend):
     def available_models(self):
         data = _get(f"{self._base()}/models")
         return [m["id"] for m in data.get("data", [])]
+
+    def served_context(self):
+        # vLLM puts --max-model-len on the model listing; llama.cpp's server
+        # keeps n_ctx on /props, beside /v1 rather than under it.
+        try:
+            for entry in _get(f"{self._base()}/models").get("data", []):
+                if (_model_present(self.cfg.model, [str(entry.get("id", ""))])
+                        and _int(entry.get("max_model_len"))):
+                    return _int(entry["max_model_len"])
+        except ModelError:
+            return None
+        try:
+            props = _get(f"{self._base()[:-len('/v1')]}/props")
+        except ModelError:
+            return None
+        settings = props.get("default_generation_settings") or {}
+        return _int(settings.get("n_ctx") or props.get("n_ctx")) or None
 
 
 BACKENDS = {
@@ -518,6 +566,13 @@ def _rejects_parameter(exc: ModelError) -> bool:
     if " HTTP 4" not in text or _CONTEXT_LIMIT.search(text):
         return False
     return bool(_PARAMETER_REFUSAL.search(text))
+
+
+def _int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _model_present(name: str, installed: list[str]) -> bool:

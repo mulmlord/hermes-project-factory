@@ -360,6 +360,22 @@ That installs the factory only — no model server — so you would be pointing
 local server, that the sandbox runtime works, and that the tooling is present.
 It refuses to guess.
 
+`hermes doctor --probe` also asks the running server a few small questions,
+one per layer, because most "the model cannot use its tools" failures are the
+server, not the model. It checks four things. First, **context**: is
+`models.<role>.context` larger than the window the server actually serves
+(vLLM's `max_model_len`, llama.cpp's `n_ctx`)? Second, **schema**: does the
+server enforce a JSON Schema, refuse it, or accept it and quietly ignore it?
+Third, **lookup**: given the real lookup protocol and a question only a file
+read can answer, does the model ask, guess, or ask in a shape the toolbox
+cannot run? Fourth, on ollama, **memory**: how much of the model spilled out
+of VRAM at the configured context? It does not probe the server's own
+tool-call parser, because Hermes never sends `tools=`. Its lookups travel as
+JSON in the reply. Each question is one sample at temperature 0, so treat a
+warning as a tendency, not a verdict. Only a context too large for the server
+or a reply that is not JSON fails the check. `start.sh` runs the probe
+whenever it has waited for the server to come up.
+
 ## Uninstall
 
 ```console

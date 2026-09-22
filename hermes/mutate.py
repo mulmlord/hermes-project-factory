@@ -277,11 +277,17 @@ def select(candidates: list[Mutant], limit: int) -> list[Mutant]:
     by_path: dict[str, list[Mutant]] = {}
     for mutant in candidates:
         by_path.setdefault(mutant.path, []).append(mutant)
-    share = max(1, limit // len(by_path))
-    picked: list[Mutant] = []
+    spread = []
     for group in by_path.values():
-        step = max(1, len(group) // share)
-        picked.extend(group[::step][:share])
+        step = max(1, len(group) // limit)
+        spread.append(group[::step])
+    picked: list[Mutant] = []
+    # Round-robin, so a change with one big file and one small one still tests
+    # the small one, and a limit larger than one file's share is not wasted.
+    for rank in range(max(len(s) for s in spread)):
+        picked.extend(s[rank] for s in spread if rank < len(s))
+        if len(picked) >= limit:
+            break
     picked.sort(key=lambda m: (m.path, m.index))
     return picked[:limit]
 

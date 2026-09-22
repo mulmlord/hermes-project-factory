@@ -9,8 +9,16 @@ import uuid
 from dataclasses import asdict
 from pathlib import Path
 
+import yaml
+
 from . import phases, workspace
-from .config import Config, ConfigError, SAMPLE_CONFIG
+from .config import (
+    Config,
+    ConfigError,
+    SAMPLE_CONFIG,
+    set_config_value,
+    user_config_paths,
+)
 from .contextdb import open_db
 from .journal import Journal
 from .log import for_workspace, scope
@@ -655,13 +663,72 @@ def cmd_doctor(args) -> int:
     return 0 if ok else 1
 
 
+def config_write_path(args) -> Path:
+    """Which file ``--set`` edits, in the order a person would expect.
+
+    An explicit ``-c`` wins, then a hermes.yaml in this directory, then the
+    per-user config -- which is also what gets created when none of the three
+    exists, since a config written into whatever directory the installer
+    happened to run from would be read by nothing.
+    """
+    if getattr(args, "config", None):
+        return Path(args.config)
+    here = Path.cwd() / "hermes.yaml"
+    if here.is_file():
+        return here
+    for candidate in user_config_paths():
+        if candidate.is_file():
+            return candidate
+    return user_config_paths()[0]
+
+
 def cmd_config(args) -> int:
     if args.sample:
         print(SAMPLE_CONFIG)
         return 0
+    if args.assignments:
+        return _config_set(args)
     config = _config(args)
     print(f"# source: {config.path or 'built-in defaults'}")
     print(config.dump())
+    return 0
+
+
+def _config_set(args) -> int:
+    """Apply ``--set key=value`` to a config file, comments and all.
+
+    start.sh records what it started a server with this way. The file is
+    edited as text rather than re-dumped because every option in it carries
+    the sentence that explains it, and a round trip through the YAML parser
+    would hand back a correct file with all of that deleted.
+    """
+    path = config_write_path(args)
+    if path.is_file():
+        text = path.read_text()
+    else:
+        text = SAMPLE_CONFIG
+        print(f"config    creating {path}")
+    for assignment in args.assignments:
+        key, sep, raw = assignment.partition("=")
+        if not sep or not key.strip():
+            print(f"config    not a KEY=VALUE assignment: {assignment}", file=sys.stderr)
+            return 2
+        # Through the YAML parser, so `context=32768` is a number, `x=true` a
+        # boolean and `model=qwen2.5` the string it looks like.
+        value = yaml.safe_load(raw) if raw.strip() else ""
+        try:
+            text = set_config_value(text, key.strip(), value)
+        except ConfigError as exc:
+            print(f"config    {exc}", file=sys.stderr)
+            return 1
+        print(f"config    {key.strip()}: {value!r}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Written whole and moved into place: an interrupted write that leaves a
+    # half-config behind would break every later run, not just this one.
+    temporary = path.with_suffix(path.suffix + ".new")
+    temporary.write_text(text)
+    temporary.replace(path)
+    print(f"config    wrote {path}")
     return 0
 
 
@@ -829,8 +896,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor", help="verify models, sandbox and tooling").set_defaults(
         func=cmd_doctor)
 
-    cfg = sub.add_parser("config", help="show effective configuration")
+    cfg = sub.add_parser("config", help="show or edit the configuration")
     cfg.add_argument("--sample", action="store_true", help="print a starter hermes.yaml")
+    cfg.add_argument("--set", action="append", default=[], dest="assignments",
+                     metavar="KEY=VALUE",
+                     help="set a dotted key in the config file, keeping its "
+                          "comments (e.g. --set models.default.context=32768)")
     cfg.set_defaults(func=cmd_config)
     return parser
 

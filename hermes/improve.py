@@ -67,6 +67,7 @@ PROTECTED = (
     "conftest.py",
     "pyproject.toml",     # testpaths, dependencies, entry points
     "install.sh",
+    "start.sh",
     "uninstall.sh",
     ".github",
     ".git",

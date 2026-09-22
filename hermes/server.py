@@ -1,6 +1,6 @@
 """Bringing the local inference server up for the length of a run.
 
-``install.sh`` writes a systemd user unit for the vLLM server but leaves it
+``start.sh`` writes a systemd user unit for the vLLM server but leaves it
 disabled on purpose. The server holds the entire model in VRAM for as long as
 it lives — vLLM has no CPU offload and never evicts — so a machine that boots
 straight into it has given several gigabytes of its GPU to a process that may

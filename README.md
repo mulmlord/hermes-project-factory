@@ -9,7 +9,7 @@ no path to a hosted API anywhere in the codebase, and a non-local endpoint is
 rejected at configuration time.
 
 ```console
-$ ./install.sh
+$ ./install.sh && ./start.sh
 $ mkdir -p ~/projects/json-diff && cd ~/projects/json-diff
 $ hpf "Build a deterministic JSON diff tool in Python"
 ```
@@ -144,9 +144,9 @@ text box a human can steer it from.
 ## Requirements
 
 - Python 3.10 or newer
-- An NVIDIA GPU with current drivers. `install.sh` sets up the model server
+- An NVIDIA GPU with current drivers. `start.sh` sets up the model server
   for you — vLLM, one model, port 6767 — and the published vLLM wheels are
-  CUDA builds. Without a GPU the installer skips the server and leaves you to
+  CUDA builds. Without a GPU the installer skips vLLM and leaves you to
   point `models.default` at a server you run yourself; Ollama, `llama.cpp` and
   any other OpenAI-compatible endpoint stay fully supported in config.
 - VRAM enough for the model you choose. vLLM keeps the entire model resident
@@ -172,23 +172,50 @@ SDK into the factory's virtualenv.
 
 ## Install
 
+Installing and starting are two scripts, because they are two different
+questions. The first only puts software on disk and asks nothing; the second
+asks what to serve and brings it up.
+
 ```console
 $ ./install.sh
+$ ./start.sh
 ```
 
-It builds a virtualenv for the factory, installs it, links `hpf` and `hermes`
-into `~/.local/bin`, pre-pulls the sandbox image, installs the OpenHands agent
-layer beside Hermes, sets up the vLLM model server described below, writes a
-config matching the model it is serving, and finishes by running
-`hermes doctor`. The server is started once so that the install proves the
-model loads on this GPU, then stopped again: from there on Hermes starts it
-when a project starts and stops it when the run ends.
+`install.sh` builds a virtualenv for the factory, installs it, links `hpf` and
+`hermes` into `~/.local/bin`, pre-pulls the sandbox image, and builds the
+neighbouring environments for vLLM and the optional OpenHands agent layer. It
+asks nothing, starts nothing, downloads no weights and writes no config, so it
+is safe to run unattended.
 
-It asks exactly one question, once: which model to serve. Either a Hugging
-Face repository to download and where to keep the weights, or a directory of
-weights you already have. Nothing else is asked, and nothing is downloaded
-behind your back — run it without a terminal and it tells you which flag to
-pass rather than fetching gigabytes unattended.
+`start.sh` is where the decisions are. It asks which model to serve — a
+Hugging Face repository to download and where to keep the weights, or a
+directory of weights you already have — on which port, with how much context
+and how much of the VRAM, writes those answers into your config, writes the
+`hermes-vllm.service` unit that serves them, starts it and finishes by running
+`hermes doctor`. Every question is pre-filled with what your config says now,
+so running it again edits your setup instead of starting over.
+
+```console
+$ ./start.sh                  # ask, update the config, start the server
+$ ./start.sh --config         # ask nothing: start what the config describes
+$ ./start.sh --port 6800 --context 32768    # answer some of it up front
+$ ./start.sh --stop           # hand the VRAM back
+```
+
+`--config` is the form for a script or a login item: it reads the config,
+rebuilds the unit from it and starts the server without asking or writing
+anything. It needs `server.model_path` to be set, which is exactly what the
+first interactive run records. Anything passed as a flag is not asked about,
+and without a terminal nothing is asked at all — your config's values stand,
+so nothing is ever downloaded behind your back.
+
+Only the keys `start.sh` is the authority on are written: the endpoint, the
+model name, the context, and the weights and VRAM fraction under `server`.
+Routing, budgets and every other choice in that file are yours and are left
+exactly as they are, comments included. `context` and the server's
+`--max-model-len` come from one answer and so cannot drift apart — an
+over-large `context` is the usual reason a server installs cleanly and then
+fails on the first long prompt.
 
 The slow steps report progress. Where the underlying tool already prints real
 byte counts — `uv` and `hf download`, which together account for most of the
@@ -200,23 +227,30 @@ instead of a megabyte of carriage returns.
 Nothing is installed for the Feynman research workflow, because it is part of
 Hermes itself rather than a package.
 
-| Flag | Effect |
+| `install.sh` | Effect |
 |---|---|
 | `--dev` | also install the test dependencies |
 | `--system` | link into `/usr/local/bin` instead of `~/.local/bin` |
 | `--bin DIR`, `--venv DIR` | choose where the commands and the virtualenv go |
 | `--no-docker-image` | skip pre-pulling the sandbox image |
-| `--no-config` | leave `~/.config/hermes/config.yaml` alone |
-| `--force-config` | rewrite an existing config to point at this server |
 | `--no-openhands` | skip the optional OpenHands agent layer |
+| `--no-vllm` | skip the vLLM environment; you serve models yourself |
+| `--classifier` | also install the security-gate classifier (torch) |
+
+| `start.sh` | Effect |
+|---|---|
+| `--config` | ask nothing: serve what the config already names |
+| `--config-file PATH` | the config to read and update |
 | `--model REPO` | Hugging Face repository to download and serve |
 | `--model-path DIR` | serve a directory of weights you already have |
 | `--models-dir DIR` | where downloaded weights are stored |
 | `--port N` | port vLLM listens on (default `6767`) |
-| `--max-model-len N` | context vLLM serves (default `16384`) |
+| `--context N` | context served, and the config's `context` (default `16384`) |
 | `--gpu-util F` | fraction of VRAM vLLM may use (default `0.90`) |
-| `--no-server` | install nothing for vLLM and start no server |
+| `--classifier`, `--no-classifier` | also run the security-gate classifier |
 | `--boot` | also run the server at boot, not just during a run |
+| `--no-wait` | do not wait for the weights to finish loading |
+| `--stop` | stop the server instead of starting it |
 
 ## Model server
 
@@ -225,12 +259,14 @@ as a **systemd user unit** called `hermes-vllm.service`. A unit rather than a
 command you remember to type, because something has to own restarts across a
 run that lasts hours.
 
-The unit is installed but **not enabled**. vLLM pins the whole model in VRAM
-for as long as it lives — it has no CPU offload and never evicts — so a server
-running since boot is gigabytes of GPU given to an idle process. Hermes
-instead starts the unit itself when a project starts or continues, waits for
-the weights to load, and stops it when the run ends. A server you started by
-hand is left running, because you did that for a reason.
+The unit is written by `start.sh` and left **not enabled**. vLLM pins the
+whole model in VRAM for as long as it lives — it has no CPU offload and never
+evicts — so a server running since boot is gigabytes of GPU given to an idle
+process. Hermes instead starts the unit itself when a project starts or
+continues, waits for the weights to load, and stops it when the run ends. A
+server you started by hand — which includes the one `start.sh` leaves
+running — is left alone, because you did that for a reason; `./start.sh
+--stop` is how you hand that VRAM back.
 
 ```console
 $ systemctl --user status hermes-vllm.service
@@ -254,7 +290,7 @@ server:
 Set `stop_after_run: false` to pay the load once and keep the model in VRAM,
 which is also what you want when two projects share one server — Hermes only
 ever stops a server it started itself, but it cannot tell that another run is
-still using one. `./install.sh --boot` restores the always-up arrangement:
+still using one. `./start.sh --boot` restores the always-up arrangement:
 the unit is enabled, and lingering (`loginctl enable-linger`) is turned on,
 which is the part that makes "at boot" true rather than "at next login" for a
 user unit.
@@ -265,15 +301,17 @@ readable by you alone.
 Serving is offline: the unit sets `HF_HUB_OFFLINE=1` and points vLLM at a
 directory on disk, so the server never reaches the network once the weights
 are downloaded. The name vLLM answers to is the weights directory's name, and
-the config is written with that same string, because `hermes doctor` compares
-what is configured against what `/v1/models` reports.
+`start.sh` writes that same string into the config, because `hermes doctor`
+compares what is configured against what `/v1/models` reports. The directory
+itself is recorded as `server.model_path`, which is what lets `./start.sh
+--config` rebuild the unit from the config alone.
 
-To change model later, re-run `./install.sh --model REPO` (or `--model-path`),
-or edit the unit and `systemctl --user restart` it. Keep `context` in the
-config equal to the server's `--max-model-len`: vLLM reserves the KV cache for
-the full context at startup, which makes it a VRAM commitment rather than a
-ceiling, and it is the usual reason a server installs cleanly and then fails
-to load.
+To change model later, re-run `./start.sh` and answer differently — it
+rewrites the unit and the config together, so `context` and the server's
+`--max-model-len` stay equal. That matters: vLLM reserves the KV cache for the
+full context at startup, which makes it a VRAM commitment rather than a
+ceiling, and a `context` larger than the server was started with is the usual
+reason a server installs cleanly and then fails on the first long prompt.
 
 A virtualenv rather than a `--user` install, because most distributions now
 mark the system interpreter externally managed and `pip` refuses to write to
@@ -311,9 +349,11 @@ lingering is left enabled, since other user services of yours may now rely on
 it.
 
 Your config is kept — the routing in it is yours — but the endpoint of the
-removed server is retired in place: the model name is emptied and the dead
-`base_url` is marked as such, so Hermes fails with "no model name/path
-configured" rather than advising you to start a server that no longer exists.
+removed server is retired in place: the model name and `server.model_path` are
+emptied and the dead `base_url` is marked as such, so Hermes fails with "no
+model name/path configured" rather than advising you to start a server that no
+longer exists, and `./start.sh --config` asks the question again instead of
+rebuilding a unit for it.
 The original is saved as `config.yaml.bak`. A config pointing somewhere other
 than a local vLLM is left untouched.
 
@@ -513,6 +553,8 @@ rate against your own code, and `block` is worth setting only after that.
 | `hermes release --github` | clean-room validate, tag, and publish |
 | `hermes checkpoint` | list, create or restore a checkpoint |
 | `hermes doctor` | verify models, sandbox and tooling |
+| `hermes config` | show the effective configuration |
+| `hermes config --set models.default.context=32768` | edit one key, comments intact |
 
 ## Generated project layout
 

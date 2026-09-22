@@ -2,8 +2,8 @@
 #
 # Uninstall the Hermes Project Factory.
 #
-# Undoes ./install.sh: stops and removes the vLLM model server unit, removes
-# the factory and vLLM virtualenvs, the `hpf` and `hermes` commands, the
+# Undoes ./install.sh and ./start.sh: stops and removes the vLLM model server
+# unit, the factory and vLLM virtualenvs, the `hpf` and `hermes` commands, the
 # editable-install leftovers in this repository, and the optional OpenHands
 # agent layer. It leaves the sandbox image and the downloaded model weights
 # alone unless you ask for them: the image is a stock one other containers
@@ -125,7 +125,7 @@ unlink_command hermes
 # Stopped before the environment it runs from is deleted, or systemd keeps
 # restarting a unit whose ExecStart has just vanished.
 #
-# Lingering is deliberately left enabled where it is on: only `install.sh
+# Lingering is deliberately left enabled where it is on: only `start.sh
 # --boot` turns it on, but other user services of yours may depend on it by
 # now, and silently switching it off would stop them at your next logout.
 if [ "$SERVER" -eq 1 ]; then
@@ -250,12 +250,21 @@ elif [ -f "$CONFIG_FILE" ]; then
              print "# The local vLLM server this config pointed at was removed by"
              print "# uninstall.sh on " today ". Hermes is local-model-only, so name"
              print "# the model and endpoint of a server you run, or re-run"
-             print "# install.sh to set one up again."
+             print "# ./install.sh && ./start.sh to set one up again."
              banner = 1
            }
            !done_model && /^[[:space:]]*model:[[:space:]]/ {
              print "    model: \"\"                       # set me: no server is installed"
              done_model = 1
+             next
+           }
+           # The weights start.sh last served, through a unit this run has
+           # just deleted. Emptied for the same reason as the model name, so
+           # `./start.sh --config` asks the question again rather than
+           # rebuilding a unit for a server nobody installed.
+           !done_path && /^[[:space:]]*model_path:[[:space:]]/ {
+             print "  model_path: \"\"               # set me: no server is installed"
+             done_path = 1
              next
            }
            !done_base && /^[[:space:]]*base_url:[[:space:]]/ {

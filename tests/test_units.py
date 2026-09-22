@@ -130,12 +130,12 @@ def test_config_is_read_from_where_the_installer_writes_it(tmp_path, monkeypatch
     assert user_config_paths() == [Path.home() / ".config" / "hermes" / "config.yaml"]
 
 
-def test_defaults_address_the_server_install_sh_starts():
-    """install.sh serves vLLM on 6767; the built-in defaults must agree.
+def test_defaults_address_the_server_start_sh_starts():
+    """start.sh serves vLLM on 6767; the built-in defaults must agree.
 
-    Three files describe that endpoint — the defaults, the sample config and
-    the installer's sed patch — and a project run with no hermes.yaml of its
-    own reaches the server through these.
+    Two files describe that endpoint — the defaults and the sample config —
+    and a project run with no hermes.yaml of its own reaches the server
+    through these.
     """
     from hermes.config import DEFAULTS, SAMPLE_CONFIG
     from hermes.models import BACKENDS, OpenAICompatBackend
@@ -148,11 +148,158 @@ def test_defaults_address_the_server_install_sh_starts():
     assert BACKENDS[cfg.backend] is OpenAICompatBackend
     assert OpenAICompatBackend(cfg)._base() == "http://localhost:6767/v1"
 
-    # The installer rewrites these three keys in the sample by anchoring on
-    # four leading spaces, so they have to stay exactly one level deep.
     for key in ("base_url", "model", "context"):
         assert f"\n    {key}: " in SAMPLE_CONFIG
     assert "6767" in SAMPLE_CONFIG
+
+
+# -- editing a config --------------------------------------------------------
+
+def test_setting_a_value_keeps_every_comment_and_every_other_option():
+    """start.sh records what it served without deleting the annotations.
+
+    The sample config is the only description of what each option means, and a
+    load-and-re-dump would hand back a correct file with all of that stripped
+    out, so the edit is made in the text.
+    """
+    import yaml
+    from hermes.config import SAMPLE_CONFIG, set_config_value
+
+    before = yaml.safe_load(SAMPLE_CONFIG)
+    text = SAMPLE_CONFIG
+    for key, value in [("models.default.base_url", "http://localhost:6900/v1"),
+                       ("models.default.model", "my-coder-7b"),
+                       ("models.default.context", 32768),
+                       ("server.model_path", "/srv/weights/My-Coder-7B"),
+                       ("server.gpu_util", 0.75)]:
+        text = set_config_value(text, key, value)
+
+    after = yaml.safe_load(text)
+    assert after["models"]["default"]["base_url"] == "http://localhost:6900/v1"
+    assert after["models"]["default"]["context"] == 32768
+    assert after["server"]["model_path"] == "/srv/weights/My-Coder-7B"
+    assert after["server"]["gpu_util"] == 0.75
+
+    # Nothing else moved: the routing, the budgets and the sandbox limits in
+    # this file are the operator's, and start.sh is not entitled to them.
+    for section in before:
+        untouched = {k: v for k, v in after[section].items()
+                     if (section, k) not in {("models", "default"),
+                                             ("server", "model_path"),
+                                             ("server", "gpu_util")}}
+        assert untouched == {k: v for k, v in before[section].items()
+                             if (section, k) not in {("models", "default"),
+                                                     ("server", "model_path"),
+                                                     ("server", "gpu_util")}}
+    # And the comments are still there, including the one that rides along on
+    # the line just rewritten.
+    assert text.count("#") == SAMPLE_CONFIG.count("#")
+    assert "# must match the server's --max-model-len" in text
+
+
+def test_setting_a_value_creates_the_keys_a_config_predates():
+    """An option added after the config was written is set, not refused."""
+    import yaml
+    from hermes.config import set_config_value
+
+    text = "models:\n  default:\n    model: x    # the one being served\n"
+    text = set_config_value(text, "server.model_path", "/srv/w")
+    text = set_config_value(text, "security.classifier.enabled", True)
+    text = set_config_value(text, "models.default.context", 8192)
+
+    loaded = yaml.safe_load(text)
+    assert loaded["server"] == {"model_path": "/srv/w"}
+    assert loaded["security"] == {"classifier": {"enabled": True}}
+    assert loaded["models"]["default"] == {"model": "x", "context": 8192}
+    assert "# the one being served" in text
+
+
+def test_a_value_that_would_not_read_back_is_refused():
+    """Editing YAML as text is only safe if the result is parsed and checked.
+
+    A quoted string that happens to look like a number, or a key the edit
+    landed in the wrong block, must fail loudly here rather than produce a
+    file that reads plausibly and means something else.
+    """
+    import yaml
+    from hermes.config import ConfigError, set_config_value
+
+    # The values most likely to be mangled: ones YAML would otherwise read as
+    # another type entirely.
+    for value in ("16384", "yes", "no", "null", "", "on"):
+        text = set_config_value("models:\n  default:\n    model: x\n",
+                                "models.default.model", value)
+        assert yaml.safe_load(text)["models"]["default"]["model"] == value
+
+    with pytest.raises(ConfigError):
+        # A list is not a mapping: there is no key to descend into.
+        set_config_value("routing:\n  - research\n", "routing.research", "fast")
+
+
+def test_config_set_writes_the_user_config_it_claims_to(tmp_path, monkeypatch, capsys):
+    """`hermes config --set` is how start.sh records what it started.
+
+    The file it picks matters as much as the edit: writing into whatever
+    directory the script ran from would leave a config nothing ever reads.
+    """
+    import yaml
+    from hermes.cli import config_write_path, main
+
+    home = tmp_path / "config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home))
+    monkeypatch.setenv("HOME", str(tmp_path))   # so a real ~/.config cannot win
+    monkeypatch.chdir(tmp_path)
+
+    target = home / "hermes" / "config.yaml"
+    assert config_write_path(SimpleNamespace(config=None)) == target
+    assert main(["config", "--set", "models.default.model=served",
+                 "--set", "models.default.context=4096"]) == 0
+    written = yaml.safe_load(target.read_text())
+    assert written["models"]["default"]["model"] == "served"
+    assert written["models"]["default"]["context"] == 4096
+
+    # A hermes.yaml in this directory is the nearer config, and a project's
+    # own settings are what someone standing in it means.
+    local = tmp_path / "hermes.yaml"
+    local.write_text("models:\n  default:\n    model: local\n")
+    assert config_write_path(SimpleNamespace(config=None)) == local
+    assert main(["config", "--set", "models.default.model=other"]) == 0
+    assert yaml.safe_load(local.read_text())["models"]["default"]["model"] == "other"
+    assert yaml.safe_load(target.read_text())["models"]["default"]["model"] == "served"
+
+    # An assignment that is not one is a usage error, not a half-written file.
+    assert main(["config", "--set", "models.default.model"]) == 2
+
+
+def test_the_scripts_split_installing_from_starting():
+    """install.sh puts software on disk; start.sh decides and starts.
+
+    The split is the contract: an install that asks questions cannot be run
+    unattended, and a start script that cannot be re-run is not one. So the
+    installer must not prompt, download weights or touch systemd, and every
+    key start.sh writes must be a key Hermes actually reads — a dotted path
+    with a typo in it would be recorded faithfully and read by nothing.
+    """
+    import re
+    from hermes.config import DEFAULTS
+
+    root = Path(__file__).resolve().parent.parent
+    install = (root / "install.sh").read_text()
+    start = (root / "start.sh").read_text()
+
+    body = "\n".join(line for line in install.splitlines()
+                     if not line.lstrip().startswith("#"))
+    for forbidden in ("read -r", "systemctl", "hf download", "loginctl"):
+        assert forbidden not in body, f"install.sh should not {forbidden}"
+
+    keys = set(re.findall(r'--set "([a-z_.]+)=', start))
+    assert {"models.default.model", "models.default.base_url",
+            "models.default.context", "server.model_path"} <= keys
+    for key in keys:
+        node = DEFAULTS
+        for part in key.split("."):
+            assert isinstance(node, dict) and part in node, f"{key} is not a config key"
+            node = node[part]
 
 
 # -- openhands ---------------------------------------------------------------
@@ -4190,7 +4337,7 @@ def test_the_server_runs_for_the_length_of_a_run():
     """Started when the project starts, stopped when it ends.
 
     vLLM pins the whole model in VRAM, so "up all the time" costs gigabytes of
-    GPU while nothing is building. The unit install.sh writes is therefore not
+    GPU while nothing is building. The unit start.sh writes is therefore not
     enabled, and this is what brings it up instead.
     """
     sysctl = _Systemctl()

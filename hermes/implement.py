@@ -393,7 +393,7 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
                    *, journal=None, max_attempts: int = 3,
                    ladder: Ladder | None = None, ledger=None, project: str = "",
                    allow_edits: bool = True, prefetched: dict | None = None,
-                   tool_calls: int = 6, tool_rounds: int = 3,
+                   tool_calls: int = 6, tool_rounds: int = 3, db=None,
                    classifier=None, mutation: dict | None = None,
                    on_apply=None, log: Logger = NULL) -> dict:
     """Run one ticket to a verdict.
@@ -413,12 +413,18 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
     *tool_calls* and *tool_rounds* bound the workspace lookups each generation
     and each review may make. Every one of them is a fresh toolbox: the budget
     is what one answer may spend, not what the ticket may.
+
+    *db* is the project's context database, and giving it to the toolbox is
+    what lets an implementer ask where something is defined and what earlier
+    tickets recorded, rather than grep for it. Without one the lookups are
+    the three that read the disk.
     """
     ladder = ladder or Ladder()
     ledger = ledger or NullLedger()
     stack = _stack(state)
     def toolbox() -> Toolbox:
-        return Toolbox(sandbox, budget=tool_calls, rounds=tool_rounds, log=log)
+        return Toolbox(sandbox, budget=tool_calls, rounds=tool_rounds, db=db,
+                       log=log)
 
     board.move(ticket.id, "active", "picked up")
     board.save()

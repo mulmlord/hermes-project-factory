@@ -99,7 +99,11 @@ What an agent is handed of the existing code is a guess — the ticket's
 artifact list was written before any of it existed — so the implementer and
 the reviewer can also look: `read_file`, `grep` and `list_dir` over the workspace, read-only,
 under a budget of a few calls per answer. Checking a signature costs one
-lookup; inventing one costs a whole generate, verify and triage cycle. While
+lookup; inventing one costs a whole generate, verify and triage cycle. Where
+the project's context database has a symbol index, they can ask by name
+instead of by text — `find_symbol`, `find_references`, `outline` — which
+answers with a signature and a line rather than with every line that happens
+to contain the word. While
 one ticket spends minutes on the CPU in its gates, the next independent one is
 generated on the GPU — but only when the host actually has room for a second
 concurrent model call, and never while a benchmark is being timed, because a
@@ -529,6 +533,17 @@ standard library, and it is derived, not authoritative — the files are on disk
 and the journal is still JSONL, so `hermes context sync` rebuilds it from a
 clean checkout and it is never committed.
 
+The same sync also parses what it stores, where it can. Python files go
+through the interpreter's own parser into a symbol index: what each file
+defines, with its signature, its line span and the first line of its
+docstring, and every line that uses each name. That is what lets an agent ask
+*where is this defined* and *who calls it* instead of grepping for a word —
+and it is deliberately Python-only, because a regular expression over C++
+would answer the same questions at a confidence the answer could not carry.
+A project in another language keeps `grep`, which never claimed to understand
+anything, and an outline built from the chunker's own headings. A file that
+stops parsing stops answering rather than answering out of date.
+
 A generated project's own build steps write to it too:
 
 ```sh
@@ -536,6 +551,8 @@ cargo test 2>&1 | hermes context log "cargo test" --kind gate
 hermes context catch-up implementer   # what the next agent has not seen yet
 hermes context search "retry backoff"
 hermes context outline src/engine.rs  # what a file contains, without its body
+hermes context symbol Engine.step     # where a name is defined, and how
+hermes context refs Engine            # every line that uses it
 ```
 
 The JSONL log under `.hermes/logs/` stamps every record with the work that

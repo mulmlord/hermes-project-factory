@@ -14,10 +14,17 @@ agents already answer in. A text protocol rather than a function-calling API
 because Hermes must work against any local OpenAI-compatible server, and only
 some of them speak ``tools=``.
 
-A fourth, :func:`recall`, reads the context database instead of the disk: it
+Four more read the context database instead of the disk. :func:`recall`
 answers "what did the others already find out about this" from what agents
 recorded, which is the one question no amount of reading the tree can settle.
-It is offered only where a database exists.
+:func:`find_symbol`, :func:`find_references` and :func:`outline` answer the
+questions an agent actually has about code it did not write -- where is this
+defined, who uses it, what is in this file -- from a parsed index rather than
+from a word search, so the answer is a signature and a line rather than every
+line that happens to contain the word. See :mod:`hermes.symbols` for what
+that index knows and, more to the point, what it does not: it reads Python,
+and a project in another language keeps grep, which never claimed to
+understand anything. All four are offered only where a database exists.
 
 Nothing here writes, and every path goes through :meth:`Sandbox.resolve`,
 which already refuses anything outside the workspace. A refusal comes back as
@@ -43,7 +50,13 @@ from .sandbox import SandboxError
 from .schema import INTEGER, STRING, any_of, arr, enum, obj
 
 #: What a lookup may name, and the order the protocol lists them in.
-TOOLS = ("read_file", "grep", "list_dir", "recall")
+TOOLS = ("read_file", "grep", "list_dir", "find_symbol", "find_references",
+         "outline", "recall")
+
+#: The ones that read the context database rather than the disk. Without one
+#: they are not offered at all: a tool that answers "no index here" to every
+#: question teaches the model to stop asking.
+INDEXED = frozenset({"find_symbol", "find_references", "outline", "recall"})
 
 #: Keys a model may put its lookups under. The first is what the protocol
 #: asks for; the rest are what models trained on other harnesses reach for.
@@ -56,7 +69,7 @@ REQUEST_KEYS = ("lookup", "lookups", "tool_calls", "tools")
 #: express the request at all.
 LOOKUP_REQUEST = obj(
     {"lookup": arr(obj({"tool": enum(*TOOLS), "path": STRING, "pattern": STRING,
-                        "query": STRING, "start": INTEGER},
+                        "query": STRING, "name": STRING, "start": INTEGER},
                        required=("tool",)))},
     required=("lookup",),
 )
@@ -102,6 +115,13 @@ class Toolbox:
     #: agent that wants one of them whole can read the file it names.
     RECALLS = 6
     RECALL_CHARS = 700
+    #: Definitions, uses and outline entries one lookup returns. A definition
+    #: costs two lines and a use costs one, which is why they differ so much:
+    #: the whole point of the index is that a hundred call sites fit where one
+    #: file read would not.
+    SYMBOLS = 10
+    REFERENCES = 40
+    OUTLINE = 60
     #: A file larger than this is data, not source, and is never searched.
     MAX_BYTES = 1_000_000
     #: Files one search walks before it gives up on the pattern.
@@ -131,7 +151,7 @@ class Toolbox:
     def available(self) -> tuple[str, ...]:
         """The tools this toolbox can actually serve."""
         return TOOLS if self.db is not None else tuple(
-            name for name in TOOLS if name != "recall")
+            name for name in TOOLS if name not in INDEXED)
 
     @property
     def remaining(self) -> int:
@@ -171,8 +191,10 @@ class Toolbox:
         else:
             name = str(request.get("tool") or request.get("name") or "").strip()
             handler = {"read_file": self._read_file, "grep": self._grep,
-                       "list_dir": self._list_dir,
-                       "recall": self._recall}.get(name)
+                       "list_dir": self._list_dir, "recall": self._recall,
+                       "find_symbol": self._find_symbol,
+                       "find_references": self._find_references,
+                       "outline": self._outline}.get(name)
             if handler is None or name not in self.available:
                 call = Call(name or "lookup", "", ok=False, output=(
                     f"there is no {name!r} tool; the tools are "
@@ -262,6 +284,79 @@ class Toolbox:
             listing.append(f"… {len(entries) - self.ENTRIES} more")
         return where, "\n".join(listing) or "(empty)", True
 
+    def _find_symbol(self, request: dict) -> tuple[str, str, bool]:
+        """Where a name is defined, from the parsed index. See :mod:`hermes.symbols`."""
+        name = _name(request)
+        where = _path(request)
+        detail = name + (f" in {where}" if where else "")
+        if not name:
+            return detail, 'no "name" given', False
+        found = self.db.find_symbol(name, limit=self.SYMBOLS, path=where)
+        if not found:
+            return detail, self._unindexed(f"nothing named {name!r} is defined"), True
+        return detail, "\n\n".join(d.render() for d in found), True
+
+    def _find_references(self, request: dict) -> tuple[str, str, bool]:
+        """Every line that uses a name. Matched by name, and said to be."""
+        name = _name(request)
+        where = _path(request)
+        detail = name + (f" in {where}" if where else "")
+        if not name:
+            return detail, 'no "name" given', False
+        found = self.db.find_references(name, limit=self.REFERENCES, path=where)
+        if not found:
+            return detail, self._unindexed(f"nothing uses {name!r}"), True
+        total = self.db.count_references(name, path=where)
+        lines = [f"{r.path}:{r.line}  {r.kind}"
+                 + (f" in {r.qualname}" if r.qualname else "") for r in found]
+        if total > len(found):
+            lines.append(f"… {total - len(found)} more; narrow it with \"path\"")
+        lines.append("(matched by name only: a name used by two different "
+                     "things looks the same here)")
+        return detail, "\n".join(lines), True
+
+    def _outline(self, request: dict) -> tuple[str, str, bool]:
+        """What one file defines, without its body.
+
+        Parsed definitions where there are any, and the chunker's headings
+        where there are not -- which is every file in a language the index
+        does not read, and is still a table of contents.
+        """
+        where = _path(request)
+        if not where:
+            return where, 'no "path" given', False
+        found = self.db.definitions(where)
+        if found:
+            lines = [f"{d.line:>6}  {'  ' if d.parent else ''}"
+                     f"{d.signature or d.qualname}" for d in found[: self.OUTLINE]]
+            if len(found) > self.OUTLINE:
+                lines.append(f"… {len(found) - self.OUTLINE} more")
+            return where, "\n".join(lines), True
+        status = self.db.indexed(where)
+        if status and not status.get("parsed"):
+            return where, (f"{where} did not parse, so nothing in it is indexed: "
+                           f"{status.get('error') or 'unknown error'}"), True
+        chunks = self.db.outline(where)
+        if not chunks:
+            return where, ("nothing stored for that path; it may not exist, or "
+                           "may not have been written yet"), True
+        lines = [f"{c.first_line:>6}  {c.heading}" for c in chunks[: self.OUTLINE]]
+        return where, "\n".join(lines), True
+
+    def _unindexed(self, answer: str) -> str:
+        """*answer*, plus what the index covers when it covers little.
+
+        An empty answer from an index that was never built reads exactly like
+        an empty answer from one that was, and the two call for opposite next
+        moves: ask differently, or stop asking and grep.
+        """
+        covered = self.db.indexed()
+        if not covered.get("parsed"):
+            return (f"{answer}. No file here is indexed -- the index reads Python, "
+                    "and this project has none stored yet. Use grep.")
+        return (f"{answer} in the {covered['parsed']} indexed file(s). "
+                "The index reads Python only; for anything else use grep.")
+
     def _recall(self, request: dict) -> tuple[str, str, bool]:
         """What agents recorded about something, from the context database."""
         query = str(request.get("query") or request.get("pattern")
@@ -311,15 +406,26 @@ class Toolbox:
             '      matching lines; "path" optional\n'
             '  {"tool": "list_dir", "path": "src"}'
             '                          what one directory holds\n'
-            + ('  {"tool": "recall", "query": "retry backoff"}'
-               '                 what other agents recorded about it\n'
+            + ('  {"tool": "find_symbol", "name": "Engine.step"}'
+               '                where it is defined, with its signature\n'
+               '  {"tool": "find_references", "name": "Engine"}'
+               '                 every line that uses that name\n'
+               '  {"tool": "outline", "path": "src/thing.py"}'
+               '                   what one file defines, without its body\n'
+               '  {"tool": "recall", "query": "retry backoff"}'
+               '                  what other agents recorded about it\n'
+               "The last four read an index of the project. find_symbol, "
+               "find_references and outline are parsed from Python sources; in any "
+               "other language use grep, which reads the text as it is.\n"
                if self.db is not None else "")
             + f"You have {self.remaining} lookup(s) left across {self.rounds_left} more "
             "repl(y/ies). The results come back and you are asked again.\n"
             "Look up anything you would otherwise guess: a function you are about to "
             "call, its arguments, an import path, a file you were not shown. A guessed "
             "name costs a whole failed build.\n"
-            'When you have what you need, answer the task as asked, with no "lookup" key.'
+            + ("Ask by name before you ask by text: one find_symbol answers what a "
+               "grep and two file reads would.\n" if self.db is not None else "")
+            + 'When you have what you need, answer the task as asked, with no "lookup" key.'
         )
 
     def transcript(self, limit: int | None = None) -> str:
@@ -446,6 +552,15 @@ def requested(payload: Any) -> list[Any]:
     if str(payload.get("tool") or "") in TOOLS:
         return [payload]
     return []
+
+
+def _name(request: Any) -> str:
+    """The symbol a lookup is about, under whichever key it arrived."""
+    if not isinstance(request, dict):
+        return ""
+    raw = (request.get("name") or request.get("symbol") or request.get("query")
+           or request.get("pattern") or "")
+    return str(raw).strip()
 
 
 def _path(request: Any, default: str = "") -> str:

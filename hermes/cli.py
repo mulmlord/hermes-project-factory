@@ -324,7 +324,40 @@ def _context_search(db, root, args) -> int:
     return 0
 
 
+def _context_symbol(db, root, args) -> int:
+    found = db.find_symbol(" ".join(args.name), limit=args.lines)
+    if not found:
+        print("nothing defined by that name is indexed")
+        return 1
+    for definition in found:
+        print(definition.render() + "\n")
+    return 0
+
+
+def _context_refs(db, root, args) -> int:
+    name = " ".join(args.name)
+    found = db.find_references(name, limit=args.lines, path=args.path or "")
+    if not found:
+        print("nothing uses that name")
+        return 1
+    for reference in found:
+        print(reference.render())
+    total = db.count_references(name, path=args.path or "")
+    if total > len(found):
+        print(f"… {total - len(found)} more")
+    return 0
+
+
 def _context_outline(db, root, args) -> int:
+    found = db.definitions(args.path)
+    if found:
+        for definition in found:
+            print(f"{definition.line:>6}-{definition.end_line:<6} "
+                  f"{definition.signature or definition.qualname}")
+        return 0
+    status = db.indexed(args.path)
+    if status and not status.get("parsed"):
+        print(f"{args.path} did not parse: {status.get('error') or 'unknown error'}")
     chunks = db.outline(args.path)
     if not chunks:
         print(f"{args.path} is not in the database "
@@ -384,6 +417,8 @@ _CONTEXT_ACTIONS = {
     "catch-up": _context_catch_up,
     "search": _context_search,
     "outline": _context_outline,
+    "symbol": _context_symbol,
+    "refs": _context_refs,
     "show": _context_show,
     "log": _context_log,
     "recall": _context_recall,
@@ -708,6 +743,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     outline = actions.add_parser("outline", help="what a file contains, without its body")
     outline.add_argument("path")
+
+    symbol = actions.add_parser("symbol", help="where a name is defined")
+    symbol.add_argument("name", nargs="+", help="a name, optionally Class.method")
+    symbol.add_argument("-n", "--lines", type=int, default=10)
+
+    refs = actions.add_parser("refs", help="every line that uses a name")
+    refs.add_argument("name", nargs="+")
+    refs.add_argument("--path", help="only this file")
+    refs.add_argument("-n", "--lines", type=int, default=40)
 
     show = actions.add_parser("show", help="a stored file, reassembled")
     show.add_argument("path")

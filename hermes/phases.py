@@ -189,6 +189,7 @@ def implementation(factory) -> None:
                 tool_calls=int(factory.config.get("execution.tool_calls", 6)),
                 tool_rounds=int(factory.config.get("execution.tool_rounds", 3)),
                 classifier=factory.classifier,
+                mutation=factory.config.get("verification.mutation") or {},
                 on_apply=lambda: factory._prefetch_next(ticket),
                 log=factory.log)
 

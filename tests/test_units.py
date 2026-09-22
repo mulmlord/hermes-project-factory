@@ -1,4 +1,5 @@
 """Unit checks for the logic that has to be right for the loop to terminate."""
+import ast
 import contextlib
 import json
 import os
@@ -10,6 +11,7 @@ import time
 
 import pytest
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from conftest import needs_docker
@@ -34,15 +36,16 @@ from hermes.models import (ModelError, PromptTooLarge, Router, extract_json,
 from hermes.openhands import OpenHands
 from hermes.research import ResearchLog, investigate
 from hermes.resources import Governor
-from hermes import harness, prompts, schema
+from hermes import harness, mutate, prompts, schema
 from hermes.sandbox import Sandbox, SandboxError
 from hermes.sources import Librarian, marker, quarantine
 from hermes.state import State, StateError, checkpoint, restore
 from hermes.tickets import Board, split_validation
 from hermes.tools import LOOKUP_REQUEST, Lookup, Quarantined, Toolbox
 from hermes.classify import Classifier, ClassifierConfig, chunks
-from hermes.verify import (Verification, installs, review, scan_unsafe,
-                           security_gate, text_gate, verify_project)
+from hermes.verify import (Verification, installs, mutation_gate, review,
+                           scan_unsafe, security_gate, text_gate, verify_project,
+                           verify_ticket)
 from hermes import cli, workspace
 
 
@@ -382,6 +385,7 @@ SHAPES = [
     (prompts.compress_findings(500), prompts.FINDINGS),
     (prompts.REVIEW, prompts.REVIEW_SHAPE),
     (prompts.TRIAGE, prompts.TRIAGE_SHAPE),
+    (prompts.mutation_screen(2), prompts.MUTATION_SHAPE),
     (prompts.experiment_design(60, "protocol"), prompts.EXPERIMENT),
     (prompts.EXPERIMENT_VERDICT, prompts.VERDICT_SHAPE),
     (prompts.evolution_direction("family"), prompts.PROPOSAL),
@@ -2939,6 +2943,193 @@ def test_the_scan_is_capped_so_a_large_tree_cannot_run_away(tmp_path):
         security_gate(tmp_path, classifier=_classifier(url, max_chunks=25))
 
     assert sum(len(payload["items"]) for payload in sent) == 25
+
+
+# -- mutation testing --------------------------------------------------------
+
+#: A decision worth one line of code, and two suites that disagree about
+#: whether they have tested it. The weak one never tries the boundary, so a
+#: fault moved onto the boundary goes unnoticed -- which is the entire claim
+#: mutation testing makes about agent-written tests.
+DECISION = "def over(n):\n    return n > 10\n"
+WEAK = "from calc import over\nassert over(11)\n"
+STRONG = "from calc import over\nassert over(11)\nassert not over(10)\n"
+
+
+def _project(tmp_path, suite: str):
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 30})
+    sandbox.write("calc.py", DECISION)
+    sandbox.write("check.py", suite)
+    return sandbox, {"commands": {"test": "python3 check.py"}}
+
+
+def test_every_mutant_is_valid_python_that_really_behaves_differently():
+    """A mutant that will not parse tests nothing; one that is the original lies.
+
+    Run over the factory's own sources, because those are the only Python to
+    hand that nobody wrote to make this pass.
+    """
+    source = Path("hermes/anchor.py").read_text()
+    original = ast.unparse(ast.parse(source))
+    found = mutate.mutants("hermes/anchor.py", source)
+    assert len(found) > 50
+
+    for mutant in mutate.select(found, 20):
+        applied = mutate.apply(source, mutant.index)
+        assert applied, mutant
+        ast.parse(applied[0])                 # raises if the mutant is not code
+        assert applied[0] != original, mutant  # and a no-op mutant is not a fault
+
+
+def test_the_same_change_injects_the_same_faults():
+    """A mutation report nobody can reproduce is a rumour, so selection is fixed."""
+    source = Path("hermes/anchor.py").read_text()
+    found = mutate.mutants("hermes/anchor.py", source)
+    assert ([m.index for m in mutate.select(found, 5)]
+            == [m.index for m in mutate.select(found, 5)])
+
+
+def test_tests_are_not_themselves_mutated(tmp_path):
+    """Breaking a test proves nothing about whether the tests catch breakage."""
+    sandbox, _ = _project(tmp_path, WEAK)
+    sandbox.write("tests/test_calc.py", STRONG)
+    paths = {m.path for m in mutate.candidates(sandbox, ["calc.py", "tests/test_calc.py"])}
+    assert paths == {"calc.py"}
+
+
+def test_a_suite_that_misses_the_boundary_is_reported(tmp_path):
+    sandbox, plan = _project(tmp_path, WEAK)
+    survey = mutate.survey(sandbox, ["calc.py"], plan["commands"]["test"])
+
+    assert survey.survivors, survey.summary()
+    assert all("calc.py" in m.path for m in survey.survivors)
+    assert any("> to >=" == m.operator for m in survey.survivors)
+    # The report has to name the statement, not just the file: a line number
+    # against a file the agent must re-read is not a failing case.
+    assert "return n > 10" in survey.summary()
+    assert "return n >= 10" in survey.summary()
+
+
+def test_a_suite_that_tests_the_boundary_is_not(tmp_path):
+    sandbox, plan = _project(tmp_path, STRONG)
+    survey = mutate.survey(sandbox, ["calc.py"], plan["commands"]["test"])
+
+    assert survey.mutants and not survey.survivors
+    assert survey.score == 1.0
+
+
+def test_the_workspace_is_left_exactly_as_it_was_found(tmp_path):
+    """Including when the run blows up halfway through a mutant.
+
+    A survey that leaves a fault behind hands the next gate a project the
+    factory never wrote, and the ticket would be blamed for it.
+    """
+    sandbox, plan = _project(tmp_path, WEAK)
+    mutate.survey(sandbox, ["calc.py"], plan["commands"]["test"])
+    assert sandbox.read("calc.py") == DECISION
+
+    def explode(command, **kw):
+        raise KeyboardInterrupt("the operator gave up mid-survey")
+
+    sandbox.run = explode
+    with pytest.raises(KeyboardInterrupt):
+        mutate.survey(sandbox, ["calc.py"], plan["commands"]["test"])
+    assert sandbox.read("calc.py") == DECISION
+
+
+def test_the_budget_stops_the_survey_rather_than_the_mutants(tmp_path):
+    sandbox, plan = _project(tmp_path, WEAK)
+    survey = mutate.survey(sandbox, ["calc.py"], plan["commands"]["test"], budget=0)
+
+    assert survey.exhausted and not survey.mutants
+
+
+def _screener(observable: bool, seen: list | None = None):
+    def answer(prompt):
+        (seen if seen is not None else []).append(prompt)
+        return {"verdicts": [{"index": i, "observable": observable,
+                              "reason": "over(10)"} for i in range(4)]}
+    return {"reviewer": _agent(answer, task="review", name="reviewer")}
+
+
+def test_a_survivor_blocks_only_once_the_screen_confirms_it(tmp_path):
+    sandbox, plan = _project(tmp_path, WEAK)
+    cfg = {"enabled": True, "mutants": 4, "budget": 60}
+
+    seen: list = []
+    confirmed = mutation_gate(sandbox, plan, ["calc.py"], cfg,
+                              agents=_screener(True, seen))
+    assert not confirmed.passed
+    assert "return n >= 10" in seen[0]     # the screen is shown the fault itself
+
+    # The same survivor, judged unreachable, is a fault no test could have
+    # caught -- so it is reported and the ticket is not failed for it.
+    dismissed = mutation_gate(sandbox, plan, ["calc.py"], cfg,
+                              agents=_screener(False))
+    assert dismissed.passed
+    assert "no test could have caught" in dismissed.detail
+
+
+def test_an_unscreened_survivor_is_reported_and_nothing_more(tmp_path):
+    """No screen means no second opinion, and no second opinion means no veto."""
+    sandbox, plan = _project(tmp_path, WEAK)
+    gate = mutation_gate(sandbox, plan, ["calc.py"],
+                         {"enabled": True, "mutants": 4}, agents=None)
+
+    assert gate.passed and "survived the tests" in gate.detail
+
+
+def test_screening_off_lets_the_survivor_block_alone(tmp_path):
+    sandbox, plan = _project(tmp_path, WEAK)
+    gate = mutation_gate(sandbox, plan, ["calc.py"],
+                         {"enabled": True, "mutants": 4, "screen": False})
+
+    assert not gate.passed
+
+
+def test_the_gate_does_not_run_while_the_code_is_already_broken(tmp_path):
+    """Breaking code on purpose says nothing about a suite that is already red."""
+    sandbox, _ = _project(tmp_path, WEAK)
+    sandbox.write("calc.py", DECISION + "raise SystemExit(1)\n")
+    board = Board(tmp_path)
+    ticket = board.add(title="decide", status="active", validation=["true"])
+    plan = {"commands": {"test": "python3 check.py"}}
+
+    verification = verify_ticket(sandbox, ticket, plan, ["calc.py"],
+                                 mutation={"enabled": True, "mutants": 2},
+                                 agents=_screener(True))
+
+    assert not verification.passed
+    assert [g.name for g in verification.gates if g.name == "mutation"] == []
+
+
+def test_a_passing_ticket_is_measured_by_its_own_tests(tmp_path):
+    sandbox, plan = _project(tmp_path, WEAK)
+    board = Board(tmp_path)
+    ticket = board.add(title="decide", status="active", validation=["true"])
+
+    verification = verify_ticket(sandbox, ticket, plan, ["calc.py"],
+                                 mutation={"enabled": True, "mutants": 4},
+                                 agents=_screener(True))
+
+    mutation = [g for g in verification.gates if g.name == "mutation"]
+    assert len(mutation) == 1 and not mutation[0].passed
+    assert not verification.passed
+    # And the failing case reaches the repair path as words, not as a rate.
+    assert "return n > 10" in verification.report()
+
+
+def test_mutation_is_off_until_an_operator_turns_it_on(tmp_path):
+    sandbox, plan = _project(tmp_path, WEAK)
+    board = Board(tmp_path)
+    ticket = board.add(title="decide", status="active", validation=["true"])
+    assert DEFAULTS["verification"]["mutation"]["enabled"] is False
+
+    verification = verify_ticket(sandbox, ticket, plan, ["calc.py"],
+                                 mutation=DEFAULTS["verification"]["mutation"])
+
+    assert verification.passed
+    assert "mutation" not in [g.name for g in verification.gates]
 
 
 # -- evolution ---------------------------------------------------------------

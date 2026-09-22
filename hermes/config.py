@@ -142,6 +142,26 @@ DEFAULTS: dict[str, Any] = {
         "max_concurrent_inference": 2,  # 1 stops generation overlapping at all
         "measure_drain_seconds": 120,   # how long a benchmark waits for the GPU to clear
     },
+    "verification": {
+        # Mutation testing: break the code the ticket just wrote and see
+        # whether its own tests go red. The factory writes both sides, so a
+        # green suite is the weakest evidence it collects -- but the check
+        # costs one full test run per injected fault, which is why it is off
+        # until an operator decides the project is worth it. See
+        # hermes.mutate.
+        "mutation": {
+            "enabled": False,
+            "mutants": 5,      # faults injected per ticket
+            "budget": 180,     # seconds the whole survey may spend
+            "timeout": 120,    # seconds one test run under one fault may take
+            "screen": True,    # ask a model whether a survivor is reachable at
+                               # all; most survivors are faults no test could
+                               # catch, and reporting those teaches nothing
+            "block": True,     # a survivor the screen confirmed fails the
+                               # ticket, which sends the concrete failing case
+                               # back to the repair path. false only reports it
+        },
+    },
     "security": {
         # A second opinion on the security gate, for the defects no regex in
         # UNSAFE_PATTERNS expresses. Off by default and advisory when on: an
@@ -437,6 +457,21 @@ evolution:
   baseline_repeats: 3    # runs used to measure benchmark noise
   min_relative_gain: 0.01
   screen_factor: 2.0     # kill a run this much slower than the incumbent
+
+verification:
+  mutation:              # measure the tests, rather than trusting the suite
+    enabled: false       # that the same factory wrote to check its own code.
+                         # Once a ticket passes every other gate, a small fault
+                         # is injected into the code it touched and the tests
+                         # are re-run: one the tests do not notice is a change
+                         # that would have shipped. Costs a test run per fault
+    mutants: 5           # faults injected per ticket
+    budget: 180          # seconds the whole survey may spend
+    timeout: 120         # seconds one test run under one fault may take
+    screen: true         # ask a model whether a survivor is reachable at all;
+                         # most are faults no test could ever have caught
+    block: true          # a confirmed survivor fails the ticket, which sends
+                         # the failing case to the repair path. false reports it
 
 github:
   enabled: false

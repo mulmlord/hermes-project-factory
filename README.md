@@ -452,8 +452,23 @@ the model will not fix it, because a thin answer beats a failed phase.
 ## Isolation
 
 Generated code is treated as hostile. It runs in a container with no network,
-capped memory, CPU and process count, all capabilities dropped, and only the
-project workspace mounted. Agent file writes are checked against path escapes
+capped memory (swap included), CPU and process count, all capabilities
+dropped, a read-only root filesystem, and only the project workspace mounted.
+The one other writable place is `/tmp`, which is also `$HOME` and where
+`pip install --user` lands: a tmpfs capped at `sandbox.tmp` (2g), so a
+runaway write fills a bounded buffer rather than the host's disk. Nothing from
+the host environment is passed in, so no token or key is inside to be used.
+
+A container shares the host's kernel. For a kernel boundary as well, install
+gVisor or Kata Containers and name the runtime at `sandbox.oci_runtime`
+(`runsc`, `kata-runtime`); `hermes doctor` says whether docker has it
+registered. It is a name rather than a list of `docker run` flags, so the
+setting can only add isolation. If the engine does not know the runtime,
+Hermes runs under docker's default `runc` and logs `sandbox.runtime_refused` —
+never the `local` runtime, which would be no container at all. gVisor blocks
+GPU passthrough; the sandbox is given none, so nothing is lost.
+
+Agent file writes are checked against path escapes
 and a protected-path list, so generated code cannot reach Hermes state, the
 git directory, or anything on the host. In the local fallback runtime the
 environment is stripped of anything resembling a key, token or credential.

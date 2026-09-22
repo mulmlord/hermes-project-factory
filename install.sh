@@ -2,44 +2,30 @@
 #
 # Install the Hermes Project Factory.
 #
-# Creates an isolated virtualenv for the factory, installs it and its single
-# dependency, and puts `hpf` and `hermes` on your PATH. The optional OpenHands
-# agent layer is installed alongside it, in an environment of its own.
+# This script only puts software on disk. It asks nothing, starts nothing,
+# downloads no model weights and writes no configuration: it builds an
+# isolated virtualenv for the factory, installs it and its single dependency,
+# puts `hpf` and `hermes` on your PATH, and builds the neighbouring
+# environments for vLLM and the optional OpenHands agent layer.
 #
-# It then sets up the model server Hermes talks to: vLLM, serving one local
-# model on port 6767, under a systemd user unit that restarts on failure.
-# Hermes starts that unit when a project starts or continues and stops it when
-# the run ends, so the model is not holding VRAM while nothing is using it.
-# You are asked once where the model is — a directory you already have, or a
-# Hugging Face repository to download and where to keep it. Nothing is guessed
-# silently and no hosted API is ever contacted.
+# Choosing and starting a model server is the other half, and it lives in
+# ./start.sh, which asks where the model is, which port to serve it on and how
+# much context to reserve, writes your config and brings the server up.
+#
+#     ./install.sh && ./start.sh
 #
 # Usage: ./install.sh [--dev] [--system] [--bin DIR] [--venv DIR]
-#                     [--no-docker-image] [--no-config] [--no-openhands]
-#                     [--classifier] [--classifier-model REPO] [--classifier-port N]
-#                     [--model REPO_OR_NAME] [--model-path DIR] [--models-dir DIR]
-#                     [--port N] [--max-model-len N] [--gpu-util F]
-#                     [--no-server] [--boot] [--force-config]
+#                     [--no-docker-image] [--no-openhands] [--no-vllm]
+#                     [--classifier]
 #
 #   --dev              also install the test dependencies
 #   --system           link into /usr/local/bin instead of ~/.local/bin (sudo)
 #   --bin DIR          link the commands into DIR
 #   --venv DIR         build the virtualenv in DIR (default: <repo>/.venv)
 #   --no-docker-image  skip pre-pulling the sandbox image
-#   --no-config        do not write ~/.config/hermes/config.yaml
 #   --no-openhands     skip the optional OpenHands agent layer
-#   --classifier       install the optional security-gate classifier (torch)
-#   --classifier-model REPO  checkpoint it serves (default: a tuned one of yours)
-#   --classifier-port N      port the classifier listens on (default: 6768)
-#   --model REPO       Hugging Face repository to download and serve
-#   --model-path DIR   serve a model directory you already have
-#   --models-dir DIR   where downloaded weights are stored
-#   --port N           port vLLM listens on (default: 6767)
-#   --max-model-len N  context length vLLM serves (default: 16384)
-#   --gpu-util F       fraction of VRAM vLLM may use (default: 0.90)
-#   --no-server        install nothing for vLLM and start no server
-#   --boot             also run the server at boot, not just during a run
-#   --force-config     rewrite an existing config to point at this server
+#   --no-vllm          skip the vLLM environment (you serve models yourself)
+#   --classifier       also install the security-gate classifier (torch)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,38 +36,13 @@ LAYA_VENV="$REPO/.venv-laya"
 BIN_DIR="$HOME/.local/bin"
 DEV=0
 PULL_IMAGE=1
-WRITE_CONFIG=1
 OPENHANDS=1
-
-# -- model server defaults ---------------------------------------------------
-
-SERVER=1
-BOOT=0          # --boot: run the server whether or not a project is running
-FORCE_CONFIG=0
-PORT=6767
-MODEL_REPO=""
-MODEL_PATH=""
-MODELS_DIR="${HERMES_MODELS_DIR:-$HOME/.local/share/hermes/models}"
-MAX_MODEL_LEN=16384
-GPU_UTIL=0.90
-UNIT_NAME="hermes-vllm.service"
-UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-
-# -- security classifier defaults --------------------------------------------
+VLLM=1
 
 # Off unless asked for. It is a second opinion on the security gate, it costs
 # a torch install, and an un-tuned checkpoint is a source of noise rather than
 # of findings — so nobody gets it by accident.
 CLASSIFIER=0
-CLASSIFIER_PORT=6768
-CLASSIFIER_REPO="convaiinnovations/laya"
-CLASSIFIER_UNIT="hermes-classifier.service"
-
-# A 7B AWQ coder: ~5 GiB of weights, which is what actually fits beside a
-# desktop session on an 8 GiB card. vLLM keeps the whole model resident in
-# VRAM — it has no CPU offload — so the ollama habit of naming a 30B model
-# here would simply fail to start.
-DEFAULT_REPO="Qwen/Qwen2.5-Coder-7B-Instruct-AWQ"
 
 note() { printf '==> %s\n' "$*"; }
 warn() { printf ' !  %s\n' "$*" >&2; }
@@ -90,35 +51,15 @@ die()  { printf 'XX  %s\n' "$*" >&2; exit 1; }
 # -- progress ----------------------------------------------------------------
 
 # Several steps here take minutes, and a silent terminal during a 4 GB
-# download is indistinguishable from a hang. Two indicators cover the two
-# cases: `spin` for work of unknown length, `bar` for a wait with a deadline.
-#
-# Steps whose own tooling already prints real byte-level progress — uv and
-# `hf download` — are deliberately left to print it, because a spinner that
+# download is indistinguishable from a hang. `spin` covers work of unknown
+# length; steps whose own tooling already prints real byte-level progress —
+# uv and pip — are deliberately left to print it, because a spinner that
 # replaced "1.2/4.0 GB" with a twirling stick would be less information, not
 # more.
 #
-# Both degrade to a single plain line when stdout is not a terminal, so piping
+# It degrades to a single plain line when stdout is not a terminal, so piping
 # the install to a file does not produce a megabyte of carriage returns.
-BAR_FULL='############################'
-BAR_EMPTY='............................'
-BAR_WIDTH=28
-
 progress_tty() { [ -t 1 ]; }
-
-bar() {  # bar <done> <total> <label>
-  progress_tty || return 0
-  local done=$1 total=$2 label=$3 filled pct
-  [ "$total" -gt 0 ] || total=1
-  filled=$(( done * BAR_WIDTH / total ))
-  [ "$filled" -gt "$BAR_WIDTH" ] && filled=$BAR_WIDTH
-  pct=$(( done * 100 / total ))
-  [ "$pct" -gt 100 ] && pct=100
-  printf '\r    [%s%s] %3d%%  %s\033[K' \
-    "${BAR_FULL:0:filled}" "${BAR_EMPTY:0:$((BAR_WIDTH - filled))}" "$pct" "$label"
-}
-
-bar_clear() { progress_tty && printf '\r\033[K' || true; }
 
 spin() {  # spin <label> <command...>
   local label="$1"; shift
@@ -150,6 +91,21 @@ spin() {  # spin <label> <command...>
   return 1
 }
 
+# The interpreter vLLM, OpenHands and the classifier are built against. All
+# three lag the newest CPython by a release or two, and this host may well be
+# running it, so uv fetching 3.12 is the reliable answer and a system 3.10-3.12
+# the fallback.
+find_python() {  # find_python <version...>
+  local candidate
+  for candidate in "$@"; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --dev)             DEV=1 ;;
@@ -157,21 +113,10 @@ while [ $# -gt 0 ]; do
     --bin)             BIN_DIR="${2:?--bin needs a directory}"; shift ;;
     --venv)            VENV="${2:?--venv needs a directory}"; shift ;;
     --no-docker-image) PULL_IMAGE=0 ;;
-    --no-config)       WRITE_CONFIG=0 ;;
     --no-openhands)    OPENHANDS=0 ;;
+    --no-vllm)         VLLM=0 ;;
     --classifier)      CLASSIFIER=1 ;;
-    --classifier-model) CLASSIFIER=1; CLASSIFIER_REPO="${2:?--classifier-model needs a repository}"; shift ;;
-    --classifier-port) CLASSIFIER_PORT="${2:?--classifier-port needs a number}"; shift ;;
-    --model)           MODEL_REPO="${2:?--model needs a repository or name}"; shift ;;
-    --model-path)      MODEL_PATH="${2:?--model-path needs a directory}"; shift ;;
-    --models-dir)      MODELS_DIR="${2:?--models-dir needs a directory}"; shift ;;
-    --port)            PORT="${2:?--port needs a number}"; shift ;;
-    --max-model-len)   MAX_MODEL_LEN="${2:?--max-model-len needs a number}"; shift ;;
-    --gpu-util)        GPU_UTIL="${2:?--gpu-util needs a fraction}"; shift ;;
-    --no-server)       SERVER=0 ;;
-    --boot)            BOOT=1 ;;
-    --force-config)    FORCE_CONFIG=1 ;;
-    -h|--help)         sed -n '3,42p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)         sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)                 die "unknown option: $1 (try --help)" ;;
   esac
   shift
@@ -221,42 +166,6 @@ for command in hpf hermes; do
     sudo ln -sf "$VENV/bin/$command" "$BIN_DIR/$command"
   fi
 done
-
-# -- configuration -----------------------------------------------------------
-
-# `hpf` runs in project directories that have no hermes.yaml of their own, so
-# the config in $HOME is what makes the command work from anywhere.
-#
-# Deferred until the model server section has run, because the config has to
-# name the model that is actually being served and the port it answers on.
-# MODEL_NAME is empty when no server was set up, and the sample's own defaults
-# then stand unaltered.
-CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/hermes/config.yaml"
-MODEL_NAME=""
-
-write_config() {
-  [ "$WRITE_CONFIG" -eq 1 ] || return 0
-  if [ -f "$CONFIG" ] && [ "$FORCE_CONFIG" -eq 0 ]; then
-    note "keeping the existing config at $CONFIG"
-    if [ -n "$MODEL_NAME" ]; then
-      note "to point it at this server, set under models.default:"
-      note "    backend: vllm"
-      note "    base_url: http://localhost:$PORT/v1"
-      note "    model: $MODEL_NAME"
-      note "or re-run with --force-config to have it rewritten"
-    fi
-    return 0
-  fi
-  mkdir -p "$(dirname "$CONFIG")"
-  # Patch the sample rather than restating it here, so the annotated file
-  # stays the single description of every option.
-  "$VENV/bin/hermes" config --sample \
-    | sed -e "s|^\(    base_url: \).*|\1http://localhost:$PORT/v1|" \
-          ${MODEL_NAME:+-e "s|^\(    model: \).*|\1$MODEL_NAME|"} \
-          -e "s|^\(    context: \).*|\1$MAX_MODEL_LEN|" \
-    > "$CONFIG"
-  note "wrote a config to $CONFIG"
-}
 
 # -- tooling -----------------------------------------------------------------
 
@@ -334,10 +243,9 @@ fi
 # wants torch and transformers, and the factory's own environment has exactly
 # one dependency and should keep it.
 #
-# On CPU by default, deliberately. The coding model has the GPU for the whole
-# run and vLLM pins it; a 400M encoder competing for the same VRAM would cost
-# more than the gate it serves is worth. It classifies a few hundred short
-# chunks after a test suite has already run for minutes.
+# Only the environment is built here. start.sh writes its unit and starts it,
+# because which checkpoint it serves and on which port are questions about a
+# running server rather than about an install.
 if [ "$CLASSIFIER" -eq 1 ]; then
   note "installing the security-gate classifier"
   build_classifier() {
@@ -345,11 +253,8 @@ if [ "$CLASSIFIER" -eq 1 ]; then
       uv venv --quiet --python 3.12 "$LAYA_VENV" \
         && uv pip install --quiet --python "$LAYA_VENV/bin/python" laya
     else
-      local py=""
-      for candidate in python3.12 python3.11 python3.10; do
-        command -v "$candidate" >/dev/null 2>&1 && { py="$candidate"; break; }
-      done
-      [ -n "$py" ] || return 1
+      local py
+      py="$(find_python python3.12 python3.11 python3.10)" || return 1
       "$py" -m venv "$LAYA_VENV" \
         && "$LAYA_VENV/bin/python" -m pip install --quiet --upgrade pip \
         && "$LAYA_VENV/bin/python" -m pip install --quiet laya
@@ -367,288 +272,49 @@ if [ "$CLASSIFIER" -eq 1 ]; then
   fi
 fi
 
-if [ "$CLASSIFIER" -eq 1 ]; then
-  note "writing the $CLASSIFIER_UNIT user unit"
-  mkdir -p "$UNIT_DIR"
-  cat > "$UNIT_DIR/$CLASSIFIER_UNIT" <<EOF
-[Unit]
-Description=Hermes Project Factory security classifier (port $CLASSIFIER_PORT)
-After=network-online.target
+# -- vllm --------------------------------------------------------------------
 
-[Service]
-Type=exec
-# The SDK deadlocks against TensorFlow's abseil init if both get imported.
-Environment=USE_TF=0
-ExecStart=$LAYA_VENV/bin/python $REPO/contrib/laya_server.py \\
-    --model $CLASSIFIER_REPO \\
-    --host 127.0.0.1 --port $CLASSIFIER_PORT \\
-    --device cpu
-Restart=always
-RestartSec=10
-TimeoutStartSec=600
-
-[Install]
-WantedBy=default.target
-EOF
-  systemctl --user daemon-reload || warn "could not reload the user systemd manager"
-  if systemctl --user enable --now "$CLASSIFIER_UNIT" 2>/dev/null; then
-    note "started $CLASSIFIER_UNIT on port $CLASSIFIER_PORT"
-  else
-    warn "could not start $CLASSIFIER_UNIT; start it by hand when you want it"
-  fi
-  note "to use it, set 'enabled: true' under 'security.classifier' in your config"
-  warn "$CLASSIFIER_REPO is not tuned for vulnerability detection: out of the box"
-  warn "it scores near chance and will mostly add noise. Fine-tune a checkpoint"
-  warn "on labelled vulnerability data and pass --classifier-model before you"
-  warn "rely on it, and leave 'block: false' until you have measured it."
-fi
-
-# -- model server ------------------------------------------------------------
-
-# vLLM, one model, port 6767, under a systemd user unit. A unit rather than a
-# shell command because the factory runs for hours and every agent call needs
-# the server up: something has to own restarts, and an operator who must
-# remember to start it by hand is a dependency the loop cannot satisfy at 04:00.
+# The environment only. Which model it serves, on which port, with how much
+# context is start.sh's business, and none of it is needed to install torch.
 #
-# The unit is installed but *not* enabled. vLLM pins the whole model in VRAM
-# for as long as it lives, so a server running since boot is gigabytes of GPU
-# given to an idle process. Hermes starts the unit when a project starts or
-# continues and stops it when the run ends (server.autostart in the config).
-# This install starts it once, so you can see it work. --boot opts into the
-# old behaviour: enabled, plus lingering so it survives logout.
+# vLLM's dependency tree is torch plus the CUDA runtime, several gigabytes of
+# it, and it does not belong in the factory's own virtualenv. It also has no
+# wheels for the newest CPython releases, so the interpreter is pinned to 3.12
+# the same way the OpenHands layer is.
 #
-# A *user* unit, not a system one, so nothing here needs root and the weights
-# stay readable by you alone.
-serve_model() {
-  if [ "$SERVER" -eq 0 ]; then
-    note "skipping the model server (--no-server)"
-    return 0
-  fi
-
+# Left unquiet on purpose: this is the single longest step of the install, and
+# both uv and pip report bytes and packages as they go. That is better progress
+# information than anything this script could draw over the top.
+if [ "$VLLM" -eq 1 ]; then
   if ! command -v nvidia-smi >/dev/null 2>&1; then
     warn "no NVIDIA GPU detected. The published vLLM wheels need CUDA, and a"
-    warn "CPU-only vLLM has to be built from source, so the server is skipped."
-    warn "Point models.default at a server you run yourself, or re-run with"
-    warn "--no-server to stop being told this."
-    return 0
-  fi
-
-  # Where the weights come from. Asked once, never guessed in the dark: an
-  # unattended run that silently pulls several gigabytes is a worse outcome
-  # than one that says what flag to pass.
-  if [ -n "$MODEL_PATH" ]; then
-    MODEL_PATH="$(cd "$MODEL_PATH" 2>/dev/null && pwd)" \
-      || die "--model-path is not a directory that exists"
-  elif [ -z "$MODEL_REPO" ]; then
-    if [ -t 0 ]; then
-      printf '\n'
-      note "Which model should vLLM serve on port $PORT?"
-      note "  1) download one from Hugging Face"
-      note "  2) serve a model directory already on this machine"
-      printf '   choice [1]: '
-      read -r choice || choice=""
-      if [ "${choice:-1}" = "2" ]; then
-        printf '   path to the model directory: '
-        read -r reply || reply=""
-        [ -n "$reply" ] || die "no path given"
-        MODEL_PATH="$(cd "${reply/#\~/$HOME}" 2>/dev/null && pwd)" \
-          || die "not a directory: $reply"
-      else
-        printf '   Hugging Face repository [%s]: ' "$DEFAULT_REPO"
-        read -r reply || reply=""
-        MODEL_REPO="${reply:-$DEFAULT_REPO}"
-        printf '   store the weights in [%s]: ' "$MODELS_DIR"
-        read -r reply || reply=""
-        MODELS_DIR="${reply:-$MODELS_DIR}"
-        MODELS_DIR="${MODELS_DIR/#\~/$HOME}"
-      fi
-    else
-      warn "no model chosen and no terminal to ask at. Re-run with --model"
-      warn "REPO (downloaded into --models-dir) or --model-path DIR, or pass"
-      warn "--no-server. Nothing was installed for vLLM."
-      return 0
-    fi
-  fi
-
-  # 8 GiB cards are the common case on laptops and the common cause of a
-  # server that installs cleanly and then dies on first load.
-  local vram
-  vram="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)"
-  if [ -n "$vram" ] && [ "$vram" -lt 10000 ] 2>/dev/null; then
-    note "GPU has ${vram} MiB of VRAM: serving at most a 7B 4-bit model"
-    note "vLLM holds the whole model in VRAM, so a 30B model will not load"
-  fi
-
-  # vLLM's dependency tree is torch plus the CUDA runtime, several gigabytes of
-  # it, and it does not belong in the factory's own virtualenv. It also has no
-  # wheels for this host's CPython 3.14 yet, so the interpreter is pinned to
-  # 3.12 the same way the OpenHands layer is.
-  # Left unquiet on purpose: this is the single longest step of the install,
-  # and both uv and pip report bytes and packages as they go. That is better
-  # progress information than anything this script could draw over the top.
-  note "installing vLLM into $VLLM_VENV (a few GB; progress below)"
-  if [ -x "$VLLM_VENV/bin/vllm" ]; then
+    warn "CPU-only vLLM has to be built from source, so it is skipped. Point"
+    warn "models.default at a server you run yourself — Ollama, llama.cpp and"
+    warn "any other OpenAI-compatible endpoint are fully supported — or pass"
+    warn "--no-vllm to stop being told this."
+    VLLM=0
+  elif [ -x "$VLLM_VENV/bin/vllm" ]; then
     note "reusing the vLLM environment at $VLLM_VENV"
-  elif command -v uv >/dev/null 2>&1; then
-    uv venv --quiet --python 3.12 "$VLLM_VENV" \
-      || die "uv could not create a CPython 3.12 environment for vLLM"
-    uv pip install --python "$VLLM_VENV/bin/python" vllm "huggingface_hub[cli]" \
-      || die "could not install vLLM into $VLLM_VENV"
   else
-    local py=""
-    for candidate in python3.12 python3.11 python3.10; do
-      command -v "$candidate" >/dev/null 2>&1 && { py="$candidate"; break; }
-    done
-    [ -n "$py" ] || die "vLLM needs CPython 3.10-3.12; install uv (https://docs.astral.sh/uv/) and re-run"
-    "$py" -m venv "$VLLM_VENV" || die "could not create $VLLM_VENV"
-    spin "upgrading pip in $VLLM_VENV" \
-      "$VLLM_VENV/bin/python" -m pip install --quiet --upgrade pip || true
-    "$VLLM_VENV/bin/python" -m pip install --progress-bar on vllm "huggingface_hub[cli]" \
-      || die "could not install vLLM into $VLLM_VENV"
-  fi
-
-  if [ -z "$MODEL_PATH" ]; then
-    MODEL_PATH="$MODELS_DIR/$(basename "$MODEL_REPO")"
-    # hf draws a per-file progress bar with real byte counts, so it is left to
-    # speak for itself rather than being wrapped in a spinner.
-    note "downloading $MODEL_REPO into $MODEL_PATH (progress below)"
-    mkdir -p "$MODEL_PATH" || die "cannot write to $MODEL_PATH"
-    "$VLLM_VENV/bin/hf" download "$MODEL_REPO" --local-dir "$MODEL_PATH" \
-      || die "could not download $MODEL_REPO. Check the name, or pass --model-path."
-  fi
-  [ -f "$MODEL_PATH/config.json" ] \
-    || warn "$MODEL_PATH has no config.json; vLLM may not recognise it"
-
-  # The name the config will use, and the name vLLM will answer to, are made
-  # the same string on purpose: preflight compares what is configured against
-  # what /v1/models reports, and a path here would make that comparison fuzzy.
-  MODEL_NAME="$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')"
-
-  note "writing the $UNIT_NAME user unit"
-  mkdir -p "$UNIT_DIR"
-  cat > "$UNIT_DIR/$UNIT_NAME" <<EOF
-[Unit]
-Description=Hermes Project Factory model server (vLLM, port $PORT)
-Documentation=https://docs.vllm.ai
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=exec
-# The weights are already on disk; serving must never reach the network.
-Environment=HF_HUB_OFFLINE=1
-ExecStart=$VLLM_VENV/bin/vllm serve $MODEL_PATH \\
-    --served-model-name $MODEL_NAME \\
-    --host 127.0.0.1 --port $PORT \\
-    --max-model-len $MAX_MODEL_LEN \\
-    --gpu-memory-utilization $GPU_UTIL
-# vLLM drains in-flight requests on SIGINT; SIGTERM kills mid-generation.
-KillSignal=SIGINT
-Restart=always
-RestartSec=10
-TimeoutStartSec=900
-
-[Install]
-WantedBy=default.target
-EOF
-
-  systemctl --user daemon-reload || warn "could not reload the user systemd manager"
-
-  if [ "$BOOT" -eq 1 ]; then
-    # --boot: the server runs whether or not a project does. Lingering is the
-    # piece that makes that true at boot rather than at next login, because a
-    # user unit otherwise stops with the last session.
-    if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" = "yes" ]; then
-      note "lingering is already enabled for $USER"
-    elif loginctl enable-linger "$USER" 2>/dev/null; then
-      note "enabled lingering for $USER, so the server starts at boot"
-    elif sudo loginctl enable-linger "$USER"; then
-      note "enabled lingering for $USER (as root)"
+    note "installing vLLM into $VLLM_VENV (a few GB; progress below)"
+    if command -v uv >/dev/null 2>&1; then
+      uv venv --quiet --python 3.12 "$VLLM_VENV" \
+        || die "uv could not create a CPython 3.12 environment for vLLM"
+      uv pip install --python "$VLLM_VENV/bin/python" vllm "huggingface_hub[cli]" \
+        || die "could not install vLLM into $VLLM_VENV"
     else
-      warn "could not enable lingering: the server will start when you log in,"
-      warn "not at boot. Run: sudo loginctl enable-linger $USER"
+      PY="$(find_python python3.12 python3.11 python3.10)" \
+        || die "vLLM needs CPython 3.10-3.12; install uv (https://docs.astral.sh/uv/) and re-run"
+      "$PY" -m venv "$VLLM_VENV" || die "could not create $VLLM_VENV"
+      spin "upgrading pip in $VLLM_VENV" \
+        "$VLLM_VENV/bin/python" -m pip install --quiet --upgrade pip || true
+      "$VLLM_VENV/bin/python" -m pip install --progress-bar on vllm "huggingface_hub[cli]" \
+        || die "could not install vLLM into $VLLM_VENV"
     fi
-    note "enabling $UNIT_NAME at boot and starting it now"
-    systemctl --user enable --now "$UNIT_NAME" \
-      || warn "could not start $UNIT_NAME; see: systemctl --user status $UNIT_NAME"
-  else
-    # Left disabled deliberately: Hermes starts it per run. Started once here
-    # so the install proves the model actually loads on this GPU, rather than
-    # deferring that discovery to the first project.
-    note "starting $UNIT_NAME once to check the model loads"
-    note "it is not enabled at boot: Hermes starts it when a project starts"
-    systemctl --user start "$UNIT_NAME" \
-      || warn "could not start $UNIT_NAME; see: systemctl --user status $UNIT_NAME"
   fi
-
-  # Loading several gigabytes onto the GPU takes minutes, and every command
-  # after this one assumes the server answers, so wait rather than race it.
-  # The bar runs against the timeout rather than against real progress: vLLM
-  # reports nothing over HTTP until it is ready to serve, so elapsed-against-
-  # deadline is the only honest total available. It is labelled as such.
-  local waited=0 timeout=600 ready=0
-  note "waiting for the server to load the model (up to $((timeout / 60)) minutes)"
-  while [ "$waited" -lt "$timeout" ]; do
-    if "$VENV/bin/python" - "$PORT" <<'PY'
-import sys, urllib.error, urllib.request
-try:
-    with urllib.request.urlopen(
-            f"http://127.0.0.1:{sys.argv[1]}/v1/models", timeout=5) as resp:
-        raise SystemExit(0 if resp.status == 200 else 1)
-except (urllib.error.URLError, OSError):
-    raise SystemExit(1)
-PY
-    then
-      ready=1
-      break
-    fi
-    sleep 5
-    waited=$((waited + 5))
-    bar "$waited" "$timeout" "loading $MODEL_NAME (${waited}s of ${timeout}s)"
-  done
-  bar_clear
-  if [ "$ready" -eq 1 ]; then
-    note "vLLM is serving $MODEL_NAME on http://localhost:$PORT/v1"
-  else
-    warn "the server did not answer on port $PORT within 10 minutes."
-    warn "check: systemctl --user status $UNIT_NAME; journalctl --user -u $UNIT_NAME"
-    warn "a model too large for this GPU is the usual cause; --max-model-len"
-    warn "and --gpu-util are the knobs, a smaller model is the other answer."
-  fi
-}
-
-serve_model
-write_config
-
-# -- models ------------------------------------------------------------------
-
-note "checking the local inference server"
-"$VENV/bin/hermes" doctor \
-  || warn "doctor found problems above. Check that $UNIT_NAME is running and
-     that the config names the model it serves. Hermes will not fall back to
-     a cloud API."
-
-# The check above is the only reason the server was started, and it is done.
-# Handing the VRAM back now is what "runs while a project runs" means; the
-# alternative is a model resident until the next reboot on the chance that a
-# project follows the install.
-if [ "$SERVER" -eq 1 ] && [ "$BOOT" -eq 0 ] && [ -f "$UNIT_DIR/$UNIT_NAME" ]; then
-  note "stopping $UNIT_NAME; Hermes starts it when a project starts"
-  systemctl --user stop "$UNIT_NAME" || warn "could not stop $UNIT_NAME"
 fi
 
-if [ "$CLASSIFIER" -eq 1 ]; then
-  cat <<EOF
-
-==> the security classifier runs on CPU as $CLASSIFIER_UNIT, so it never
-    competes with the coding model for VRAM:
-
-    systemctl --user status $CLASSIFIER_UNIT
-    curl -s http://127.0.0.1:$CLASSIFIER_PORT/health
-
-    It does nothing until you set 'enabled: true' under 'security.classifier'.
-EOF
-fi
+# -- next --------------------------------------------------------------------
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
@@ -658,31 +324,32 @@ esac
 
 cat <<EOF
 
-==> installed.
+==> installed. Nothing is running yet and no config has been written.
 
-The model server runs as a systemd user unit, started by the run that needs
-it and stopped when that run ends, so no model sits in VRAM in between:
+Set up the model server and write your config:
 
-    systemctl --user status $UNIT_NAME
-    journalctl --user -u $UNIT_NAME -f     # what it is doing
-    systemctl --user start $UNIT_NAME      # bring it up by hand
+    ./start.sh
 
-A server you started yourself is left alone at the end of a run. To keep it
-resident between runs, set 'stop_after_run: false' under 'server'; to have it
-running at boot regardless, re-run with --boot.
+It asks which model to serve, on which port, with how much context, writes
+those answers to your config and brings the server up. Later runs of it
+either ask again, defaulting to your current answers, or skip the questions
+entirely and start what the config already describes:
 
-Start a project from any directory:
+    ./start.sh --config
+
+Then build something, from any directory:
 
     mkdir -p ~/projects/my-idea && cd ~/projects/my-idea
     hpf "my-idea"
-
-Continue an interrupted project from the same directory:
-
-    hpf
-
-Watch it work:
-
-    hermes status      # phase, board, progress
-    hermes journal     # what each agent did
-    hermes logs -f     # live log
 EOF
+if [ "$VLLM" -eq 0 ]; then
+  cat <<EOF
+
+No vLLM environment was installed, so ./start.sh has no server to bring up.
+Point models.default at an OpenAI-compatible server you run yourself:
+
+    hermes config --set models.default.base_url=http://localhost:11434/v1 \\
+                  --set models.default.model=NAME
+    hermes doctor
+EOF
+fi

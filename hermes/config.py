@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import ipaddress
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,7 @@ DEFAULTS: dict[str, Any] = {
     "models": {
         "default": {
             "backend": "vllm",
-            # install.sh serves one model here under a systemd user unit.
+            # start.sh serves one model here under a systemd user unit.
             "base_url": "http://localhost:6767/v1",
             "model": "qwen2.5-coder-7b-instruct-awq",
             # vLLM reserves the KV cache for the full context at startup, so
@@ -49,13 +50,20 @@ DEFAULTS: dict[str, Any] = {
     },
     "routing": {role: "default" for role in TASK_ROLES},
     "server": {
-        # install.sh writes this unit but leaves it disabled: the server pins
+        # start.sh writes this unit but leaves it disabled: the server pins
         # the whole model in VRAM, so it runs while a project runs and not
         # while the machine merely happens to be on.
         "autostart": True,
         "unit": "hermes-vllm.service",
         "wait": 600,             # seconds allowed for the weights to load
         "stop_after_run": True,  # only ever stops a server Hermes started
+        # What start.sh served, recorded so that `./start.sh --config` can
+        # rebuild the unit from this file alone rather than asking again.
+        # Hermes itself reads neither: the endpoint it talks to is base_url
+        # above, and the context it may ask for is that model's `context`,
+        # which start.sh keeps equal to the server's --max-model-len.
+        "model_path": "",        # weights directory the unit serves
+        "gpu_util": 0.90,        # fraction of VRAM vLLM may use
     },
     "sandbox": {
         "runtime": "docker",          # docker | local
@@ -273,7 +281,7 @@ def is_local_url(url: str) -> bool:
 def user_config_paths() -> list[Path]:
     """Where a per-user config may live, in precedence order.
 
-    install.sh and uninstall.sh both address this file as
+    start.sh and uninstall.sh both address this file as
     ``${XDG_CONFIG_HOME:-$HOME/.config}/hermes/config.yaml``. Honouring only
     the second half of that would mean the installer writes the name of the
     model it is serving into a file Hermes never reads. ``~/.config`` stays in
@@ -370,7 +378,7 @@ class Config:
 SAMPLE_CONFIG = """\
 # Hermes Project Factory configuration. Local models only.
 #
-# install.sh serves one model with vLLM on port 6767, as a systemd user unit:
+# start.sh serves one model with vLLM on port 6767, as a systemd user unit:
 # `systemctl --user status hermes-vllm.service`. Hermes starts that unit when
 # a project starts or continues and stops it when the run ends, so the model
 # does not sit in VRAM between runs. The model name below must be the one the
@@ -404,6 +412,10 @@ server:
   stop_after_run: true         # set false to leave the model resident between
                                # runs, or when two projects share one server:
                                # Hermes only ever stops one it started itself
+  # What start.sh last served. It writes these two so that `./start.sh
+  # --config` can rebuild the unit from this file without asking again.
+  model_path: ""               # weights directory the unit serves
+  gpu_util: 0.90               # fraction of VRAM vLLM may use
 
 sandbox:
   runtime: docker                    # docker | local
@@ -497,3 +509,121 @@ github:
                          # board is the source of truth and an edit made on
                          # GitHub is never read back.
 """
+
+
+# -- editing a config in place -----------------------------------------------
+
+# start.sh writes the model, the port and the context it just started a server
+# with into the user's config. That config is annotated — every option in it
+# carries the sentence explaining it — so it is edited as text rather than
+# loaded and re-dumped, which would return a correct file with every comment
+# stripped out of it.
+#
+# Text editing of YAML is only safe if you check the result, so every edit here
+# is parsed back and the value compared against what was asked for; a mismatch
+# raises rather than leaving a file that reads plausibly and means something
+# else.
+
+_KEY_LINE = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_.\-]+):(?P<rest>(?: .*)?)$")
+
+
+def format_scalar(value: Any) -> str:
+    """Render *value* as the YAML scalar that parses back to it.
+
+    Quoting is left to PyYAML, which knows that ``yes`` and ``16384`` need it
+    to stay strings and that a path does not.
+    """
+    return yaml.safe_dump(value, default_flow_style=True, width=10 ** 6).splitlines()[0]
+
+
+def _block_bounds(lines: list[str], start: int, indent: int) -> int:
+    """Index one past the last line of the block opened above *start*."""
+    end = start
+    for i in range(start, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped or stripped.startswith("#"):
+            continue          # blank lines and comments never close a block
+        if len(lines[i]) - len(lines[i].lstrip(" ")) <= indent:
+            return end
+        end = i + 1
+    return end
+
+
+def _key_indent(lines: list[str], start: int, end: int, fallback: int) -> int:
+    """The column the keys of the block in [start, end) are written at."""
+    for i in range(start, end):
+        match = _KEY_LINE.match(lines[i])
+        if match:
+            return len(match.group("indent"))
+    return fallback              # an empty block: nest one level under its name
+
+
+def _find_key(lines: list[str], start: int, end: int, indent: int, key: str) -> int | None:
+    """The line defining *key* at *indent* in [start, end)."""
+    for i in range(start, end):
+        match = _KEY_LINE.match(lines[i])
+        if not match or len(match.group("indent")) != indent:
+            continue             # deeper keys belong to a nested mapping
+        if match.group("key") == key:
+            return i
+    return None
+
+
+def set_config_value(text: str, dotted: str, value: Any) -> str:
+    """Return *text* with *dotted* set to *value*, comments intact.
+
+    Missing keys are created, including the mappings on the way down, so a
+    config written before an option existed gains it rather than being
+    rejected.
+    """
+    lines = text.splitlines()
+    parts = dotted.split(".")
+    start, end = 0, len(lines)
+    indent = _key_indent(lines, start, end, 0)
+
+    for depth, part in enumerate(parts):
+        line = _find_key(lines, start, end, indent, part)
+        if line is None:
+            # Insert what is left of the path at the foot of the block we got
+            # to, after its last line of content rather than after the blank
+            # line and the comment that introduce whatever follows it.
+            at = end
+            while at > start and not lines[at - 1].strip():
+                at -= 1
+            block = [""] if indent == 0 and at and lines[at - 1].strip() else []
+            block += [
+                f"{' ' * (indent + 2 * offset)}{name}:"
+                + (f" {format_scalar(value)}" if depth + offset == len(parts) - 1 else "")
+                for offset, name in enumerate(parts[depth:])
+            ]
+            lines[at:at] = block
+            break
+
+        if depth == len(parts) - 1:
+            match = _KEY_LINE.match(lines[line])
+            rest = match.group("rest")
+            comment = rest[rest.index("#"):] if "#" in rest else ""
+            new = f"{' ' * indent}{part}: {format_scalar(value)}"
+            if comment:
+                # Keep the comment in the column it was written in, so a file
+                # of aligned annotations stays aligned.
+                column = len(lines[line]) - len(comment)
+                new += " " * max(1, column - len(new)) + comment
+            lines[line] = new
+            break
+
+        start, end = line + 1, _block_bounds(lines, line + 1, indent)
+        indent = _key_indent(lines, start, end, indent + 2)
+
+    out = "\n".join(lines) + "\n"
+    try:
+        node: Any = yaml.safe_load(out)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"setting {dotted} would not parse: {exc}") from exc
+    for part in parts:
+        if not isinstance(node, dict) or part not in node:
+            raise ConfigError(f"could not set {dotted} in this config")
+        node = node[part]
+    if node != value:
+        raise ConfigError(f"setting {dotted} gave {node!r}, not {value!r}")
+    return out

@@ -16,8 +16,8 @@ from types import SimpleNamespace
 
 from conftest import needs_docker
 
-from hermes.agents import (Prompt, build as build_agents, change_schema, escalate,
-                           file_protocol)
+from hermes.agents import (Prompt, build as build_agents, change_schema, context_block,
+                           escalate, file_protocol, ticket_block)
 from hermes.config import Config, ConfigError, DEFAULTS, deep_merge, is_local_url
 from hermes.contextdb import UNTRUSTED, ContextDB, open_db, split
 from hermes.anchor import locate
@@ -771,6 +771,47 @@ def test_generate_fits_a_tight_context_and_keeps_what_the_ticket_needs(tmp_path)
     assert "AssertionError: the last line" in prompt     # so did the failure's end
     assert "FILES:" not in prompt                        # the listing went, whole
     assert ("prompt.block_dropped", "tree") in dropped   # and said so
+
+
+def test_two_asks_about_one_project_share_the_prefix_the_server_caches(tmp_path):
+    """What ``--enable-prefix-caching`` is paid for, asserted in the text.
+
+    A KV cache is reused up to the first token that differs, so "stable
+    blocks first" is not a matter of taste: move the file listing above the
+    ticket and every call in the run recomputes the whole prompt. Two
+    different tickets must therefore still begin with the same project block,
+    and two attempts at one ticket must agree for longer than that.
+    """
+    import os
+
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    state = State(idea="parse the config",
+                  plan={"commands": {"build": "true", "test": "true"}})
+    board = Board(tmp_path)
+    first = board.add(title="read the file", status="ready")
+    second = board.add(title="write the file", status="ready")
+
+    seen = []
+    agent = _agent(lambda prompt: seen.append(prompt) or {"summary": "", "files": []})
+    agents = {"implementer": agent, "tester": agent}
+    generate(agents, sandbox, state, first, tree="src/a.py", prior="did a thing")
+    generate(agents, sandbox, state, second, tree="src/a.py", prior="did a thing")
+    generate(agents, sandbox, state, first, tree="src/a.py\nsrc/b.py",
+             prior="did a thing", failure="AssertionError")
+
+    project = context_block(state)
+    assert all(prompt.startswith(project) for prompt in seen)
+
+    # Two tickets: everything they can share, they do.
+    across = os.path.commonprefix([seen[0], seen[1]])
+    assert across == project + "\n\nTICKET T00"
+
+    # Two attempts at one ticket: the ticket and the journal are shared too,
+    # and only the tail that actually changed -- the listing, the sources, the
+    # failure being repaired -- falls outside the prefix.
+    retry = os.path.commonprefix([seen[0], seen[2]])
+    assert ticket_block(first) in retry and "did a thing" in retry
+    assert "AssertionError" not in retry and "src/b.py" not in retry
 
 
 # -- state -------------------------------------------------------------------
@@ -4497,6 +4538,84 @@ def test_running_holds_the_server_for_exactly_one_block(monkeypatch):
     off = Config(deep_merge(DEFAULTS, {"server": {"autostart": False}}))
     with running(off, router) as server:
         assert server is None
+
+
+def _serve_flags(vllm_version="0.11.2", log=NULL, **server):
+    from hermes.config import DEFAULTS
+    from hermes.server import serve_flags
+    return serve_flags(Config(deep_merge(DEFAULTS, {"server": server})),
+                       vllm_version, log)
+
+
+def test_the_unit_serves_with_the_two_flags_this_workload_pays_for():
+    """Prefix caching and n-gram speculation, and the JSON must survive.
+
+    ``--speculative-config`` takes a JSON document, and systemd tokenises
+    ExecStart itself with its own quoting rules before vLLM ever sees it: an
+    unquoted document arrives with its double quotes eaten and parses as
+    nothing. So the flag carries its own single quotes, and this asserts what
+    is left after systemd has done its half.
+    """
+    flags = _serve_flags()
+    assert "--enable-prefix-caching" in flags
+    name, document = shlex.split(next(f for f in flags if "speculative" in f))
+    assert name == "--speculative-config"
+    settings = json.loads(document)
+    assert settings["method"] == "ngram"
+    # A draft model would be the other way to speculate, and the card this
+    # unit targets has no VRAM to spare for one.
+    assert "model" not in settings
+    assert 0 < settings["prompt_lookup_min"] < settings["prompt_lookup_max"]
+    assert settings["num_speculative_tokens"] >= settings["prompt_lookup_min"]
+
+
+def test_a_vllm_too_old_for_the_flag_is_not_given_it():
+    """It spells the same setting across four others, and a flag vLLM does not
+    know is not a slower server but an absent one."""
+    old = _serve_flags("0.8.5")
+    assert old == ["--enable-prefix-caching"]
+    # Unreadable is not old: start.sh drops these and restarts if the server
+    # refuses them, so a guess costs a restart while refusing to guess costs
+    # the speedup on every version whose string we cannot parse.
+    assert _serve_flags("") == _serve_flags("0.11.2")
+
+
+def test_both_flags_are_switches_the_operator_holds(tmp_path):
+    log = Logger(tmp_path / "log.jsonl", quiet=True)
+    assert _serve_flags(speculative="off") == ["--enable-prefix-caching"]
+    assert len(_serve_flags(prefix_caching=False)) == 1
+    assert _serve_flags(prefix_caching=False, speculative="off") == []
+    # `--set server.speculative=off` is the advice the failed-start path
+    # gives, and YAML stores that answer as a boolean.
+    assert _serve_flags(speculative=False) == _serve_flags(speculative="off")
+    assert _serve_flags(speculative=True) == _serve_flags(speculative="ngram")
+    # A method nobody implements is reported, not invented: the alternative is
+    # a unit file that names a vLLM feature by guess.
+    assert _serve_flags(speculative="eagle3", log=log) == ["--enable-prefix-caching"]
+    assert _records(tmp_path / "log.jsonl")[0]["event"] == "server.speculative_unknown"
+
+
+def test_start_sh_can_serve_without_the_flags_it_wrote():
+    """The tuning must never cost the server it is tuning.
+
+    These flags are written on a version check, which is a guess about a
+    binary this repo does not pin. The guess is survivable only because the
+    unit is written by a function that can be called a second time with
+    nothing, so this pins that arrangement rather than the flags themselves.
+    """
+    start = (Path(__file__).resolve().parent.parent / "start.sh").read_text()
+
+    assert "serve_flags" in start                  # composed in Python, not here
+    assert 'write_unit "$SERVE_FLAGS"' in start    # and the first attempt uses it
+    assert 'write_unit ""' in start                # the second one does not
+    # The flags go last on the ExecStart, because each arrives as its own
+    # continuation line and a flag after them would need a backslash nothing
+    # would have written.
+    exec_start = start[start.index("ExecStart=$VLLM_VENV"):]
+    assert exec_start[:exec_start.index("\n#")].rstrip().endswith("$GPU_UTIL$1")
+    # A refusal is diagnosed from the server's own log rather than assumed:
+    # the same failed wait is far more often a model too big for the card.
+    assert "rejected_flags" in start and "journalctl" in start
 
 
 # -- the context database ----------------------------------------------------

@@ -337,9 +337,37 @@ MODEL_NAME="$(basename "$MODEL_PATH" | tr '[:upper:]' '[:lower:]')"
 # systemd error about a missing binary instead of the sentence you need.
 [ -x "$VLLM_VENV/bin/vllm" ] \
   || die "no vLLM environment at $VLLM_VENV. Run ./install.sh first."
-note "writing the $UNIT_NAME user unit"
-mkdir -p "$UNIT_DIR"
-cat > "$UNIT_DIR/$UNIT_NAME" <<EOF
+
+# How to serve, as opposed to what. Hermes decides these two from the config
+# and from which vLLM is installed — see hermes.server.serve_flags for why
+# this workload wants them — and they are asked for by version rather than
+# assumed, because a flag an older vLLM does not know is a server that exits
+# on startup instead of one that serves slightly slower.
+VLLM_VERSION="$("$VLLM_VENV/bin/python" -c \
+  'import importlib.metadata as m; print(m.version("vllm"))' 2>/dev/null || true)"
+[ -n "$VLLM_VERSION" ] && note "vLLM $VLLM_VERSION" \
+  || warn "cannot tell which vLLM is installed at $VLLM_VENV"
+SERVE_FLAGS="$("$VENV/bin/python" - "$CONFIG" "$VLLM_VERSION" <<'PY'
+import copy, sys
+from pathlib import Path
+
+from hermes.config import DEFAULTS, Config
+from hermes.server import serve_flags
+
+path = Path(sys.argv[1])
+config = Config.load(path) if path.is_file() else Config(copy.deepcopy(DEFAULTS))
+for flag in serve_flags(config, sys.argv[2]):
+    print(f" \\\n    {flag}", end="")
+PY
+)" || die "could not work out how to serve"
+
+# Written by a function rather than inline because it is written twice: once
+# with the flags above, and again without them if the server turns out not to
+# accept them.
+write_unit() {  # write_unit <extra ExecStart lines>
+  note "writing the $UNIT_NAME user unit"
+  mkdir -p "$UNIT_DIR"
+  cat > "$UNIT_DIR/$UNIT_NAME" <<EOF
 [Unit]
 Description=Hermes Project Factory model server (vLLM, port $PORT)
 Documentation=https://docs.vllm.ai
@@ -354,7 +382,7 @@ ExecStart=$VLLM_VENV/bin/vllm serve $MODEL_PATH \\
     --served-model-name $MODEL_NAME \\
     --host 127.0.0.1 --port $PORT \\
     --max-model-len $CONTEXT \\
-    --gpu-memory-utilization $GPU_UTIL
+    --gpu-memory-utilization $GPU_UTIL$1
 # vLLM drains in-flight requests on SIGINT; SIGTERM kills mid-generation.
 KillSignal=SIGINT
 Restart=always
@@ -364,7 +392,10 @@ TimeoutStartSec=900
 [Install]
 WantedBy=default.target
 EOF
-systemctl --user daemon-reload || warn "could not reload the user systemd manager"
+  systemctl --user daemon-reload || warn "could not reload the user systemd manager"
+}
+
+write_unit "$SERVE_FLAGS"
 
 # -- the config --------------------------------------------------------------
 
@@ -464,25 +495,45 @@ fi
 
 # restart rather than start when it is already up: the unit was just rewritten,
 # and a running server is still serving the old model on the old port.
-if systemctl --user is-active --quiet "$UNIT_NAME"; then
-  note "restarting $UNIT_NAME with the settings above"
+# Always a restart, whatever state it is in: "start" on a unit systemd is
+# already restarting on a loop would be honoured lazily, and the whole point
+# of the second call below is that it runs the unit file just rewritten.
+start_unit() {
+  if systemctl --user is-active --quiet "$UNIT_NAME"; then
+    note "restarting $UNIT_NAME with the settings above"
+  else
+    note "starting $UNIT_NAME"
+  fi
   systemctl --user restart "$UNIT_NAME" \
-    || die "could not restart $UNIT_NAME; see: systemctl --user status $UNIT_NAME"
-else
-  note "starting $UNIT_NAME"
-  systemctl --user start "$UNIT_NAME" \
     || die "could not start $UNIT_NAME; see: systemctl --user status $UNIT_NAME"
-fi
+}
+
+# A server that died over an argument it did not recognise, as distinct from
+# one still loading or one too big for the card. Both halves are needed: vLLM
+# prints its speculation settings on a perfectly healthy startup, so the word
+# alone means nothing, and "error" alone would blame the flags for a model
+# that simply does not fit.
+rejected_flags() {
+  journalctl --user -u "$UNIT_NAME" -n 300 --no-pager 2>/dev/null \
+    | grep -Ei 'error|unrecognized|invalid|unsupported|not supported' \
+    | grep -Eqi 'speculativ|prefix.caching'
+}
+
+restarts() { systemctl --user show -p NRestarts --value "$UNIT_NAME" 2>/dev/null || echo 0; }
 
 # Loading several gigabytes onto the GPU takes minutes, and everything after
 # this assumes the server answers, so wait rather than race it. The bar runs
 # against the timeout rather than against real progress: vLLM reports nothing
 # over HTTP until it is ready to serve, so elapsed-against-deadline is the only
 # honest total available. It is labelled as such.
-if [ "$WAIT" -eq 1 ]; then
-  waited=0
-  timeout="$CFG_WAIT"
-  ready=0
+#
+# The one thing worth not waiting ten minutes for is a server that is not
+# loading at all: a rejected argument makes vLLM exit in seconds and systemd
+# restart it forever, so a restart the log blames on our flags ends the wait
+# there and then.
+wait_ready() {
+  local waited=0 timeout="$CFG_WAIT" before
+  before="$(restarts)"
   note "waiting for the server to load the model (up to $((timeout / 60)) minutes)"
   while [ "$waited" -lt "$timeout" ]; do
     if "$VENV/bin/python" - "$PORT" <<'PY'
@@ -495,23 +546,52 @@ except (urllib.error.URLError, OSError):
     raise SystemExit(1)
 PY
     then
-      ready=1
-      break
+      bar_clear
+      note "vLLM is serving $MODEL_NAME on http://localhost:$PORT/v1"
+      return 0
+    fi
+    if [ "$(restarts)" != "$before" ] && rejected_flags; then
+      bar_clear
+      return 1
     fi
     sleep 5
     waited=$((waited + 5))
     bar "$waited" "$timeout" "loading $MODEL_NAME (${waited}s of ${timeout}s)"
   done
   bar_clear
-  if [ "$ready" -eq 1 ]; then
-    note "vLLM is serving $MODEL_NAME on http://localhost:$PORT/v1"
-  else
-    warn "the server did not answer on port $PORT within $((timeout / 60)) minutes."
-    warn "check: systemctl --user status $UNIT_NAME; journalctl --user -u $UNIT_NAME"
-    warn "a model too large for this GPU is the usual cause; --context and"
-    warn "--gpu-util are the knobs, a smaller model is the other answer."
-    exit 1
+  return 1
+}
+
+loading_failed() {
+  warn "the server did not answer on port $PORT within $((CFG_WAIT / 60)) minutes."
+  warn "check: systemctl --user status $UNIT_NAME; journalctl --user -u $UNIT_NAME"
+  warn "a model too large for this GPU is the usual cause; --context and"
+  warn "--gpu-util are the knobs, a smaller model is the other answer."
+  exit 1
+}
+
+start_unit
+
+if [ "$WAIT" -eq 1 ]; then
+  if ! wait_ready; then
+    # The flags above are there to make it faster, so they are never allowed
+    # to make it absent: a vLLM that will not serve with them serves without
+    # them instead, and says which knob turns that into the default.
+    if [ -n "$SERVE_FLAGS" ] && rejected_flags; then
+      warn "this vLLM refused:$(printf '%s' "$SERVE_FLAGS" | tr -d '\\' | tr '\n' ' ')"
+      warn "serving without them. To stop trying them at every start:"
+      warn "  hermes config --set server.speculative=off"
+      write_unit ""
+      SERVE_FLAGS=""
+      start_unit
+      wait_ready || loading_failed
+    else
+      loading_failed
+    fi
   fi
+elif [ -n "$SERVE_FLAGS" ]; then
+  warn "not waiting, so a server that refuses the flags above goes unnoticed"
+  warn "here: journalctl --user -u $UNIT_NAME is where it would say so."
 fi
 
 # -- check -------------------------------------------------------------------

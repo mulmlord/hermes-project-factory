@@ -139,6 +139,25 @@ DEFAULTS: dict[str, Any] = {
         "max_concurrent_inference": 2,  # 1 stops generation overlapping at all
         "measure_drain_seconds": 120,   # how long a benchmark waits for the GPU to clear
     },
+    "verification": {
+        # Mutation testing over the files one ticket touched. The tests are
+        # written by the same system that wrote the code, so a suite that
+        # merely executes what it was written beside is the expected outcome
+        # rather than an unlucky one, and coverage cannot tell the difference.
+        # Changing the code and watching whether the suite notices can.
+        #
+        # Off by default, and the reason is cost on both sides: every mutant
+        # is a whole run of the project's test command, and an equivalent
+        # mutant -- one no test could ever kill -- fails a ticket that was
+        # correct. The wall clock bounds the first; execution.max_ticket_
+        # attempts bounds the second. See hermes.verify.mutation_gate.
+        "mutation": {
+            "enabled": False,
+            "seconds": 120,    # wall clock the whole gate may spend, per call
+            "mutants": 20,     # mutants tried, if the clock allows that many
+            "timeout": 120,    # seconds one mutated run of the tests may take
+        },
+    },
     "security": {
         # A second opinion on the security gate, for the defects no regex in
         # UNSAFE_PATTERNS expresses. Off by default and advisory when on: an
@@ -404,6 +423,19 @@ execution:
                          # so it can check a name instead of inventing one
   tool_rounds: 3         # extra generations those lookups may cost. Set either
                          # to 0 to go back to a single-shot prompt
+
+verification:
+  mutation:
+    enabled: false       # change the code a ticket wrote and check that its
+                         # own tests fail. The same system writes both, so a
+                         # green suite over untested code is the normal
+                         # failure here and coverage cannot see it. Costs one
+                         # full run of the test command per mutant, and a
+                         # mutant no test could kill fails a correct ticket,
+                         # so it is off until you want to pay for that
+    seconds: 120         # wall clock the gate may spend on one verification
+    mutants: 20          # mutants tried, if the clock allows that many
+    timeout: 120         # seconds one mutated run of the tests may take
 
 evolution:
   enabled: true

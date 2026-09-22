@@ -500,6 +500,34 @@ room reproduces it, and the security scan is clean. Failing that, it goes
 back to implementation, and after repeated failure it stops and says so
 rather than declaring success.
 
+### Are the tests worth anything?
+
+"Tests pass" is a weak claim when the same system wrote the code and the
+tests, and coverage does not strengthen it: it says a line ran, not that
+anything asserted on what the line did. Mutation testing asks directly.
+Hermes changes the code a ticket just wrote — one comparison, one constant,
+one `and` at a time — and reruns that project's own test command. A mutant
+the suite still passes is a place where nothing was checking, and it is
+reported as exactly that: `src/fee.py:12: > -> >=`, which the triager repairs
+against and the reviewer reads. The operators are a few dozen lines of `ast`
+rather than a dependency, and nothing is installed into the sandbox to run
+them.
+
+```yaml
+verification:
+  mutation:
+    enabled: true
+    seconds: 120       # wall clock one verification may spend on this
+    mutants: 20        # mutants tried, if the clock allows that many
+```
+
+It is off by default because it is not free in either direction. Each mutant
+is a whole run of the test suite, so the wall clock and not the mutant count
+is the real bound. And some mutants are *equivalent* — they cannot change
+behaviour, so no test can kill them, and one will occasionally fail a ticket
+that was correct. Scoping the gate to the files a single ticket touched is
+what keeps both costs affordable.
+
 ## Development
 
 ```console

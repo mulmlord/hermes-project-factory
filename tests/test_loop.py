@@ -35,6 +35,9 @@ from calc import add, divide
 
 assert add(2, 3) == 5
 assert divide(6, 3) == 2
+# Pinned either side of the zero guard, so changing the constant it compares
+# against is a change this suite notices. See test_loop's mutation gate test.
+assert divide(1, 1) == 1
 try:
     divide(1, 0)
 except ZeroDivisionError:
@@ -641,3 +644,58 @@ def test_a_hypothesis_becomes_an_experiment_that_runs_and_feeds_research(factory
     assert any(r.get("experiment") for r in known["rounds"])
     metrics = (factory.root / ".hermes" / "metrics" / "experiments.jsonl").read_text()
     assert json.loads(metrics.strip())["verdict"] == "supported"
+
+
+def test_the_loop_runs_clean_through_a_mutation_gate_that_is_satisfied(tmp_path):
+    """Turning the gate on must cost a project with real tests nothing.
+
+    The stub's suite pins both sides of the zero guard, so every mutant of
+    ``calc`` changes an answer it has written down. That is the case the gate
+    has to be transparent in -- if a satisfied gate still blocked, nobody
+    could afford to enable it. It also proves the wiring end to end: nothing
+    else checks that the configured budget reaches a ticket's verification
+    through the factory and the phase that runs it.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    workspace.create(root, "A minimal arithmetic library")
+    config = Config.load()
+    config.data["sandbox"]["runtime"] = "local"
+    config.data["sandbox"]["timeout"] = 60
+    config.data["github"]["enabled"] = False
+    config.data["verification"]["mutation"] = {"enabled": True, "seconds": 120,
+                                               "mutants": 8, "timeout": 60}
+    class Together(StubRouter):
+        """One ticket that writes the module and its tests in the same change.
+
+        The gate is scoped to what a ticket touched, so it can only weigh a
+        suite against code that arrived with it. Two tickets in sequence --
+        code, then tests -- leave nothing for it to mutate on either, which is
+        the shape of the default stub project and a real limitation worth
+        naming rather than designing around.
+        """
+
+        def _answer(self, prompt):
+            if ("Implement this ticket completely" in prompt
+                    and "KIND: implementation" in prompt):
+                return {"summary": "add and divide, with their tests",
+                        "files": [{"path": "src/calc.py", "content": CALC},
+                                  {"path": "tests/test_calc.py", "content": TEST}]}
+            return super()._answer(prompt)
+
+    built = Factory(root, config, quiet=True)
+    built.router = Together()
+    from hermes.agents import build as build_agents
+    built.agents = build_agents(built.router, built.log)
+
+    state = built.run(max_iterations=40)
+
+    assert state.phase == "COMPLETED", (state.phase, state.notes)
+    assert (root / "src" / "calc.py").read_text() == CALC  # nothing left unparsed
+
+    evaluations = [json.loads(p.read_text()) for p in
+                   sorted((root / ".hermes" / "evaluations").glob("*.json"))]
+    graded = [g for record in evaluations for g in record["gates"]
+              if g["name"] == "mutation" and not g["skipped"]]
+    assert graded, "the gate never actually ran over a ticket"
+    assert all(g["passed"] and "all killed" in g["detail"] for g in graded), graded

@@ -39,6 +39,7 @@ from .sources import STORE as SOURCE_STORE, Librarian
 from .state import State, checkpoint
 from .tickets import Board
 from .tools import Toolbox
+from .verify import MutationBudget
 
 
 class Factory:
@@ -68,6 +69,9 @@ class Factory:
         #: :mod:`hermes.ledger`.
         self.ledger = open_ledger(self.config, self.log)
         self.classifier = Classifier.from_config(self.config, self.log)
+        #: None unless verification.mutation is on. See
+        #: :func:`hermes.verify.mutation_gate`.
+        self.mutation = MutationBudget.from_config(self.config)
         self.resources = self.governor.snapshot()
         self._pool: ThreadPoolExecutor | None = None
         self._prefetch: tuple[str, Future] | None = None

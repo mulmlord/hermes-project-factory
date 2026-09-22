@@ -40,8 +40,9 @@ from hermes.state import State, StateError, checkpoint, restore
 from hermes.tickets import Board, split_validation
 from hermes.tools import Lookup, Quarantined, Toolbox
 from hermes.classify import Classifier, ClassifierConfig, chunks
-from hermes.verify import (Verification, installs, review, scan_unsafe,
-                           security_gate, text_gate, verify_project)
+from hermes.verify import (MutationBudget, Verification, installs, mutation_gate,
+                           review, scan_unsafe, security_gate, text_gate,
+                           verify_project, verify_ticket)
 from hermes import cli, workspace
 
 
@@ -4262,3 +4263,226 @@ def test_learning_stays_off_when_the_configuration_says_so(tmp_path):
 
     assert isinstance(open_ledger(config), NullLedger)
     assert not open_ledger(config).stats()["available"]
+
+
+# -- the mutation gate ---------------------------------------------------
+
+#: A function with exactly four mutation sites: the comparison, its bound, and
+#: each returned fee. Small enough that one gate call reaches all of them, and
+#: written with a comment so a restore that reformatted the file would show.
+FEE = '''\
+def fee(amount):
+    # over the threshold costs more
+    if amount > 100:
+        return 5
+    return 1
+'''
+
+#: A suite that runs every line of FEE and asserts nothing about any of it.
+#: Coverage calls this tested; it is the failure the gate exists to catch.
+EXERCISES = "import calc\ncalc.fee(150)\ncalc.fee(50)\n"
+
+#: The same suite, pinned either side of the boundary, so every mutant of FEE
+#: changes an answer the suite has written down.
+ASSERTS = ("import calc\n"
+           "assert calc.fee(150) == 5\n"
+           "assert calc.fee(101) == 5\n"
+           "assert calc.fee(100) == 1\n"
+           "assert calc.fee(50) == 1\n")
+
+
+def _fee_workspace(tmp_path, suite: str, source: str = FEE):
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 30})
+    sandbox.write("src/calc.py", source)
+    sandbox.write("tests/check.py", suite)
+    plan = {"commands": {"build": "true", "test": "python tests/check.py"}}
+    return sandbox, plan
+
+
+def test_a_suite_that_asserts_nothing_lets_every_mutant_through(tmp_path):
+    """The whole point: a green suite over untested code has to read as a failure.
+
+    Both suites here run the same lines, so coverage cannot separate them.
+    Only changing the code and re-running does.
+    """
+    sandbox, plan = _fee_workspace(tmp_path, EXERCISES)
+
+    gate = mutation_gate(sandbox, plan, ["src/calc.py"], MutationBudget(),
+                         tests_passed=True)
+
+    assert not gate.passed and not gate.skipped
+    assert "4/4 mutants survived" in gate.detail
+    assert "src/calc.py:3: > -> >=" in gate.detail or "src/calc.py" in gate.detail
+
+
+def test_a_suite_that_pins_the_boundary_kills_every_mutant(tmp_path):
+    """No false survivor against a suite that does check, which is subtler.
+
+    ``100 -> 101`` is the same length as what it replaces, so before mutants
+    were written with their own mtime CPython reran the cached bytecode of
+    the original and reported it as surviving. A gate whose survivors are not
+    real sends the repair loop after tests that were already sufficient.
+    """
+    sandbox, plan = _fee_workspace(tmp_path, ASSERTS)
+
+    gate = mutation_gate(sandbox, plan, ["src/calc.py"], MutationBudget(),
+                         tests_passed=True)
+
+    assert gate.passed and not gate.skipped
+    assert gate.detail == "4 mutants, all killed"
+
+
+def test_the_gate_leaves_the_source_byte_for_byte_as_it_found_it(tmp_path):
+    """A mutant left behind would replace the agent's file with unparsed source.
+
+    Every comment in it would be gone and the tree would still compile, so
+    nothing downstream would notice until a human read the published repo.
+    The gate writes the whole file on every mutant, which is exactly why this
+    is the property worth asserting rather than assuming.
+    """
+    sandbox, plan = _fee_workspace(tmp_path, EXERCISES)
+
+    mutation_gate(sandbox, plan, ["src/calc.py"], MutationBudget(), tests_passed=True)
+
+    assert sandbox.read("src/calc.py") == FEE
+    assert "# over the threshold costs more" in sandbox.read("src/calc.py")
+
+
+def test_a_test_file_the_ticket_wrote_is_never_itself_mutated(tmp_path):
+    """Mutating an assertion breaks the test that holds it, which looks like a kill.
+
+    The suite here asserts nothing, so anything the gate does mutate survives
+    and is named in the detail. Nothing from tests/ may appear there.
+    """
+    sandbox, plan = _fee_workspace(tmp_path, EXERCISES)
+
+    gate = mutation_gate(sandbox, plan, ["src/calc.py", "tests/check.py"],
+                         MutationBudget(), tests_passed=True)
+
+    assert "tests/check.py" not in gate.detail
+    assert sandbox.read("tests/check.py") == EXERCISES
+
+
+def test_the_gate_stands_down_when_the_tests_were_already_failing(tmp_path):
+    """Against a red suite every mutant dies of the pre-existing failure.
+
+    Scoring that would report a perfect result over a measurement the gate
+    never made, which is worse than declining to measure.
+    """
+    sandbox, plan = _fee_workspace(
+        tmp_path, "import calc\nassert calc.fee(1) == 999\n")
+
+    gate = mutation_gate(sandbox, plan, ["src/calc.py"], MutationBudget(),
+                         tests_passed=False)
+
+    assert gate.skipped and gate.passed
+
+
+def test_the_gate_is_absent_until_the_configuration_asks_for_it(tmp_path):
+    """Off by default, and off means one skipped line rather than no line."""
+    sandbox, plan = _fee_workspace(tmp_path, EXERCISES)
+    config = Config(deep_merge(DEFAULTS, {}))
+
+    assert MutationBudget.from_config(config) is None
+    assert mutation_gate(sandbox, plan, ["src/calc.py"], None).skipped
+
+    asked = Config(deep_merge(DEFAULTS, {
+        "verification": {"mutation": {"enabled": True, "mutants": 3}}}))
+    assert MutationBudget.from_config(asked).mutants == 3
+
+
+def test_the_budget_bounds_how_many_mutants_one_verification_runs(tmp_path):
+    sandbox, plan = _fee_workspace(tmp_path, EXERCISES)
+
+    gate = mutation_gate(sandbox, plan, ["src/calc.py"], MutationBudget(mutants=2),
+                         tests_passed=True)
+
+    assert "2/2 mutants survived" in gate.detail
+
+
+def test_a_surviving_mutant_reaches_the_repair_path_as_a_failing_gate(tmp_path):
+    """A weak suite has to fail verification, or nothing is ever repaired.
+
+    The detail is what the triager and the reviewer read, so the concrete
+    change that went unnoticed has to survive into the failure output too.
+    """
+    sandbox, plan = _fee_workspace(tmp_path, EXERCISES)
+    ticket = Board(tmp_path).add(title="charge a fee", status="ready")
+
+    verification = verify_ticket(sandbox, ticket, plan, ["src/calc.py"],
+                                 mutation=MutationBudget())
+
+    assert not verification.passed
+    assert [g.name for g in verification.failures] == ["mutation"]
+    assert "mutants survived" in verification.failure_output()
+
+
+def test_every_mutant_of_the_factorys_own_sources_is_real_and_parses():
+    """A mutant that will not compile scores a kill for the wrong reason.
+
+    The gate reads a red test run as a kill, so an operator emitting code
+    Python refuses would report a perfect score against a suite it never
+    challenged -- and one emitting an unchanged tree would do the same.
+    Neither shows up in a hand-written fixture. The factory's own sources are
+    the widest sample of real Python on hand, so they are what this sweeps.
+    """
+    import ast
+    from pathlib import Path
+
+    from hermes.verify import _mutable, _mutant
+
+    checked = 0
+    for path in sorted((Path(__file__).resolve().parent.parent / "hermes").glob("*.py")):
+        source = path.read_text()
+        tree = ast.parse(source)
+        # The gate rewrites the whole file from the mutated tree, so an
+        # unfaithful unparse would have it scoring a change nobody made.
+        assert ast.dump(ast.parse(ast.unparse(tree))) == ast.dump(tree), path.name
+        count = _mutable(source)
+        if not count:                      # __init__.py and __main__.py
+            continue
+        for index in list(range(0, count, max(1, count // 8)))[:8]:
+            code, description, line = _mutant(source, index)
+            where = f"{path.name}:{line}: {description}"
+            try:
+                mutated = ast.parse(code)
+            except SyntaxError as exc:
+                raise AssertionError(f"{where} does not parse: {exc}") from None
+            assert ast.dump(mutated) != ast.dump(tree), f"{where} changed nothing"
+            checked += 1
+    assert checked > 200, f"only {checked} mutants swept"
+
+
+def test_the_gate_declines_when_the_tests_react_to_formatting(tmp_path):
+    """Unparsing drops comments, and a command that notices kills every mutant.
+
+    The gate would then report a perfect score over a suite it never actually
+    challenged -- the one outcome worse than not measuring, because it is
+    indistinguishable from a suite that is genuinely strong.
+    """
+    sandbox, plan = _fee_workspace(tmp_path, ASSERTS)
+    plan["commands"]["test"] = ("grep -q 'over the threshold costs more' "
+                                "src/calc.py && python tests/check.py")
+
+    gate = mutation_gate(sandbox, plan, ["src/calc.py"], MutationBudget(),
+                         tests_passed=True)
+
+    assert gate.skipped and gate.passed
+    assert gate.detail == "the tests do not pass on unparsed source"
+    assert sandbox.read("src/calc.py") == FEE
+
+
+def test_no_operator_produces_a_mutant_equal_to_the_code_it_replaced(tmp_path):
+    """The one result this gate must never produce is a survivor of nothing.
+
+    A float past 2**53 absorbs an increment, so the constant operator is
+    where the promise breaks first; the sweep over the factory's own sources
+    holds the same invariant everywhere else.
+    """
+    from hermes.verify import _mutable, _mutant
+
+    source = "LIMIT = 1e16\nHUGE = 1e308\nSMALL = 2\nFLAG = True\n"
+
+    made = [_mutant(source, i) for i in range(_mutable(source))]
+
+    assert [m[1] for m in made] == ["2 -> 3", "True -> False"]

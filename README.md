@@ -409,6 +409,42 @@ that round's notes under `docs/research/`.
 A static scan runs over generated sources on every ticket and again at
 release, and it blocks completion regardless of whether the tests pass.
 
+The tests themselves are the weakest evidence the factory collects, because
+the same system wrote both sides: a suite that imports a function, calls it
+and asserts nothing is green and covers every line. Mutation testing is the
+instrument that says so. Once a ticket has cleared every other gate, Hermes
+injects a small fault into the code that ticket touched — a comparison moved
+onto its boundary, a constant shifted by one, a `not` dropped, a `return`
+emptied — runs the project's own test command, and puts the file back. A
+fault the suite does not notice is a sentence about the tests: *this change
+would have shipped*. The surviving fault goes back to the repair path as the
+statement before and the statement after, which is a concrete reproducible
+failing case rather than a coverage percentage.
+
+Most survivors are faults no test could ever catch — a bound tightened on a
+value that cannot occur, a constant used only in a message — and reporting
+those is how a report gets ignored, so a survivor is shown to the reviewer
+first and only blocks the ticket if it agrees that some reachable input tells
+the two programs apart. With no screen there is no veto: the fault is
+reported and the ticket proceeds.
+
+```yaml
+verification:
+  mutation:
+    enabled: true
+    mutants: 5           # faults injected per ticket
+    budget: 180          # seconds the whole survey may spend
+    screen: true         # ask whether a survivor is reachable at all
+    block: true          # a confirmed survivor fails the ticket
+```
+
+It is off by default because it costs a full test run per fault. Faults are
+generated through the syntax tree, never by patching text, so a mutant is
+always valid code; they are injected one at a time and reverted before the
+next, so two faults never interact and a survivor is always attributable; and
+which faults get picked is fixed rather than random, so the same change
+injects the same faults twice. Only Python is mutated today.
+
 That scan is a pattern list, which means it reads what it was told to look
 for and nothing else. You can put a second opinion behind it: a local text
 classifier that scores each chunk of generated source against a small
@@ -608,6 +644,12 @@ halfway through.
   sites was meant: an ambiguous anchor is refused unless the edit names the
   function or class it belongs to, because a wrong edit that still passes the
   tests is worse than a retry.
+- Mutation testing measures the suite with a fixed operator table over Python
+  only, and five faults per ticket is a sample, not a verdict: it can show you
+  that a suite misses a boundary, never that it misses nothing. The screen
+  that separates a real gap from an uncatchable one is the same class of model
+  that wrote the tests, which is why its only power is to *withdraw* a
+  complaint, never to raise one.
 - Optimisation needs its targets to fit the evolver's context whole. A project
   whose hot file is larger than that gets no optimisation rather than a
   half-informed one; the log names the file and the room it missed by, and the

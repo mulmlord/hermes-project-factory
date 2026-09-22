@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import prompts
+from . import mutate, prompts
 from .agents import Prompt
 from .log import Logger, NULL
 from .sandbox import Result, Sandbox
@@ -267,6 +267,74 @@ def _gate(sources: dict[str, str], *, classifier=None, clean: str,
     return Gate("security", not blocking, detail)
 
 
+def mutation_gate(sandbox: Sandbox, plan: dict, changed: list[str], cfg: dict,
+                  *, agents=None, log: Logger = NULL) -> Gate:
+    """Ask whether this ticket's tests would have noticed a fault in its code.
+
+    The suite passing is the precondition, not the result: what is measured
+    here is the suite, by breaking the code it just approved and watching
+    whether it stays green. See :mod:`hermes.mutate` for the faults injected.
+
+    A survivor blocks only once a second opinion has agreed that the two
+    programs really differ. Unscreened survivors are reported and nothing
+    more, because the common survivor is an equivalent mutant -- a fault no
+    input can expose -- and failing a correct ticket over one costs a whole
+    repair cycle to learn nothing. ``block: false`` keeps even the confirmed
+    ones advisory.
+    """
+    command = (plan.get("commands") or {}).get("test", "")
+    if not command:
+        return Gate("mutation", True, "no test command to measure", skipped=True)
+    survey = mutate.survey(
+        sandbox, changed, command,
+        limit=int(cfg.get("mutants", 5)), budget=int(cfg.get("budget", 180)),
+        timeout=int(cfg.get("timeout", 120)), log=log)
+    if not survey.mutants:
+        return Gate("mutation", True, "no python sources in this change", skipped=True)
+    if not survey.survivors:
+        return Gate("mutation", True, survey.summary())
+    confirmed, dismissed = survey.survivors, []
+    judged = not cfg.get("screen", True)    # nothing to wait for when it is off
+    if not judged and agents:
+        confirmed, dismissed = screen_mutants(agents, survey.survivors, log=log)
+        judged = True
+    lines = [f"{survey.killed}/{len(survey.mutants)} faults caught, "
+             f"{len(survey.survivors)} survived the tests"]
+    lines += [m.describe() for m in confirmed]
+    if dismissed:
+        lines.append(f"({len(dismissed)} of them no test could have caught)")
+    if survey.exhausted:
+        lines.append("(the budget ran out before every fault was tried)")
+    return Gate("mutation", not (confirmed and judged and cfg.get("block", True)),
+                "\n".join(lines))
+
+
+def screen_mutants(agents, survivors: list, log: Logger = NULL) -> tuple[list, list]:
+    """Split survivors into the ones worth reporting and the equivalent ones.
+
+    Only an explicit "yes, these differ" keeps a survivor on the blocking
+    side. A screen that failed, answered about the wrong fault, or ran out of
+    context therefore costs a report that nags instead of a ticket that fails,
+    which is the right direction for a judgement made by the same kind of
+    model that wrote the tests.
+    """
+    reviewer = agents["reviewer"]
+    prompt = Prompt(reviewer, log=log)
+    faults = prompt.add("faults", priority=10, floor=400)
+    prompt.add("instructions", prompts.mutation_screen(len(survivors)), required=True)
+    header = "SURVIVING FAULTS:\n"
+    body = "\n".join(f"[{i}] {m.describe()}" for i, m in enumerate(survivors))
+    faults.fill(header + body[: max(0, faults.room() - len(header))])
+    verdicts = reviewer.ask_json(prompt.render(), schema=prompts.MUTATION_SHAPE)
+    observable = {int(v["index"]) for v in (verdicts.get("verdicts") or [])
+                  if isinstance(v, dict) and str(v.get("index", "")).strip("-").isdigit()
+                  and v.get("observable")}
+    confirmed = [m for i, m in enumerate(survivors) if i in observable]
+    dismissed = [m for i, m in enumerate(survivors) if i not in observable]
+    log.info("mutation.screened", confirmed=len(confirmed), dismissed=len(dismissed))
+    return confirmed, dismissed
+
+
 def record_installs(sandbox: Sandbox, plan: dict) -> None:
     """Fold anything Hermes had to install into the project's own setup command.
 
@@ -303,12 +371,18 @@ def verify_project(sandbox: Sandbox, plan: dict, *, include_benchmark: bool = Fa
 
 def verify_ticket(sandbox: Sandbox, ticket, plan: dict, changed: list[str],
                   log: Logger = NULL, tests_required: bool = True,
-                  classifier=None) -> Verification:
+                  classifier=None, mutation: dict | None = None,
+                  agents=None) -> Verification:
     """Gate a single ticket: its own validation commands plus the project tests.
 
     Early in a project the test suite does not exist yet, so failing it would
     block the very ticket that creates it. Until the suite has passed once,
     it is advisory; from then on it is a hard regression gate.
+
+    *mutation* configures the gate that measures those tests rather than
+    trusting them; it runs last and only when everything before it passed,
+    because breaking the code on purpose says nothing while the code is
+    already broken.
     """
     commands = plan.get("commands") or {}
     verification = Verification()
@@ -321,6 +395,9 @@ def verify_ticket(sandbox: Sandbox, ticket, plan: dict, changed: list[str],
                  required=tests_required, log=log)
     verification.gates.append(
         security_gate(sandbox.root, changed, classifier=classifier, clean="clean"))
+    if mutation and mutation.get("enabled") and verification.passed:
+        verification.gates.append(
+            mutation_gate(sandbox, plan, changed, mutation, agents=agents, log=log))
     record_installs(sandbox, plan)
     return verification
 

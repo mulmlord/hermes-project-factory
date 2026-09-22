@@ -578,6 +578,48 @@ TRIAGE_SHAPE = obj(
 )
 
 
+def mutation_screen(count: int) -> str:
+    """Ask which surviving faults are real gaps and which cannot be caught.
+
+    This is the filter that made mutation testing usable at Meta: most of what
+    survives a suite is an *equivalent* mutant, a rewrite that no input can
+    distinguish from the original, and reporting those as missing tests trains
+    everyone to ignore the report. The question asked here is deliberately not
+    "is this bad code" -- it is the narrow, checkable one of whether some
+    reachable input tells the two programs apart.
+    """
+    return (
+        f"{count} deliberate faults were injected into the code, one at a "
+        "time, and the test suite passed with each one in place. For every "
+        "fault decide one thing: is there any input the program can actually "
+        "reach for which the mutated statement behaves differently from the "
+        "original? If there is, the suite is missing a test. If there is not "
+        "-- a bound tightened on a value that cannot occur, a constant used "
+        "only in a message, an order that cannot matter -- the two are the "
+        "same program and no test could ever have caught it.\n"
+        "Return JSON:\n"
+        "{\n"
+        '  "verdicts": [\n'
+        '    {"index": 0, "observable": true|false,\n'
+        '     "reason": "the call or input that tells the two apart"}\n'
+        "  ]\n"
+        "}\n"
+        "Answer for every fault, by the index it was given. Judge only the "
+        "behaviour, never whether the original code was good."
+    )
+
+
+#: A verdict without an index cannot be matched back to the fault it judges,
+#: and a verdict without ``observable`` is not a verdict, so both are required
+#: of each entry while the reasoning that justifies them is not.
+MUTATION_SHAPE = obj(
+    {"verdicts": arr(obj({"index": INTEGER, "observable": BOOLEAN,
+                          "reason": STRING},
+                         required=("index", "observable")))},
+    required=("verdicts",),
+)
+
+
 # -- experiments -------------------------------------------------------------
 
 

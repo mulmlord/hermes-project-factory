@@ -275,6 +275,9 @@ def mutation_gate(sandbox: Sandbox, plan: dict, changed: list[str], cfg: dict,
     here is the suite, by breaking the code it just approved and watching
     whether it stays green. See :mod:`hermes.mutate` for the faults injected.
 
+    The gate stands down rather than scoring when it cannot measure: see
+    :func:`hermes.mutate.survey` for the control run that decides that.
+
     A survivor blocks only once a second opinion has agreed that the two
     programs really differ. Unscreened survivors are reported and nothing
     more, because the common survivor is an equivalent mutant -- a fault no
@@ -289,6 +292,8 @@ def mutation_gate(sandbox: Sandbox, plan: dict, changed: list[str], cfg: dict,
         sandbox, changed, command,
         limit=int(cfg.get("mutants", 5)), budget=int(cfg.get("budget", 180)),
         timeout=int(cfg.get("timeout", 120)), log=log)
+    if survey.uncontrolled:
+        return Gate("mutation", True, survey.uncontrolled, skipped=True)
     if not survey.mutants:
         return Gate("mutation", True, "no python sources in this change", skipped=True)
     if not survey.survivors:

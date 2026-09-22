@@ -23,8 +23,10 @@ restored afterwards, and the *report* names the statement, never the file.
 from __future__ import annotations
 
 import ast
+import os
 import time
 from dataclasses import dataclass, field, replace
+from itertools import count
 from pathlib import Path
 
 from .log import Logger, NULL
@@ -97,6 +99,7 @@ class Survey:
     survivors: list[Mutant] = field(default_factory=list)   #: tests stayed green
     errors: list[str] = field(default_factory=list)
     exhausted: bool = False     #: the budget ran out before the mutants did
+    uncontrolled: str = ""      #: why nothing could be measured here at all
 
     @property
     def killed(self) -> int:
@@ -187,7 +190,12 @@ class _Mutator(ast.NodeTransformer):
         # Strings are left alone: mutating one is as likely to change a log
         # line as a decision, and a suite that asserts on log text is not what
         # this is measuring.
-        if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        # A float past 2**53 absorbs the increment -- ``1e16 + 1 == 1e16`` -- and
+        # so would offer a "fault" that runs the original program. No suite can
+        # go red on it, so it survives every time, and the report would blame
+        # the tests for missing a change that was never made.
+        if (isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
+                and node.value + 1 != node.value):
             return self._offer(node, f"{node.value!r} to {node.value + 1!r}",
                                _attr(node, "value", node.value + 1))
         return node
@@ -264,6 +272,34 @@ def apply(source: str, index: int) -> tuple[str, str] | None:
         return None
 
 
+def _place(sandbox: Sandbox, path: str, code: str, stamp: float) -> None:
+    """Write a source back, and make sure the next reader recompiles it.
+
+    CPython validates a ``__pycache__`` entry against its source's size and
+    its mtime in whole seconds. A mutant that happens to be the same length as
+    what it replaced -- ``100`` for ``101`` -- written inside the same second
+    is indistinguishable from the original to that check, so the stale
+    bytecode runs, the suite passes the code it already passed, and the mutant
+    is filed as a survivor it never was. Giving every write its own mtime is
+    what makes the measurement real rather than a story about one.
+    """
+    os.utime(sandbox.write(path, code), (stamp, stamp))
+
+
+def _faithful(source: str) -> bool:
+    """Whether ``ast.unparse`` reproduces this file's own tree.
+
+    Every mutant is written back as the whole file re-rendered from its AST.
+    If that round trip does not survive on the *unmutated* tree, nothing read
+    back from the mutated one can be trusted either, so the file is left out.
+    """
+    try:
+        tree = ast.parse(source)
+        return ast.dump(ast.parse(ast.unparse(tree))) == ast.dump(tree)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+
+
 def select(candidates: list[Mutant], limit: int) -> list[Mutant]:
     """Spread *limit* picks over the files and over each file's mutation points.
 
@@ -306,7 +342,7 @@ def candidates(sandbox: Sandbox, paths: list[str]) -> list[Mutant]:
         if "tests" in Path(path).parts[:-1]:
             continue
         source = sandbox.read(path)
-        if source:
+        if source and _faithful(source):
             found.extend(mutants(path, source))
     return found
 
@@ -324,30 +360,68 @@ def survey(sandbox: Sandbox, paths: list[str], command: str, *, limit: int = 5,
     chosen = select(candidates(sandbox, paths), limit)
     if not chosen:
         return result
+    sources = {path: sandbox.read(path) for path in {m.path for m in chosen}}
+    stamps = {path: sandbox.resolve(path).stat().st_mtime for path in sources}
+    # Stamps for the writes this function makes, all of them later than any
+    # mtime already on disk, so no write can be mistaken for what it replaced.
+    clock = count(time.time() + 1.0)
+
+    def restore() -> None:
+        """Put the sources back as they were found, mtimes included.
+
+        A mutant left behind would replace the agent's file with unparsed
+        source -- every comment in it gone -- and still compile, so nothing
+        downstream would notice until a human read the published repo. That
+        has to survive whatever the sandbox raises, not only the happy path.
+        """
+        for path, text in sources.items():
+            _place(sandbox, path, text, stamps[path])
+
+    # Every mutant is written back through ast.unparse, which drops comments
+    # and normalises formatting. A test command that reacts to either -- a
+    # lint step in front of the suite being the usual one -- fails on all of
+    # them alike, and the gate reports a flawless score for a question it
+    # never asked. So the control is the unparsed tree with nothing else
+    # changed: if that does not pass, there is nothing to measure here.
+    try:
+        for path, text in sources.items():
+            _place(sandbox, path, ast.unparse(ast.parse(text)), next(clock))
+        control = sandbox.run(command, timeout=timeout)
+    finally:
+        restore()
+    if not control.ok:
+        result.uncontrolled = "the tests do not pass on unparsed source"
+        log.info("mutation.uncontrolled", files=len(sources))
+        return result
+
     deadline = time.time() + budget
-    for mutant in chosen:
-        if time.time() >= deadline:
-            result.exhausted = True
-            break
-        original = sandbox.read(mutant.path)
-        mutated = apply(original, mutant.index)
-        if mutated is None:
-            result.errors.append(f"{mutant.path}: mutation {mutant.index} did not apply")
-            continue
-        try:
-            sandbox.write(mutant.path, mutated[0])
-            run = sandbox.run(command, timeout=min(timeout, max(1, int(deadline - time.time()))))
-        finally:
-            sandbox.write(mutant.path, original)
-        mutant = replace(mutant, after=mutated[1])
-        result.mutants.append(mutant)
-        if run.ok:
-            result.survivors.append(mutant)
-            log.info("mutation.survived", path=mutant.path, line=mutant.line,
-                     operator=mutant.operator)
-        else:
-            log.debug("mutation.killed", path=mutant.path, line=mutant.line,
-                      operator=mutant.operator)
+    try:
+        for mutant in chosen:
+            if time.time() >= deadline:
+                result.exhausted = True
+                break
+            original = sources[mutant.path]
+            mutated = apply(original, mutant.index)
+            if mutated is None:
+                result.errors.append(f"{mutant.path}: mutation {mutant.index} did not apply")
+                continue
+            try:
+                _place(sandbox, mutant.path, mutated[0], next(clock))
+                run = sandbox.run(
+                    command, timeout=min(timeout, max(1, int(deadline - time.time()))))
+            finally:
+                _place(sandbox, mutant.path, original, stamps[mutant.path])
+            mutant = replace(mutant, after=mutated[1])
+            result.mutants.append(mutant)
+            if run.ok:
+                result.survivors.append(mutant)
+                log.info("mutation.survived", path=mutant.path, line=mutant.line,
+                         operator=mutant.operator)
+            else:
+                log.debug("mutation.killed", path=mutant.path, line=mutant.line,
+                          operator=mutant.operator)
+    finally:
+        restore()
     log.info("mutation.survey", tested=len(result.mutants),
              survived=len(result.survivors), exhausted=result.exhausted)
     return result

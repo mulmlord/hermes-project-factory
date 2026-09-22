@@ -3210,6 +3210,89 @@ def test_the_budget_stops_the_survey_rather_than_the_mutants(tmp_path):
     assert survey.exhausted and not survey.mutants
 
 
+def test_a_same_length_mutant_is_not_scored_against_stale_bytecode(tmp_path):
+    """The fault has to reach the interpreter, not just the disk.
+
+    CPython trusts a ``__pycache__`` entry whose source has the same size and
+    the same mtime-in-whole-seconds as the one it was built from. ``100`` for
+    ``101`` is the same size, and a survey writes both inside one second, so
+    without a fresh mtime the suite re-runs the code it already passed and the
+    mutant is filed as a survivor that was never actually injected -- a weak
+    suite invented out of nothing, sent to repair as a real failing case.
+    """
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 30})
+    sandbox.write("m.py", "LIMIT = 100\n")
+    read = 'python3 -c "import m; print(m.LIMIT)"'
+
+    before = sandbox.run(read)                  # caches bytecode for 100
+    mutate._place(sandbox, "m.py", "LIMIT = 101\n", time.time() + 1.0)
+    after = sandbox.run(read)
+
+    assert before.stdout.strip() == "100"
+    assert after.stdout.strip() == "101", "the mutant never ran"
+
+
+def test_the_gate_stands_down_when_the_tests_react_to_formatting(tmp_path):
+    """A perfect score measured through a suite that fails on every mutant alike.
+
+    Mutants are written back through ``ast.unparse``, so comments and layout
+    go. A test command with a lint step in front of it then goes red for all
+    of them, every fault scores as caught, and the gate reports the suite is
+    watertight without having asked it anything.
+    """
+    sandbox, _ = _project(tmp_path, STRONG)
+    sandbox.write("calc.py", "# the comment a formatting check insists on\n" + DECISION)
+    command = 'grep -q "^# the comment" calc.py && python3 check.py'
+    assert sandbox.run(command).ok                  # red for the formatting, not the code
+
+    survey = mutate.survey(sandbox, ["calc.py"], command)
+
+    assert survey.uncontrolled and not survey.mutants
+    assert survey.score == 1.0                      # which is why score cannot be the verdict
+    gate = mutation_gate(sandbox, {"commands": {"test": command}}, ["calc.py"], {})
+    assert gate.passed and gate.skipped and gate.detail == survey.uncontrolled
+
+
+def test_a_survey_leaves_the_comments_it_had_to_strip(tmp_path):
+    """The restore is byte-for-byte, not merely semantic.
+
+    An unparsed file still compiles and still passes, so a survey that put one
+    back in place of the agent's own source would go unnoticed until a human
+    read the published repository.
+    """
+    sandbox, plan = _project(tmp_path, WEAK)
+    source = "# why ten and not nine\n" + DECISION
+    sandbox.write("calc.py", source)
+
+    survey = mutate.survey(sandbox, ["calc.py"], plan["commands"]["test"])
+
+    assert survey.mutants                           # it really did run
+    assert sandbox.read("calc.py") == source
+
+
+def test_a_number_too_large_to_increment_is_never_offered(tmp_path):
+    """``1e16 + 1 == 1e16``, so that "fault" is the original program.
+
+    It cannot be killed by any test, survives every time, and would be
+    reported as a hole in a suite that has none.
+    """
+    assert mutate.points("LIMIT = 1e15\n")          # still short of the ceiling
+    assert mutate.points("LIMIT = 1e16\n") == []
+    assert mutate.points("LIMIT = float('inf')\n") == []
+
+
+def test_every_factory_source_survives_its_own_round_trip():
+    """Mutants are written as the whole file re-rendered from its tree.
+
+    If that round trip is not faithful on the unmutated tree, the mutated one
+    cannot be trusted either -- so the file is skipped rather than scored.
+    """
+    sources = sorted(Path("hermes").glob("*.py"))
+    assert len(sources) > 20
+    assert [p.name for p in sources if not mutate._faithful(p.read_text())] == []
+    assert not mutate._faithful("def broken(:\n")
+
+
 def _screener(observable: bool, seen: list | None = None):
     def answer(prompt):
         (seen if seen is not None else []).append(prompt)

@@ -454,6 +454,15 @@ next, so two faults never interact and a survivor is always attributable; and
 which faults get picked is fixed rather than random, so the same change
 injects the same faults twice. Only Python is mutated today.
 
+The gate would rather say nothing than say something it did not measure. A
+mutant is the whole file re-rendered from its tree, which drops the comments,
+so before injecting anything it runs the suite once against the re-rendered
+but *unmutated* source: if a test command reacts to formatting, every fault
+would score as caught and the report would be a perfect mark for a question
+never asked, so the gate stands down instead. Each write also carries its own
+mtime, because a same-length mutant written within a second of what it
+replaced would otherwise run from stale bytecode and be blamed on the tests.
+
 That scan is a pattern list, which means it reads what it was told to look
 for and nothing else. You can put a second opinion behind it: a local text
 classifier that scores each chunk of generated source against a small

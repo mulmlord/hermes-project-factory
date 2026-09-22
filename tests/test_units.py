@@ -1067,11 +1067,12 @@ def test_the_default_ladder_climbs_and_then_holds():
     """Each rung inherits the one below it; past the top, effort stops growing."""
     ladder = Ladder.from_config(Config(deep_merge(DEFAULTS, {})))
 
-    assert ladder.rung(1) == Rung(candidates=1, files=6, role="")
-    assert ladder.rung(2) == Rung(candidates=2, files=10, role="")
-    # The third rung names only a role, and keeps the samples and the files the
-    # second one bought: a ladder never quietly de-escalates.
-    assert ladder.rung(3) == Rung(candidates=2, files=10, role="architect")
+    assert ladder.rung(1) == Rung(candidates=1, files=6, role="", whole=False)
+    assert ladder.rung(2) == Rung(candidates=2, files=10, role="", whole=False)
+    # The third rung names a role and a format, and keeps the samples and the
+    # files the second one bought: a ladder never quietly de-escalates.
+    assert ladder.rung(3) == Rung(candidates=2, files=10, role="architect",
+                                  whole=True)
     assert ladder.rung(9) == ladder.rung(3)
 
 
@@ -1081,7 +1082,7 @@ def test_escalation_can_be_turned_off_entirely():
         DEFAULTS, {"execution": {"candidates": 2, "escalation": []}})))
 
     assert not ladder.escalates
-    assert ladder.rung(3) == Rung(candidates=2, files=6, role="")
+    assert ladder.rung(3) == Rung(candidates=2, files=6, role="", whole=False)
 
 
 def test_a_stronger_role_is_asked_of_the_model_already_resident(tmp_path):
@@ -1190,6 +1191,171 @@ def test_without_a_ladder_every_attempt_is_the_cheapest_ask(tmp_path):
 
     assert outcome["status"] == "failed"
     assert asked == [5, 5, 5]   # one sample, six files, three times over
+
+
+# -- the edit format as a rung -----------------------------------------------
+
+def _format_ladder(**execution):
+    """A ladder whose second attempt changes only the format it asks for."""
+    return Ladder.from_config(Config(deep_merge(DEFAULTS, {"execution": dict(
+        {"escalation": [{"format": "whole"}]}, **execution)})))
+
+
+def _formatted_ticket(tmp_path, replies, **kwargs):
+    """Run one ticket against *replies*, returning the prompts each attempt saw."""
+    sandbox, board, ticket, state = _escalating_ticket(tmp_path)
+    prompts: list[str] = []
+    answers = iter(replies)
+
+    def reply(prompt):
+        prompts.append(prompt)
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    agents = {"implementer": _agent(reply), "tester": _agent(reply),
+              "architect": _agent(reply, task="architecture", name="architect"),
+              "reviewer": _agent(lambda _p: {"approved": True, "advisory": [],
+                                             "security": [], "blocking": []}),
+              "triager": _agent(lambda _p: {"diagnosis": "wrong value",
+                                            "classification": "implementation",
+                                            "action": "repair", "instructions": ""})}
+    outcome = execute_ticket(agents, sandbox, state, board, ticket,
+                             lambda: "src/a.py", max_attempts=2, **kwargs)
+    return outcome, prompts, sandbox
+
+
+#: An edit whose anchor is nowhere in src/a.py, which is the failure the
+#: format rung exists for: the patch format itself did not land.
+MISSES = {"summary": "carry the value",
+          "edits": [{"path": "src/a.py", "find": "value = 'nothing like this'",
+                     "replace": "value = 'good'"}]}
+REWRITES = {"summary": "carry the value",
+            "files": [{"path": "src/a.py", "content": "value = 'good'\n"}]}
+
+
+def test_an_attempt_that_could_not_patch_a_file_is_asked_for_it_whole(tmp_path):
+    """The formats fail differently, so the second ask is a different question.
+
+    A search/replace edit that finds no anchor is not a wrong idea about the
+    code; it is the format failing. Sending the same request in the same
+    format is the retry the ladder exists to avoid.
+    """
+    outcome, prompts, sandbox = _formatted_ticket(
+        tmp_path, [MISSES, REWRITES], ladder=_format_ladder())
+
+    assert outcome["status"] == "completed"
+    assert sandbox.read("src/a.py") == "value = 'good'\n"
+    assert "FILE FORMAT FOR THIS ATTEMPT" not in prompts[0]
+    assert "FILE FORMAT FOR THIS ATTEMPT" in prompts[1]
+    # Named file by file, and only the one the patch failed on: the other nine
+    # sources the ticket claims are still cheaper and safer to patch, and the
+    # protocol still offers that for them.
+    demanded = prompts[1].split("FILE FORMAT FOR THIS ATTEMPT")[1].split("\n\n")[0]
+    assert "- src/a.py" in demanded and "src/mod0.py" not in demanded
+    assert '"edits"' in prompts[1]
+
+
+def test_a_format_rung_with_no_file_to_blame_takes_the_format_off_everything(tmp_path):
+    """An attempt that produced nothing names no file, and the rung still runs.
+
+    A rung that quietly did nothing is worse than either format: the ledger
+    records it as tried, and what it measures is then an ask that never
+    happened.
+    """
+    outcome, prompts, _sandbox = _formatted_ticket(
+        tmp_path, [RuntimeError("the model returned nothing"), REWRITES],
+        ladder=_format_ladder())
+
+    assert outcome["status"] == "completed"
+    # No file to scope it to, so the protocol itself drops the patch format
+    # rather than the prompt asking for one file whole and not saying which.
+    assert '"edits"' in prompts[0] and '"edits"' not in prompts[1]
+    assert "FILE FORMAT FOR THIS ATTEMPT" not in prompts[1]
+
+
+def test_a_format_rung_after_a_whole_file_answer_has_nothing_to_narrow_to(tmp_path):
+    """An attempt that patched nothing leaves no file to take the format from.
+
+    The rung then drops the patch format from the protocol rather than
+    demanding a file whole that was already sent whole, which would be a rung
+    that asked for nothing and a ledger row that recorded it as an ask.
+    """
+    wrong = {"summary": "carry the value",
+             "files": [{"path": "src/a.py", "content": "value = 'bad'\n"}]}
+
+    outcome, prompts, _sandbox = _formatted_ticket(
+        tmp_path, [wrong, REWRITES], ladder=_format_ladder())
+
+    assert outcome["status"] == "completed"
+    assert '"edits"' in prompts[0] and '"edits"' not in prompts[1]
+
+
+def test_the_files_a_format_rung_rewrites_are_the_ones_that_failed(tmp_path):
+    """Rewriting a file that was never the problem is how one loses code."""
+    from hermes.implement import offending
+
+    assert offending(None) == []
+    assert offending(Change()) == []
+    # An edit that did not anchor names its file exactly; the files an edit
+    # did change are the fallback, not the first answer.
+    assert offending(Change(patched=["a.py", "b.py"],
+                            unanchored=["c.py"])) == ["c.py"]
+    assert offending(Change(written=["a.py", "b.py"],
+                            patched=["b.py"])) == ["b.py"]
+    # A file the attempt already returned whole is not a file the patch
+    # format failed on, so asking for it whole again would change nothing.
+    assert offending(Change(written=["a.py", "b.py"])) == []
+    # Several failed edits in one file are one file, and the list is capped:
+    # past a few, "return these whole" is a rewrite of the ticket.
+    assert offending(Change(unanchored=["a.py", "a.py", "b.py"])) == ["a.py", "b.py"]
+    assert len(offending(Change(patched=[f"m{i}.py" for i in range(9)]))) == 3
+
+
+def test_a_project_that_never_patches_records_no_format_rung():
+    """Two rungs that ask the same thing take twice the evidence to tell apart."""
+    rungs = _format_ladder(edit_protocol=False).rungs
+
+    # With the patch protocol off every answer was already a whole file, so
+    # the rung that asks for one is not a rung at all.
+    assert [rung.whole for rung in rungs] == [False, False]
+    assert [rung.whole for rung in _format_ladder().rungs] == [False, True]
+
+
+def test_no_ladder_a_configuration_can_express_takes_the_run_down(tmp_path):
+    """A typo in the ladder must cost that rung, not the run it is climbed in.
+
+    The ladder is built at startup and climbed hours later, unattended, so a
+    value it cannot read has to fall back to the rung below rather than raise.
+    Fuzzed rather than tabulated because the ways a hand-written rung can be
+    wrong are not a list anyone finishes -- and because whatever it parses to
+    still has to be a rung the ledger can store and hand back, or the factory
+    learns nothing from the attempt it spent.
+    """
+    import random
+    from hermes.ledger import FIXED, Ledger
+
+    junk = [None, "", "two", 0, -3, 2.5, True, [], {}, {"nested": 1}, "6",
+            "whole", "PATCH", " Whole ", "hole", float("nan"), 10 ** 9,
+            "architect", b"whole"]
+    keys = ["candidates", "files", "role", "format", "unknown"]
+    ledger = Ledger(tmp_path / "factory.db")
+    random.seed(20260922)
+
+    for _ in range(400):
+        specs = [{key: random.choice(junk)
+                  for key in random.sample(keys, random.randint(0, len(keys)))}
+                 for _ in range(random.randint(0, 4))]
+        ladder = Ladder.from_config(Config(deep_merge(
+            DEFAULTS, {"execution": {"escalation": specs}})))
+
+        for rung in ladder.rungs:
+            assert rung.candidates >= 1 and rung.files >= 1
+            assert isinstance(rung.role, str) and isinstance(rung.whole, bool)
+        top = ladder.rung(len(ladder.rungs)).spec
+        ledger.record("gates:build", top, FIXED)
+        assert top in {row.rung for row in ledger.evidence("gates:build")}
 
 
 # -- workspace lookups -------------------------------------------------------
@@ -4746,7 +4912,9 @@ def _watch(ledger, signature, rung, fixed, failed, **extra):
         ledger.record(signature, rung, FAILED, following=signature, **extra)
 
 
-CHEAP, SAMPLES, REASONING = (1, 6, ""), (2, 10, ""), (2, 10, "architect")
+CHEAP = (1, 6, "", False)
+SAMPLES = (2, 10, "", False)
+REASONING = (2, 10, "architect", True)
 RUNGS = [CHEAP, SAMPLES, REASONING]
 
 
@@ -4832,6 +5000,82 @@ def test_a_ticket_the_run_gave_up_on_counts_neither_way(tmp_path):
     evidence = {row.rung: row for row in ledger.evidence("gates:build")}
 
     assert evidence[SAMPLES].tried == 10 and evidence[SAMPLES].rate == 1.0
+
+
+def test_the_ledger_tells_the_two_edit_formats_apart(tmp_path):
+    """A rung that changes only the format has to be a rung the record can see.
+
+    The ladder now asks a repeated failure in the other format as well as of
+    another role. That is a hypothesis like every other rung, and this is
+    where it is answered.
+    """
+    from hermes.ledger import FIXED
+    patches, whole = (1, 6, "", False), (1, 6, "", True)
+    ledger = _ledger(tmp_path)
+    _watch(ledger, "edits:unmatched", patches, fixed=2, failed=18)
+    _watch(ledger, "edits:unmatched", whole, fixed=17, failed=3)
+
+    advice = ledger.advice("edits:unmatched", patches, [patches, whole])
+
+    assert advice.rung == whole and advice.learned
+    assert ledger.advice("edits:unmatched", patches, [patches]).rung == patches
+    # The two are also distinguishable to the person reading `hermes ledger`,
+    # which is where a rung that pays for itself has to be visible.
+    rows = {row.rung: row for row in ledger.evidence("edits:unmatched")}
+    assert "whole-file" in rows[whole].describe()
+    assert "whole-file" not in rows[patches].describe()
+    ledger.record("edits:unmatched", whole, FIXED)
+
+
+def test_a_ledger_written_before_the_format_rung_keeps_its_history(tmp_path):
+    """A rung that gains a dimension must reach the rows already recorded.
+
+    This is the one file that outlives every workspace. Starting the record
+    again on a schema change would throw away exactly the history the ladder
+    is judged against, so the column is added to the table that is there.
+    """
+    import sqlite3
+    from hermes.ledger import FIXED, SCHEMA_VERSION, Ledger
+
+    path = tmp_path / "factory.db"
+    before = sqlite3.connect(path)
+    before.executescript("""
+        CREATE TABLE attempt (
+            id INTEGER PRIMARY KEY, at REAL NOT NULL,
+            project TEXT NOT NULL DEFAULT '', stack TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL DEFAULT '', signature TEXT NOT NULL DEFAULT '',
+            attempt INTEGER NOT NULL DEFAULT 1, candidates INTEGER NOT NULL DEFAULT 1,
+            files INTEGER NOT NULL DEFAULT 6, role TEXT NOT NULL DEFAULT '',
+            outcome TEXT NOT NULL DEFAULT '', next TEXT NOT NULL DEFAULT '',
+            seconds REAL NOT NULL DEFAULT 0);
+        CREATE INDEX attempt_lookup
+            ON attempt(signature, stack, candidates, files, role);
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta(key, value) VALUES('schema', '1');
+    """)
+    for _ in range(9):
+        before.execute(
+            "INSERT INTO attempt(at, signature, candidates, files, role, outcome)"
+            " VALUES(0, 'gates:build', 2, 10, 'architect', ?)", (FIXED,))
+    before.commit()
+    before.close()
+
+    ledger = _ledger(tmp_path)
+
+    assert ledger.ok
+    # Every old row survives, read as the format its run actually asked in.
+    rows = {row.rung: row for row in ledger.evidence("gates:build")}
+    assert rows[(2, 10, "architect", False)].fixed == 9
+    # And the dimension those rows never had is writable against them.
+    ledger.record("gates:build", (2, 10, "architect", True), FIXED)
+    assert {row.rung for row in ledger.evidence("gates:build")} == {
+        (2, 10, "architect", False), (2, 10, "architect", True)}
+    conn = ledger._conn()
+    assert conn.execute("SELECT value FROM meta WHERE key = 'schema'"
+                        ).fetchone()[0] == str(SCHEMA_VERSION)
+    # The lookup index is keyed on the rung, so it has to have been rebuilt.
+    assert "whole" in conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'attempt_lookup'").fetchone()[0]
 
 
 def test_a_ledger_that_cannot_be_opened_does_not_stop_the_factory(tmp_path):
@@ -4928,8 +5172,8 @@ def test_a_rung_the_ledger_trusts_replaces_the_one_the_ladder_named(tmp_path):
     ledger = _ledger(tmp_path)
     # Twenty tickets' worth of evidence that racing a second sample does not
     # fix this failure and that the reasoning role does.
-    _watch(ledger, "gates:ticket", (2, 10, ""), fixed=1, failed=19)
-    _watch(ledger, "gates:ticket", (2, 10, "architect"), fixed=18, failed=2)
+    _watch(ledger, "gates:ticket", SAMPLES, fixed=1, failed=19)
+    _watch(ledger, "gates:ticket", REASONING, fixed=18, failed=2)
 
     _, asked = _always_fails(tmp_path, ledger)
 

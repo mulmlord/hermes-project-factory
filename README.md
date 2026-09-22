@@ -80,7 +80,12 @@ failure is not retried identically — the same prompt at the same temperature
 answers the same way — so each attempt is asked harder than the last: attempt
 two races two samples and is shown more of the existing code, attempt three
 goes to the reasoning role instead of the implementer, told to work out why
-the approach cannot be made to work rather than resend it. The ladder is
+the approach cannot be made to work rather than resend it, and asked for the
+whole file rather than a search/replace patch — the two formats fail in
+different ways, and reconsidering an approach is the one thing a patch cannot
+express. That last change applies only to the files the previous attempt
+already failed on: rewriting the rest whole is how a large file loses the code
+nobody meant to touch. The ladder is
 `execution.escalation`, and it climbs roles rather than models, because
 routing a retry to a second model would unload the resident one mid-ticket.
 

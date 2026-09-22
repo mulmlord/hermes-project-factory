@@ -504,6 +504,25 @@ ESCALATION = (
     "write that."
 )
 
+
+def whole_file(paths: list[str]) -> str:
+    """Demand complete files for the paths the patch format has failed on.
+
+    Said to an attempt that is climbing the ladder's format rung. It names
+    files rather than switching the protocol wholesale because the rest of the
+    answer is better off as patches: re-emitting a large file to change a few
+    lines is slow and loses code nobody meant to touch.
+    """
+    return (
+        "FILE FORMAT FOR THIS ATTEMPT: patching these files has already been "
+        "tried and has not produced a working change, so return each of them "
+        "complete under \"files\" -- the entire file as it should be once your "
+        "change is in it -- and send no \"edits\" entry for them:\n"
+        + "\n".join(f"- {path}" for path in paths)
+        + "\nAny other file you change may still be patched with \"edits\"."
+    )
+
+
 #: The closing line of every implementation prompt.
 IMPLEMENT = (
     "Implement this ticket completely. Every file you return "

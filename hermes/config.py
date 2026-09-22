@@ -110,6 +110,13 @@ DEFAULTS: dict[str, Any] = {
         "benchmark_timeout": 900,
         "screen_factor": 2.0,         # kill a run this much slower than the best
         "archive": 12,                # correct candidates kept as possible parents
+        # A proposal that changes the same lines as one already measured
+        # against the same parent is the same experiment, and the cycle it
+        # would cost is the most expensive thing here. Such a patch is always
+        # refused; this is how much of a near miss goes the same way, as the
+        # fraction of changed lines the two share. 1.0 refuses nothing but the
+        # exact repeats.
+        "novelty": 0.8,
     },
     "planning": {
         "max_tickets": 40,
@@ -483,6 +490,12 @@ evolution:
   baseline_repeats: 3    # runs used to measure benchmark noise
   min_relative_gain: 0.01
   screen_factor: 2.0     # kill a run this much slower than the incumbent
+  novelty: 0.8           # rather than pay for the same experiment twice, refuse
+                         # a proposal sharing this fraction of its changed lines
+                         # with one already measured against the same parent,
+                         # and ask again. A patch that changes exactly the same
+                         # lines is refused whatever this says; 1.0 leaves only
+                         # those refused
 
 verification:
   mutation:              # measure the tests, rather than trusting the suite

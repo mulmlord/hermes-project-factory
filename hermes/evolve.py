@@ -10,6 +10,7 @@ happened to climb.
 """
 from __future__ import annotations
 
+import difflib
 import json
 import math
 import random
@@ -65,6 +66,24 @@ class Candidate:
     seconds: float = 0.0
 
 
+@dataclass(frozen=True)
+class Tried:
+    """A change that has already been paid for, and what it got.
+
+    *changes* is the set of lines the candidate added to and removed from its
+    parent, which is what a later proposal is compared against; *candidate* is
+    kept whole rather than copied from, so the outcome read back to the
+    evolver is the one selection finally recorded, not the one the branch that
+    stored it happened to know.
+    """
+    parent: int
+    changes: frozenset[str]
+    candidate: Candidate
+
+    def outcome(self) -> str:
+        return self.candidate.notes or f"scored {self.candidate.score}"
+
+
 class NoTargetFits(RuntimeError):
     """No evolution target can be shown whole inside the evolver's context.
 
@@ -114,6 +133,11 @@ def parse_score(output: str) -> float | None:
         return float(matches[-1])
     numbers = _NUMBER.findall((output or "").strip().splitlines()[-1] if output.strip() else "")
     return float(numbers[-1]) if numbers else None
+
+
+def _significant(text: str) -> list[str]:
+    """The lines of *text* that could change what a program does."""
+    return [line.rstrip() for line in text.splitlines() if line.strip()]
 
 
 class Bandit:
@@ -186,6 +210,10 @@ class Evolution:
         self.best_seconds = 0.0
         self.last_seconds = 0.0
         self.bandit = Bandit(FAMILIES)
+        #: Every change that has been through the gates, by the parent it was
+        #: made to, so the same one is not bought twice.
+        self.tried: list[Tried] = []
+        self.repeats = 0
         #: Two-sided memory. Only feeding back rejections tells the evolver
         #: what not to do and nothing about what this project rewards.
         self.helped: list[str] = []
@@ -211,6 +239,7 @@ class Evolution:
             "pareto": [asdict(c) for c in self.pareto()],
             "archive": [c.generation for c in self.archive()],
             "families": self.bandit.report(),
+            "repeats_refused": self.repeats,
         }, indent=2, default=str))
 
     def snapshot(self, generation: int) -> Path:
@@ -377,10 +406,10 @@ class Evolution:
                 feedback: str = "") -> tuple[dict, list[str]]:
         """Ask for one change, as a patch. Returns the proposal and what it saw.
 
-        *feedback* is the report from a previous proposal whose edits did not
-        apply, which is the one failure the evolver can fix from the report
-        alone -- it knows what it meant to change and has the file in front of
-        it, so it only has to anchor the edit somewhere that exists.
+        *feedback* is what a previous proposal in this same generation came
+        back as -- an anchor that matched nothing, or a change already
+        measured here. It arrives composed, because what to say about a
+        proposal is the caller's knowledge, not this method's.
         """
         evolver = self.agents["evolver"]
         prompt = Prompt(evolver, log=self.log)
@@ -406,9 +435,7 @@ class Evolution:
                        + "\n".join(f"- {r}" for r in self.hurt[-12:]))
                       if self.hurt else ""), priority=20, floor=400)
         if feedback:
-            prompt.add("feedback", f"YOUR LAST PROPOSAL DID NOT APPLY:\n{feedback}\n"
-                       "Anchor every edit in text you can see above, character for "
-                       "character.", priority=5, floor=200)
+            prompt.add("feedback", feedback, priority=5, floor=200)
         prompt.add("direction", prompts.evolution_direction(family),
                    required=True)
         # The code block takes what the fixed blocks leave, and every target it
@@ -479,6 +506,61 @@ class Evolution:
                 f"Change only {', '.join(shown)}.")
         return change
 
+    # -- novelty ----------------------------------------------------------
+    def changed_lines(self, before: dict[str, str]) -> frozenset[str]:
+        """What a candidate did to its parent, as the lines it moved.
+
+        Not the proposal's own account of itself: the same change arrives as a
+        find/replace in one generation and as a whole rewritten file in the
+        next, and the mutation line is a label the model chose for it. Blank
+        lines and trailing spaces are dropped because they are not a different
+        program; indentation is kept, because in an indented language it is.
+        """
+        changed: set[str] = set()
+        for path in sorted(before):
+            after = _significant(self.sandbox.read(path) or "")
+            # Dropping the first two lines drops the ---/+++ header, which is
+            # otherwise indistinguishable from a removed line beginning with a
+            # dash. A diff with nothing in it yields no lines at all.
+            body = list(difflib.unified_diff(_significant(before[path]), after,
+                                             n=0, lineterm=""))[2:]
+            changed.update(f"{path}{line}" for line in body if line[:1] in "+-")
+        return frozenset(changed)
+
+    def repeat_of(self, parent: int, changes: frozenset[str]) -> Tried | None:
+        """The measured change this proposal repeats, if it repeats one.
+
+        A compile-test-benchmark cycle is the most expensive thing the factory
+        does, and an evolver told not to repeat itself still re-proposes the
+        same edit under a new name. Refusing it before the cycle costs one set
+        comparison.
+
+        Scoped to the parent, because the same edit made to two different
+        parents is two different programs and only one of them has been
+        measured. A patch that changes exactly the lines an earlier one
+        changed is always refused, whatever the threshold says: there is
+        nothing left to learn from measuring it. The threshold governs the
+        near misses, and it compares changed lines rather than patch text
+        because a character ratio cannot tell a re-worded repeat from a tuned
+        constant -- ``BLOCK = 64`` and ``BLOCK = 128`` differ in one character
+        and are two experiments. What it can still be wrong about is a patch
+        that moves the same lines somewhere else, which is why a refusal is
+        logged and re-asked rather than silently dropped.
+        """
+        if not changes:
+            return None
+        threshold = float(self.cfg.get("novelty", 0.8) or 0.0)
+        for tried in self.tried:
+            if tried.parent != parent:
+                continue
+            if tried.changes == changes:
+                return tried  # the same experiment: its score is already known
+            if not 0 < threshold <= 1:
+                continue
+            if len(tried.changes & changes) / len(tried.changes | changes) >= threshold:
+                return tried
+        return None
+
     def remember(self, family: str, mutation: str, improved: bool,
                  detail: str = "") -> None:
         record = f"{mutation}{f' ({detail})' if detail else ''}"
@@ -522,39 +604,67 @@ class Evolution:
         self.save()
         return self.best
 
+    def _draft(self, index: int, family: str, parent: Candidate,
+               feedback: str = "") -> tuple[dict, Change, frozenset[str]]:
+        """One ask, applied to the parent: the proposal, what landed, what moved.
+
+        An edit that missed makes this a different change from the one
+        proposed, so the rest of it goes back too and the whole patch is asked
+        for again, told which anchor was wrong. The generation is already paid
+        for; a second ask that can see the same code is cheaper than measuring
+        half a mutation.
+        """
+        before = {path: self.sandbox.read(path) or "" for path in self.targets}
+        proposal, shown = self.propose(index, family, parent, feedback)
+        change = self._apply(proposal, shown)
+        if change.unmatched:
+            self.log.info("evolve.reanchor", index=index,
+                          reason=change.unmatched[0][:160])
+            self.restore(parent.generation)
+            proposal, shown = self.propose(
+                index, family, parent,
+                prompts.evolution_reanchor("\n".join(change.unmatched)))
+            change = self._apply(proposal, shown)
+        return proposal, change, self.changed_lines(before)
+
     def _attempt(self, index: int) -> bool:
         """One candidate: propose, apply, measure, select. True when promoted."""
         parent = self.sample_parent()
-        self.restore(parent.generation)
         family = self.bandit.select()
-        try:
-            proposal, shown = self.propose(index, family, parent)
-            change = self._apply(proposal, shown)
-            if change.unmatched:
-                # Any edit that missed makes this a different change from the
-                # one proposed, so the rest of it goes back too and the whole
-                # patch is asked for again, told which anchor was wrong. The
-                # generation is already paid for; a second ask that can see the
-                # same code is cheaper than measuring half a mutation.
-                self.log.info("evolve.reanchor", index=index,
-                              reason=change.unmatched[0][:160])
-                self.restore(parent.generation)
-                proposal, shown = self.propose(index, family, parent,
-                                               "\n".join(change.unmatched))
-                change = self._apply(proposal, shown)
-        except NoTargetFits:
-            raise
-        except Exception as exc:  # noqa: BLE001 - a bad proposal is just a bad candidate
-            self.log.warn("evolve.propose_failed", index=index, error=str(exc)[:200])
-            return False
+        feedback = ""
+        for _ in range(2):
+            self.restore(parent.generation)
+            try:
+                proposal, change, changes = self._draft(index, family, parent, feedback)
+            except NoTargetFits:
+                raise
+            except Exception as exc:  # noqa: BLE001 - a bad proposal is a bad candidate
+                self.log.warn("evolve.propose_failed", index=index, error=str(exc)[:200])
+                return False
 
-        mutation = str(proposal.get("mutation", "unnamed"))[:200]
-        if change.empty or change.unmatched:
-            # Still not a whole patch after the retry: measuring what did land
-            # would score a mutation nobody proposed, and promoting it would
-            # make it the parent of everything after.
-            self.log.info("evolve.no_change", index=index,
-                          detail="; ".join(change.unmatched)[:200] or change.describe())
+            mutation = str(proposal.get("mutation", "unnamed"))[:200]
+            if change.empty or change.unmatched:
+                # Still not a whole patch after the retry: measuring what did
+                # land would score a mutation nobody proposed, and promoting it
+                # would make it the parent of everything after.
+                detail = "; ".join(change.unmatched)[:200] or change.describe()
+                self.log.info("evolve.no_change", index=index, detail=detail)
+                self.bandit.update(family, 0.0)
+                self.restore(parent.generation)
+                return False
+
+            seen = self.repeat_of(parent.generation, changes)
+            if seen is None:
+                break
+            self.repeats += 1
+            self.log.info("evolve.repeat", index=index, mutation=mutation[:80],
+                          repeated=seen.candidate.generation,
+                          exact=seen.changes == changes)
+            feedback = prompts.evolution_repeat(seen.candidate.mutation, seen.outcome())
+        else:
+            # Twice the same change out of this family, against this parent, in
+            # one generation: it has nothing further to say here, and the
+            # bandit is the part of the system that can act on that.
             self.bandit.update(family, 0.0)
             self.restore(parent.generation)
             return False
@@ -566,6 +676,7 @@ class Evolution:
                               seconds=self.last_seconds,
                               metrics={"mechanism": proposal.get("mechanism", "")})
         self.history.append(candidate)
+        self.tried.append(Tried(parent.generation, changes, candidate))
 
         if not correct:
             candidate.notes = "failed correctness: " + verification.failure_output(800)

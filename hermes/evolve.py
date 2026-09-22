@@ -236,6 +236,9 @@ class Evolution:
         self.hurt: list[str] = []
         # Seeded: two runs of the same project should make the same choices.
         self.rng = random.Random(20250915)
+        # Its own stream, so showing an inspiration does not change which
+        # parents are drawn.
+        self.muse = random.Random(20260922)
         self.root = sandbox.root
         self.store = self.root / ".hermes" / "state" / "evolution.json"
         self.checkpoints = self.root / "artifacts" / "evolution"
@@ -281,6 +284,16 @@ class Evolution:
             if saved.is_file():
                 (self.root / target).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(saved, self.root / target)
+
+    def snapshot_text(self, generation: int) -> dict[str, str]:
+        """The targets as *generation* left them, without restoring them."""
+        directory = self.checkpoints / f"gen-{generation:03d}"
+        texts = {}
+        for target in self.targets:
+            saved = directory / target.replace("/", "__")
+            if saved.is_file():
+                texts[target] = saved.read_text(errors="replace")
+        return texts
 
     # -- measurement -----------------------------------------------------
     def measure(self, timeout: int | None = None) -> tuple[bool, float | None, Verification]:
@@ -436,6 +449,61 @@ class Evolution:
             self.log.info("evolve.migrate", generation=leader.generation,
                           score=leader.score, island=index, to=destination)
 
+    def lineage(self, generation: int) -> set[int]:
+        """*generation* and every candidate it descends from."""
+        parents = {c.generation: c.parent for c in self.history}
+        line: set[int] = set()
+        while generation is not None and generation not in line:
+            line.add(generation)
+            generation = parents.get(generation)
+        return line
+
+    def inspiration(self, parent: Candidate,
+                    island: int | None = None) -> tuple[Candidate, str] | None:
+        """A correct candidate from another line of changes, and how it differs.
+
+        Never an ancestor of *parent*, whose ideas the parent already holds,
+        and never a descendant, whose change against it is one this project
+        has already measured and novelty would refuse. What is left is a
+        cousin: something that works for a reason the parent does not share.
+        Drawn from what *island* may mutate, so an island does not read the
+        others' work before a migration has lent it. The Pareto front is
+        asked first, because a candidate dominated on both score and size is
+        worse at everything it could teach.
+        """
+        if not self.cfg.get("inspiration", True):
+            return None
+        own = self.lineage(parent.generation)
+
+        def eligible(candidate: Candidate) -> bool:
+            return (candidate.generation not in own
+                    and parent.generation not in self.lineage(candidate.generation)
+                    and self.snapshot_exists(candidate.generation))
+
+        archive = [c for c in self.archive(island) if eligible(c)]
+        front = [c for c in self.pareto() if c in archive]
+        mine = self.snapshot_text(parent.generation)
+        for pool in (front, archive):
+            pool = list(pool)
+            while pool:
+                muse = pool.pop(self.muse.randrange(len(pool)))
+                diff = self._difference(mine, self.snapshot_text(muse.generation))
+                if diff:
+                    return muse, diff
+        return None
+
+    @staticmethod
+    def _difference(before: dict[str, str], after: dict[str, str]) -> str:
+        chunks = []
+        for path in sorted(set(before) | set(after)):
+            lines = list(difflib.unified_diff(
+                (before.get(path) or "").splitlines(),
+                (after.get(path) or "").splitlines(),
+                fromfile=path, tofile=path, n=2, lineterm=""))
+            if lines:
+                chunks.append("\n".join(lines))
+        return "\n".join(chunks)
+
     def snapshot_exists(self, generation: int) -> bool:
         return (self.checkpoints / f"gen-{generation:03d}").is_dir()
 
@@ -470,7 +538,9 @@ class Evolution:
 
     # -- candidate generation --------------------------------------------
     def propose(self, generation: int, family: str, parent: Candidate,
-                feedback: str = "") -> tuple[dict, list[str]]:
+                feedback: str = "",
+                inspiration: tuple[Candidate, str] | None = None
+                ) -> tuple[dict, list[str]]:
         """Ask for one change, as a patch. Returns the proposal and what it saw.
 
         *feedback* is what a previous proposal in this same generation came
@@ -501,6 +571,13 @@ class Evolution:
                    + (("CHANGES THAT DID NOT HELP HERE:\n"
                        + "\n".join(f"- {r}" for r in self.hurt[-12:]))
                       if self.hurt else ""), priority=20, floor=400)
+        if inspiration:
+            # Dropped whole rather than trimmed: half a diff is a change
+            # nobody made, offered as one that works.
+            muse, diff = inspiration
+            prompt.add("inspiration", prompts.evolution_inspiration(
+                muse.mutation, str(muse.metrics.get("mechanism", "")),
+                muse.score, parent.score, diff), priority=25)
         if feedback:
             prompt.add("feedback", feedback, priority=5, floor=200)
         prompt.add("direction", prompts.evolution_direction(family),
@@ -679,7 +756,8 @@ class Evolution:
         return self.best
 
     def _draft(self, index: int, family: str, parent: Candidate,
-               feedback: str = "") -> tuple[dict, Change, frozenset[str]]:
+               feedback: str = "", inspiration: tuple[Candidate, str] | None = None
+               ) -> tuple[dict, Change, frozenset[str]]:
         """One ask, applied to the parent: the proposal, what landed, what moved.
 
         An edit that missed makes this a different change from the one
@@ -689,7 +767,7 @@ class Evolution:
         half a mutation.
         """
         before = {path: self.sandbox.read(path) or "" for path in self.targets}
-        proposal, shown = self.propose(index, family, parent, feedback)
+        proposal, shown = self.propose(index, family, parent, feedback, inspiration)
         change = self._apply(proposal, shown)
         if change.unmatched:
             self.log.info("evolve.reanchor", index=index,
@@ -697,7 +775,7 @@ class Evolution:
             self.restore(parent.generation)
             proposal, shown = self.propose(
                 index, family, parent,
-                prompts.evolution_reanchor("\n".join(change.unmatched)))
+                prompts.evolution_reanchor("\n".join(change.unmatched)), inspiration)
             change = self._apply(proposal, shown)
         return proposal, change, self.changed_lines(before)
 
@@ -713,11 +791,13 @@ class Evolution:
         parent = self.sample_parent(island)
         leader = self.incumbent(island)
         family = self.bandit.select()
+        inspiration = self.inspiration(parent, island)
         feedback = ""
         for _ in range(2):
             self.restore(parent.generation)
             try:
-                proposal, change, changes = self._draft(index, family, parent, feedback)
+                proposal, change, changes = self._draft(index, family, parent, feedback,
+                                                        inspiration)
             except NoTargetFits:
                 raise
             except Exception as exc:  # noqa: BLE001 - a bad proposal is a bad candidate
@@ -760,6 +840,8 @@ class Evolution:
                               metrics={"mechanism": proposal.get("mechanism", "")})
         self.history.append(candidate)
         self.members[island].add(index)
+        if inspiration:
+            candidate.metrics["inspiration"] = inspiration[0].generation
         self.tried.append(Tried(parent.generation, changes, candidate))
 
         if not correct:
@@ -812,6 +894,19 @@ class Evolution:
                       island=island, mutation=mutation[:80])
         return True
 
+    def size(self, candidate: Candidate) -> int:
+        """Characters of target source *candidate* left behind.
+
+        Read from its snapshot, not from the working tree: the tree holds
+        whichever candidate was restored last, so sizing from it gives every
+        candidate that touched the same files the same size, and a front on
+        (score, size) collapses to the best score.
+        """
+        saved = self.snapshot_text(candidate.generation)
+        if saved:
+            return sum(len(text) for text in saved.values()) or 1
+        return sum(len(self.sandbox.read(f) or "") for f in candidate.files) or 1
+
     def pareto(self) -> list[Candidate]:
         """Correct candidates not dominated on (score, code size).
 
@@ -822,8 +917,7 @@ class Evolution:
         for candidate in self.history:
             if not candidate.correct or candidate.score is None:
                 continue
-            size = sum(len(self.sandbox.read(f) or "") for f in candidate.files) or 1
-            points.append((candidate, candidate.score, size))
+            points.append((candidate, candidate.score, self.size(candidate)))
         front = []
         for candidate, score, size in points:
             dominated = any(

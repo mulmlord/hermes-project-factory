@@ -125,6 +125,9 @@ DEFAULTS: dict[str, Any] = {
         # a possible parent. 1 island is the single population.
         "islands": 1,
         "migrate_every": 4,           # generations between migrations, 0 to never
+        # Show the evolver a correct candidate from another lineage, as a diff
+        # against the code it is changing, for ideas rather than to merge.
+        "inspiration": True,
         # A proposal that changes the same lines as one already measured
         # against the same parent is the same experiment, and the cycle it
         # would cost is the most expensive thing here. Such a patch is always
@@ -521,6 +524,8 @@ evolution:
                          # has had a generation to become better than it
   migrate_every: 4       # generations between each island lending its incumbent
                          # to the next as a possible parent. 0 never migrates
+  inspiration: true      # show the evolver a correct candidate from another
+                         # lineage, as a diff, for ideas rather than to merge
   novelty: 0.8           # rather than pay for the same experiment twice, refuse
                          # a proposal sharing this fraction of its changed lines
                          # with one already measured against the same parent,

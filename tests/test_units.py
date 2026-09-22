@@ -23,8 +23,8 @@ from hermes.agents import (Prompt, build as build_agents, change_schema, context
 from hermes.config import Config, ConfigError, DEFAULTS, deep_merge, is_local_url
 from hermes.contextdb import UNTRUSTED, ContextDB, open_db, split
 from hermes.anchor import locate
-from hermes.evolve import (Bandit, Candidate, Evolution, NoTargetFits, Objective,
-                          Tried, parse_score)
+from hermes.evolve import (FAMILIES, Bandit, Candidate, Evolution, NoTargetFits,
+                          Objective, Tried, parse_score)
 from hermes.experiment import (Lab, Run, aggregate, measurements,
                                run_ticket as run_experiment_ticket)
 from hermes.implement import (Change, Ladder, Rung, _protected, _race, apply_change,
@@ -4071,6 +4071,71 @@ def test_a_generation_is_always_proposed_against_its_own_island_s_code(tmp_path)
     # The fuzz drew both answers: some generations were promoted, some were not.
     promoted = [c for c in engine.history[1:] if not c.notes]
     assert 0 < len(promoted) < len(engine.history) - 1
+
+
+def _family(engine):
+    """Baseline 10; 1 -> 8 -> 6 down one line; 3 a cousin of both, smaller."""
+    tree = [(0, None, 10, KERNEL),
+            (1, 0, 8, KERNEL.replace("COST = 10", "COST = 8")),
+            (2, 1, 6, KERNEL.replace("COST = 10", "COST = 6")),
+            (3, 0, 9, "COST = 9\n")]
+    for generation, parent, score, text in tree:
+        engine.sandbox.write("src/kernel.py", text)
+        engine.snapshot(generation)
+        engine.history.append(Candidate(generation, parent, f"to {score}", score, True,
+                                        ["src/kernel.py"],
+                                        metrics={"mechanism": "drop the padding"}))
+    engine.best = engine.history[2]
+    return engine.history
+
+
+def test_the_front_is_sized_from_each_candidate_not_from_the_tree(tmp_path):
+    """Sized from the tree, every candidate is as big as whichever was restored."""
+    engine, _ = _evolving(tmp_path, [])
+    _family(engine)
+    engine.sandbox.write("src/kernel.py", KERNEL)
+
+    assert [c.generation for c in engine.pareto()] == [2, 3]
+
+
+def test_an_inspiration_comes_from_another_line_of_changes(tmp_path):
+    """An ancestor's idea is already in the parent; a descendant's is measured."""
+    engine, _ = _evolving(tmp_path, [])
+    history = _family(engine)
+
+    muse, diff = engine.inspiration(history[2])
+    assert muse.generation == 3
+    assert "-COST = 6" in diff and "+COST = 9" in diff
+    # Everything else descends from the baseline or is where it came from.
+    assert engine.inspiration(history[0]) is None
+    engine.cfg["inspiration"] = False
+    assert engine.inspiration(history[2]) is None
+
+
+def test_an_island_is_not_inspired_by_work_it_was_never_lent(tmp_path):
+    engine, _ = _evolving(tmp_path, [], cfg={"islands": 2})
+    history = _family(engine)
+    engine.members = [{0, 1, 2}, {0, 3}]
+
+    assert engine.inspiration(history[2], island=0) is None
+    engine.members[0].add(3)  # a migration lent it
+    assert engine.inspiration(history[2], island=0)[0].generation == 3
+
+
+def test_the_evolver_is_shown_the_inspiration_as_a_diff(tmp_path):
+    engine, prompts = _evolving(tmp_path, [{"mutation": "m"}])
+    history = _family(engine)
+    engine.restore(2)
+
+    engine.propose(4, FAMILIES[0], history[2],
+                   inspiration=engine.inspiration(history[2]))
+
+    shown = prompts[0]
+    assert "ANOTHER CORRECT CANDIDATE" in shown and "drop the padding" in shown
+    assert "+COST = 9" in shown
+    # Read after the code it is compared with, before the direction.
+    assert shown.index("CURRENT CODE") < shown.index("ANOTHER CORRECT") \
+        < shown.index("THIS GENERATION'S DIRECTION")
 
 
 def test_bandit_tries_every_family_once_before_repeating():

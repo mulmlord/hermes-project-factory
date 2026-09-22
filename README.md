@@ -133,7 +133,10 @@ best, and gets the generations that would make it good. Every
 `evolution.migrate_every` generations each island lends its incumbent to the
 next as a possible parent — lends, because installing it would hand every
 island the same score to beat and collapse them back into one lineage a
-period later. The run still ends on the best code any island found.
+period later. The run still ends on the best code any island found. Each
+proposal is also shown, as a diff against its parent, one correct candidate
+from a different line of changes, as a source of ideas rather than a second
+parent to merge (`evolution.inspiration`).
 
 **Release** exports a pristine copy of the tracked tree into a fresh sandbox
 and builds and tests it there, proving the repository is reproducible from a

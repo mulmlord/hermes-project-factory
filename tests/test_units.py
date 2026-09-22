@@ -3,6 +3,7 @@ import ast
 import contextlib
 import json
 import os
+import random
 import shlex
 import shutil
 import subprocess
@@ -22,7 +23,7 @@ from hermes.config import Config, ConfigError, DEFAULTS, deep_merge, is_local_ur
 from hermes.contextdb import UNTRUSTED, ContextDB, open_db, split
 from hermes.anchor import locate
 from hermes.evolve import (Bandit, Candidate, Evolution, NoTargetFits, Objective,
-                          parse_score)
+                          Tried, parse_score)
 from hermes.experiment import (Lab, Run, aggregate, measurements,
                                run_ticket as run_experiment_ticket)
 from hermes.implement import (Change, Ladder, Rung, _protected, _race, apply_change,
@@ -3859,6 +3860,111 @@ def test_evolution_stops_rather_than_evolve_code_it_cannot_see(tmp_path):
     assert not prompts  # and not one proposal asked for against an unseen file
     with pytest.raises(NoTargetFits):
         engine.propose(1, "micro", best)
+
+
+def test_a_change_already_measured_is_not_measured_again(tmp_path):
+    """A repeat costs the most expensive thing here and cannot say anything new."""
+    engine, prompts = _evolving(tmp_path, [
+        {"mutation": "make the cost negative",
+         "edits": [{"path": "src/kernel.py", "find": "COST = 10",
+                    "replace": "COST = -1"}]},
+        {"mutation": "make the cost negative, again",
+         "edits": [{"path": "src/kernel.py", "find": "COST = 10",
+                    "replace": "COST = -1"}]},
+        {"mutation": "halve the cost",
+         "edits": [{"path": "src/kernel.py", "find": "COST = 10",
+                    "replace": "COST = 4"}]}])
+    engine.sandbox.write("src/kernel.py", KERNEL)
+    engine.state.plan["commands"]["test"] = (
+        "python3 -c \"exec(open('src/kernel.py').read()); assert COST > 0\"")
+
+    best = engine.run(max_generations=2, patience=5)
+
+    # The second ask repeated the first, so it was refused and re-asked
+    # instead of being built, tested and benchmarked a second time.
+    assert [c.mutation for c in engine.history] == [
+        "baseline", "make the cost negative", "halve the cost"]
+    assert engine.repeats == 1 and best.score == 4
+    # And it was told what that change already did, not merely that it repeated.
+    assert "ALREADY PROPOSED" in prompts[2] and "failed correctness" in prompts[2]
+
+
+def test_a_rewrite_and_an_edit_that_land_the_same_code_are_one_change(tmp_path):
+    """The proposal's shape is not the change; what it did to the file is.
+
+    The evolver answers with a patch one generation and a whole file the next,
+    so a repeat is only recognisable after both have been applied.
+    """
+    engine, _ = _evolving(tmp_path, [])
+    before = {"src/kernel.py": KERNEL}
+    engine.sandbox.write("src/kernel.py", KERNEL)
+
+    engine._apply({"edits": [{"path": "src/kernel.py", "find": "COST = 10",
+                              "replace": "COST = 4"}]}, ["src/kernel.py"])
+    by_edit = engine.changed_lines(before)
+    engine.sandbox.write("src/kernel.py",
+                         KERNEL.replace("COST = 10", "COST = 4  ") + "\n\n")
+    by_rewrite = engine.changed_lines(before)
+
+    assert by_edit and by_edit == by_rewrite
+
+
+def test_the_same_edit_made_to_a_different_parent_is_not_a_repeat(tmp_path):
+    """It produces a different program, and that one has not been measured."""
+    engine, _ = _evolving(tmp_path, [])
+    changes = frozenset({"src/kernel.py-COST = 10", "src/kernel.py+COST = 4"})
+    engine.tried.append(Tried(0, changes, Candidate(1, 0, "halve", 4.0, True, [])))
+
+    assert engine.repeat_of(0, changes) is not None
+    assert engine.repeat_of(3, changes) is None
+
+
+def test_a_long_patch_re_worded_in_one_line_is_still_a_repeat(tmp_path):
+    """Told not to repeat itself, a model renames something and re-proposes."""
+    engine, _ = _evolving(tmp_path, [])
+    first = frozenset({f"src/kernel.py+line {n}" for n in range(12)}
+                      | {"src/kernel.py-the old loop"})
+    reworded = (first - {"src/kernel.py+line 11"}) | {"src/kernel.py+line eleven"}
+    engine.tried.append(Tried(0, first, Candidate(1, 0, "rework", 9.0, True, [])))
+
+    assert engine.repeat_of(0, reworded) is not None
+    # A patch that shares only what it deletes is a different experiment.
+    assert engine.repeat_of(0, frozenset({"src/kernel.py-the old loop",
+                                          "src/kernel.py+a different loop"})) is None
+
+
+def test_no_two_different_edits_are_taken_for_each_other(tmp_path):
+    """Refusing a novel candidate loses an experiment nobody will run again.
+
+    Fuzzed rather than fixtured, because the dangerous pairs are the ones that
+    look alike -- the same line set to a different constant differs in one
+    character -- and a hand-picked pair is the one that passes by accident.
+    """
+    engine, _ = _evolving(tmp_path, [])
+    source = "".join(f"TUNE_{n} = {n}\n" for n in range(40))
+    before = {"src/kernel.py": source}
+    rng = random.Random(20260922)
+    drawn: dict[tuple[int, int], frozenset[str]] = {}
+    refused = 0
+
+    # A small range of values, so the fuzz draws real repeats as well as near
+    # misses and both answers are exercised.
+    for _ in range(200):
+        line, value = rng.randrange(40), rng.randrange(12)
+        engine.sandbox.write("src/kernel.py",
+                             source.replace(f"TUNE_{line} = {line}\n",
+                                            f"TUNE_{line} = {value}\n"))
+        changes = engine.changed_lines(before)
+        if not changes:  # the draw happened to put the value back as it was
+            continue
+        repeat = engine.repeat_of(0, changes)
+        assert (repeat is not None) == ((line, value) in drawn), f"TUNE_{line} = {value}"
+        refused += repeat is not None
+        if repeat is None:
+            drawn[(line, value)] = changes
+            engine.tried.append(Tried(0, changes, Candidate(1, 0, "tune", 1.0, True, [])))
+
+    assert len(drawn) > 100 and refused > 20  # both answers were in fact given
 
 
 def test_bandit_tries_every_family_once_before_repeating():

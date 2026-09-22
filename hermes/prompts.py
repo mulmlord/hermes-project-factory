@@ -732,6 +732,28 @@ def evolution_direction(family: str) -> str:
     )
 
 
+def evolution_reanchor(report: str) -> str:
+    """Report the anchors that matched nothing, without re-stating the task."""
+    return (f"YOUR LAST PROPOSAL DID NOT APPLY:\n{report}\n"
+            "Anchor every edit in text you can see above, character for "
+            "character.")
+
+
+def evolution_repeat(mutation: str, outcome: str) -> str:
+    """Tell the evolver it has re-proposed a change this project already ran.
+
+    With what it got, because the useful instruction is not "think of
+    something else" but "that experiment is settled": a model told only that
+    it may not repeat itself tends to return the same change in other words.
+    """
+    return ("YOU HAVE ALREADY PROPOSED THIS CHANGE AGAINST THIS CODE:\n"
+            f"- {mutation}\n"
+            f"- what it did: {outcome}\n"
+            "Measuring it again cannot tell us anything we do not know. "
+            "Propose a different change to different code -- not a re-wording "
+            "of that one.")
+
+
 #: A proposal with no edit and no file is a paragraph about optimisation, and
 #: the generation that produced it is spent. Neither key can be required on
 #: its own, though -- a patch and a rewrite are both valid answers -- so the

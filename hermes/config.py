@@ -444,9 +444,11 @@ execution:
                                    # never reloads weights mid-ticket
   edit_protocol: true    # let agents patch a file instead of rewriting it whole
   prefetch: true         # generate the next ticket while this one verifies
-  tool_calls: 6          # read-only lookups (read_file, grep, list_dir) the
-                         # implementer or reviewer may make before it answers,
-                         # so it can check a name instead of inventing one
+  tool_calls: 6          # read-only lookups (read_file, grep, list_dir, and
+                         # find_symbol/find_references/outline/recall where the
+                         # context database has them) the implementer or
+                         # reviewer may make before it answers, so it can check
+                         # a name instead of inventing one
   tool_rounds: 3         # extra generations those lookups may cost. Set either
                          # to 0 to go back to a single-shot prompt
 

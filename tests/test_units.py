@@ -4450,6 +4450,285 @@ def test_the_cli_reports_a_build_step_and_hands_it_to_the_next_reader(tmp_path, 
     assert "up to date" in capsys.readouterr().out
 
 
+# -- the symbol index --------------------------------------------------------
+
+_ENGINE = '''\
+"""The engine."""
+LIMIT = 10
+
+
+class Engine:
+    """Runs the thing."""
+
+    depth: int = 3
+
+    def step(self, count: int, *, strict: bool = False) -> int:
+        """One step of the engine."""
+        return count * LIMIT
+
+
+class Shadow:
+    def step(self) -> None:
+        """A different step entirely."""
+
+
+def build(depth: int = 3) -> Engine:
+    # Engine is mentioned here, called on the next line, and neither is a
+    # definition of it.
+    return Engine()
+'''
+
+
+def _indexed(tmp_path, files: dict[str, str]):
+    """A database holding *files*, as a sync would have left it."""
+    db = _db(tmp_path)
+    for path, text in files.items():
+        db.sync_file(path, text)
+    return db
+
+
+def test_a_name_is_answered_with_its_definition_and_not_with_every_mention(tmp_path):
+    """The whole point: one question, one signature, instead of a word search."""
+    db = _indexed(tmp_path, {"src/engine.py": _ENGINE})
+
+    found = db.find_symbol("build")
+
+    assert len(found) == 1
+    definition = found[0]
+    assert (definition.path, definition.line) == ("src/engine.py", 20)
+    assert definition.signature == "def build(depth: int=3) -> Engine"
+    assert definition.doc == ""
+    # and the mentions are a separate question, asked separately
+    assert {r.kind for r in db.find_references("Engine")} == {"call", "name"}
+
+
+def test_the_definition_costs_a_fraction_of_the_lines_that_hold_the_word(tmp_path):
+    """The saving the index exists for, measured rather than asserted."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local"})
+    sandbox.write("src/engine.py", _ENGINE)
+    toolbox = Toolbox(sandbox, db=_indexed(tmp_path, {"src/engine.py": _ENGINE}))
+
+    grepped = toolbox.invoke({"tool": "grep", "pattern": "Engine"})
+    named = toolbox.invoke({"tool": "find_symbol", "name": "Engine"})
+
+    assert grepped.ok and named.ok
+    assert "class Engine" in named.output and "Runs the thing" in named.output
+    assert len(named.output) < len(grepped.output) / 2
+
+
+def test_a_method_is_found_by_the_class_that_owns_it(tmp_path):
+    """Two classes with a `step` is the case a word search cannot answer."""
+    db = _indexed(tmp_path, {"src/engine.py": _ENGINE})
+
+    qualified = db.find_symbol("Engine.step")
+    bare = db.find_symbol("step")
+
+    assert [(d.qualname, d.line) for d in qualified] == [("Engine.step", 10)]
+    assert {d.qualname for d in bare} == {"Engine.step", "Shadow.step"}
+    # a module-qualified spelling is the same question in different words
+    assert db.find_symbol("engine.step")[0].qualname in {"Engine.step", "Shadow.step"}
+
+
+def test_a_call_is_recorded_once_and_as_a_call(tmp_path):
+    """`Engine()` must not read as both a call and a mention of the same line."""
+    db = _indexed(tmp_path, {"src/engine.py": _ENGINE})
+
+    uses = db.find_references("Engine")
+
+    assert [(u.line, u.kind, u.qualname) for u in uses] == [
+        (20, "name", ""),       # the return annotation, outside the function
+        (23, "call", "build"),  # the construction, inside it
+    ]
+    assert db.count_references("Engine") == 2
+
+
+def test_builtins_are_not_recorded_as_project_references(tmp_path):
+    """Every file calls `len`; that says nothing about who depends on what."""
+    db = _indexed(tmp_path, {"a.py": "def size(x):\n    return len(str(x))\n"})
+
+    assert db.find_references("len") == []
+    assert db.find_references("str") == []
+
+
+def test_a_definition_that_is_deleted_stops_being_answered(tmp_path):
+    """A signature that no longer exists costs a generation written against it."""
+    db = _indexed(tmp_path, {"src/engine.py": _ENGINE})
+    assert db.find_symbol("build")
+
+    db.sync_file("src/engine.py", _ENGINE.replace("def build", "def assemble"))
+
+    assert db.find_symbol("build") == []
+    assert db.find_symbol("assemble")[0].signature.startswith("def assemble")
+
+
+def test_a_file_that_stops_parsing_stops_answering_rather_than_answering_stale(tmp_path):
+    db = _indexed(tmp_path, {"src/engine.py": _ENGINE})
+
+    db.sync_file("src/engine.py", _ENGINE.replace("def build(", "def build("))
+    db.sync_file("src/engine.py", "class Engine:\n    def step(self,\n")
+
+    assert db.find_symbol("Engine.step") == []
+    status = db.indexed("src/engine.py")
+    assert not status["parsed"] and "line" in status["error"]
+
+
+def test_a_file_that_is_deleted_takes_its_symbols_with_it(tmp_path):
+    db = _indexed(tmp_path, {"src/engine.py": _ENGINE})
+
+    db.forget_file("src/engine.py")
+
+    assert db.find_symbol("Engine") == [] and db.find_references("Engine") == []
+    assert db.indexed()["files"] == 0
+
+
+def test_an_unchanged_file_is_not_reparsed_and_stays_answerable(tmp_path):
+    """Syncing costs nothing when nothing changed -- including the index."""
+    db = _indexed(tmp_path, {"src/engine.py": _ENGINE})
+    head = db.head
+
+    again = db.sync_file("src/engine.py", _ENGINE)
+
+    assert not again.changed and db.head == head
+    assert db.find_symbol("Engine.step")[0].line == 10
+
+
+def test_a_database_written_before_the_index_existed_builds_it_on_open(tmp_path):
+    """The files are already stored, so the index is rebuilt from them."""
+    db = _indexed(tmp_path, {"src/engine.py": _ENGINE})
+    with db._write() as conn:                       # what a version-2 file is
+        conn.execute("DELETE FROM symbol")
+        conn.execute("DELETE FROM reference")
+        conn.execute("DELETE FROM symbol_file")
+    db.close()
+
+    reopened = _db(tmp_path)
+
+    assert reopened.find_symbol("Engine.step")[0].line == 10
+    assert reopened.find_references("Engine")
+    assert reopened.head == db.head                 # a rebuild is not a change
+
+
+def test_the_index_never_places_a_definition_where_the_source_has_none():
+    """Over the factory's own sources: every row must be true of the file.
+
+    The failure that matters is not a missed definition but an invented one:
+    an agent sent to line 400 for a function that is not there spends a
+    lookup and then guesses anyway.
+    """
+    from hermes import symbols
+
+    checked = 0
+    for path in sorted(Path(__file__).resolve().parent.parent.glob("hermes/*.py")):
+        text = path.read_text()
+        lines = text.splitlines()
+        parsed = symbols.parse(str(path), text)
+        assert parsed.parsed, f"{path}: {parsed.error}"
+        for definition in parsed.defs:
+            source = lines[definition.line - 1].lstrip()
+            head = {"class": "class ", "method": "def ", "function": "def "}.get(
+                definition.kind)
+            if head is not None:
+                assert source.startswith((head + definition.name,
+                                          "async " + head + definition.name)), \
+                    f"{path}:{definition.line} is not {definition.qualname}"
+            else:                                   # a constant or a field
+                assert source.split(":")[0].split("=")[0].strip() == definition.name
+            assert definition.line <= definition.end_line <= len(lines)
+            assert definition.qualname.rsplit(".", 1)[-1] == definition.name
+            checked += 1
+    assert checked > 500                            # it really did read them all
+
+
+def test_every_reference_lands_on_a_line_that_holds_the_name():
+    """The weaker claim the reference table is allowed to make, checked."""
+    from hermes import symbols
+
+    for path in sorted(Path(__file__).resolve().parent.parent.glob("hermes/*.py")):
+        lines = path.read_text().splitlines()
+        for use in symbols.parse(str(path), path.read_text()).refs:
+            if use.kind == "import":
+                continue                            # `from x import y as z`
+            assert use.name in lines[use.line - 1], f"{path}:{use.line} {use.name}"
+
+
+def test_the_index_tools_are_offered_only_where_a_database_exists(tmp_path):
+    sandbox = Sandbox(tmp_path, {"runtime": "local"})
+    db = _indexed(tmp_path, {"src/engine.py": _ENGINE})
+
+    with_db = Toolbox(sandbox, db=db)
+    assert "find_symbol" in with_db.available
+    assert "find_references" in with_db.protocol()
+    assert with_db.invoke({"tool": "outline", "path": "src/engine.py"}).ok
+
+    without = Toolbox(sandbox)
+    assert "find_symbol" not in without.available
+    assert "find_symbol" not in without.protocol()
+    refused = without.invoke({"tool": "find_symbol", "name": "Engine"})
+    assert not refused.ok and "grep" in refused.output
+
+
+def test_an_outline_falls_back_to_headings_where_the_index_does_not_read(tmp_path):
+    """A C++ project still gets a table of contents, from the chunker."""
+    db = _indexed(tmp_path, {"src/main.cpp": "int main() {\n  return 0;\n}\n"})
+    toolbox = Toolbox(Sandbox(tmp_path, {"runtime": "local"}), db=db)
+
+    call = toolbox.invoke({"tool": "outline", "path": "src/main.cpp"})
+
+    assert call.ok and "int main" in call.output
+    assert db.indexed("src/main.cpp") == {}
+
+
+def test_an_empty_answer_says_which_kind_of_empty_it_is(tmp_path):
+    """"Not defined" and "nothing is indexed" call for opposite next moves."""
+    empty = Toolbox(Sandbox(tmp_path, {"runtime": "local"}), db=_db(tmp_path))
+    assert "No file here is indexed" in empty.invoke(
+        {"tool": "find_symbol", "name": "Engine"}).output
+
+    stocked = Toolbox(Sandbox(tmp_path, {"runtime": "local"}),
+                      db=_indexed(tmp_path, {"src/engine.py": _ENGINE}))
+    answer = stocked.invoke({"tool": "find_symbol", "name": "Widget"}).output
+    assert "1 indexed file" in answer and "grep" in answer
+
+
+def test_an_implementer_asks_for_a_signature_by_name(tmp_path):
+    """End to end: the answer reaches the prompt the next attempt is written from."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/engine.py", _ENGINE)
+    db = _indexed(tmp_path, {"src/engine.py": _ENGINE})
+    agent, prompts = _scripted([
+        {"lookup": [{"tool": "find_symbol", "name": "Engine.step"}]},
+        {"summary": "call it properly",
+         "files": [{"path": "src/cli.py",
+                    "content": "from engine import Engine\nEngine().step(2, strict=True)\n"}]},
+    ])
+    toolbox = Toolbox(sandbox, budget=6, rounds=3, db=db)
+
+    generate({"implementer": agent, "tester": agent}, sandbox, _state(),
+             _ticket_for(tmp_path, artifacts=["src/cli.py"]), tree="src/engine.py",
+             toolbox=toolbox)
+
+    assert [c.tool for c in toolbox.calls] == ["find_symbol"]
+    assert "def step(self, count: int, *, strict: bool=False) -> int" in prompts[1]
+    assert "One step of the engine." in prompts[1]
+
+
+def test_the_cli_answers_the_same_two_questions(tmp_path, capsys):
+    workspace.create(tmp_path, "an idea")
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src" / "engine.py").write_text(_ENGINE)
+    argv = ["-p", str(tmp_path), "context"]
+    assert cli.main(argv + ["sync"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(argv + ["symbol", "Engine.step"]) == 0
+    assert "def step(self, count: int" in capsys.readouterr().out
+
+    assert cli.main(argv + ["refs", "Engine"]) == 0
+    out = capsys.readouterr().out
+    assert "src/engine.py:23" in out and "call" in out
+
+    assert cli.main(argv + ["symbol", "Widget"]) == 1
+
 # -- the attempt ledger ------------------------------------------------------
 
 

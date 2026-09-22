@@ -188,6 +188,7 @@ def implementation(factory) -> None:
                 prefetched=factory._take_prefetch(ticket),
                 tool_calls=int(factory.config.get("execution.tool_calls", 6)),
                 tool_rounds=int(factory.config.get("execution.tool_rounds", 3)),
+                db=factory.context_db,
                 classifier=factory.classifier,
                 mutation=factory.config.get("verification.mutation") or {},
                 on_apply=lambda: factory._prefetch_next(ticket),

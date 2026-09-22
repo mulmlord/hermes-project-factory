@@ -15,6 +15,12 @@ in, both stamped with a monotonically increasing revision:
 * **chunks** -- files, split at their own boundaries and keyed by the hash of
   their contents. What the project *is*.
 
+A third kind is derived rather than delivered: **symbols** and the places
+they are used, parsed out of the same text by :mod:`hermes.symbols` as it is
+chunked. Nobody is sent those in a delta; they are there so an agent can ask
+where something is defined instead of grepping for a word and reading back
+every line that contains it.
+
 A reader remembers the revision it last saw (its *cursor*) and asks for
 everything after it. Because chunks are content-keyed, a one-function change
 to a 900-line file is one chunk in that answer and not the file; because
@@ -48,7 +54,9 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from . import symbols
 from .log import Logger, NULL
+from .symbols import Definition, Reference
 
 #: Where the database lives inside a workspace. Beside `.hermes/state` rather
 #: than inside it: `state/` is copied wholesale into every checkpoint, and
@@ -56,7 +64,7 @@ from .log import Logger, NULL
 #: exists for that instead.
 DB_PATH = Path(".hermes") / "context.db"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: The two provenances a record can have, defined here because this is the
 #: bottom of the import stack and everything above has to speak them:
@@ -94,6 +102,13 @@ _BOUNDARY = re.compile(
     r"public\s|private\s|protected\s|static\s|export\s|const\s|var\s|let\s|"
     r"type\s|template\s|/\*\*|---)"
 )
+
+#: How results from the symbol table are ordered: a class before the methods
+#: inside it, a definition before a field that merely mentions the word. The
+#: order is :data:`hermes.symbols.KINDS`, expressed where SQLite can sort by it.
+_KIND_ORDER = "CASE kind " + " ".join(
+    f"WHEN '{kind}' THEN {rank}" for rank, kind in enumerate(symbols.KINDS)
+) + " ELSE 9 END"
 
 #: Room a rendered delta sets aside for its own section headings and for the
 #: line naming whatever did not fit, so that a budget which is a prompt
@@ -169,6 +184,9 @@ class Sync:
     added: int = 0
     removed: int = 0
     kept: int = 0
+    #: Definitions the symbol index took from it, -1 where the file is not
+    #: one the index reads or did not parse.
+    symbols: int = -1
 
     @property
     def changed(self) -> bool:
@@ -351,6 +369,7 @@ class ContextDB:
         self._open: list[sqlite3.Connection] = []
         self._lock = threading.Lock()
         self.fts = True
+        self._rebuild = False
         self._setup()
 
     @classmethod
@@ -461,6 +480,43 @@ class ContextDB:
         CREATE INDEX IF NOT EXISTS chunk_rev ON chunk(rev);
         CREATE INDEX IF NOT EXISTS chunk_dead ON chunk(dead);
 
+        CREATE TABLE IF NOT EXISTS symbol(
+            id        INTEGER PRIMARY KEY,
+            path      TEXT    NOT NULL,
+            name      TEXT    NOT NULL,
+            qualname  TEXT    NOT NULL,
+            kind      TEXT    NOT NULL,
+            line      INTEGER NOT NULL DEFAULT 0,
+            end_line  INTEGER NOT NULL DEFAULT 0,
+            signature TEXT    NOT NULL DEFAULT '',
+            doc       TEXT    NOT NULL DEFAULT '',
+            parent    TEXT    NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS symbol_name ON symbol(name COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS symbol_qual ON symbol(qualname COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS symbol_path ON symbol(path, line);
+
+        CREATE TABLE IF NOT EXISTS reference(
+            id       INTEGER PRIMARY KEY,
+            path     TEXT    NOT NULL,
+            name     TEXT    NOT NULL,
+            qualname TEXT    NOT NULL DEFAULT '',
+            line     INTEGER NOT NULL DEFAULT 0,
+            kind     TEXT    NOT NULL DEFAULT 'name',
+            detail   TEXT    NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS reference_name ON reference(name COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS reference_path ON reference(path, line);
+
+        CREATE TABLE IF NOT EXISTS symbol_file(
+            path   TEXT PRIMARY KEY,
+            parsed INTEGER NOT NULL DEFAULT 0,
+            error  TEXT    NOT NULL DEFAULT '',
+            defs   INTEGER NOT NULL DEFAULT 0,
+            refs   INTEGER NOT NULL DEFAULT 0,
+            at     REAL    NOT NULL DEFAULT 0
+        );
+
         CREATE TABLE IF NOT EXISTS cursor(
             name    TEXT PRIMARY KEY,
             rev     INTEGER NOT NULL DEFAULT 0,
@@ -481,6 +537,12 @@ class ContextDB:
             # by scan; saying so once is better than a query that raises.
             self.fts = False
             self.log.warn("context.no_fts5", db=str(self.path))
+        if self._rebuild:
+            # Outside the setup statements above: this opens write
+            # transactions of its own, and it is the one part of opening a
+            # database that costs anything.
+            self._rebuild = False
+            self.log.info("context.indexing", files=self.reindex_symbols())
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         """Bring a database written by an older Hermes up to this schema.
@@ -490,6 +552,13 @@ class ContextDB:
         that has a sensible default for existing rows is added in place.
         Existing records predate retrieval and so are ``trusted``, which is
         what the default already says.
+
+        Version 3 adds tables rather than columns, so the schema part of it
+        is free -- but a database that has files in it and no symbols has
+        them because it was written before the index existed, not because
+        the project defines nothing. That is what :attr:`_rebuild` is for:
+        the text is already stored, so the index can be built from it
+        without touching the disk.
         """
         columns = {row["name"] for row in
                    conn.execute("PRAGMA table_info(record)")}
@@ -499,6 +568,9 @@ class ContextDB:
             conn.execute("UPDATE meta SET value = ? WHERE key = 'schema'",
                          (str(SCHEMA_VERSION),))
             self.log.info("context.migrated", to=SCHEMA_VERSION)
+        self._rebuild = bool(
+            conn.execute("SELECT 1 FROM chunk WHERE dead = 0 LIMIT 1").fetchone()
+            and not conn.execute("SELECT 1 FROM symbol_file LIMIT 1").fetchone())
 
     # -- revisions -------------------------------------------------------
     @property
@@ -647,7 +719,9 @@ class ContextDB:
                           kept=len(keep))
             if not fresh and not gone:
                 # Unchanged content, but the surrounding file may have moved
-                # around it; keeping the line numbers honest is free.
+                # around it; keeping the line numbers honest is free. The
+                # symbol index is a function of the text alone, so identical
+                # text means it is already right.
                 self._reposition(conn, keep, pieces)
                 return result
             result.rev = self._bump(conn)
@@ -669,8 +743,10 @@ class ContextDB:
                      piece.last_line, piece.body, result.rev, now))
                 self._index(conn, "chunk", f"chunk:{cursor.lastrowid}", path,
                             piece.heading, piece.body)
+            result.symbols = self._index_symbols(conn, path, text)
         self.log.debug("context.sync", path=path, rev=result.rev,
-                       added=result.added, removed=result.removed)
+                       added=result.added, removed=result.removed,
+                       symbols=result.symbols)
         return result
 
     @staticmethod
@@ -696,6 +772,7 @@ class ContextDB:
         with self._write() as conn:
             live = conn.execute("SELECT id FROM chunk WHERE path = ? AND dead = 0",
                                 (path,)).fetchall()
+            self._drop_symbols(conn, path)
             if not live:
                 return Sync(path=path)
             rev = self._bump(conn)
@@ -778,6 +855,152 @@ class ContextDB:
     def paths(self) -> list[str]:
         return [r["path"] for r in self._conn().execute(
             "SELECT DISTINCT path FROM chunk WHERE dead = 0 ORDER BY path")]
+
+    # -- symbols -----------------------------------------------------------
+    def _index_symbols(self, conn: sqlite3.Connection, path: str,
+                       text: str) -> int:
+        """Replace one file's symbols. Returns its definitions, or -1.
+
+        Replace rather than diff: parsing a file costs a millisecond and
+        reconciling two symbol tables costs more thought than it saves. The
+        old rows go first either way, so a file that stops parsing stops
+        answering rather than answering out of date.
+        """
+        conn.execute("DELETE FROM symbol WHERE path = ?", (path,))
+        conn.execute("DELETE FROM reference WHERE path = ?", (path,))
+        if not symbols.indexes(path):
+            conn.execute("DELETE FROM symbol_file WHERE path = ?", (path,))
+            return -1
+        parsed = symbols.parse(path, text)
+        conn.executemany(
+            "INSERT INTO symbol(path, name, qualname, kind, line, end_line,"
+            " signature, doc, parent) VALUES(?,?,?,?,?,?,?,?,?)",
+            [(d.path, d.name, d.qualname, d.kind, d.line, d.end_line,
+              d.signature, d.doc, d.parent) for d in parsed.defs])
+        conn.executemany(
+            "INSERT INTO reference(path, name, qualname, line, kind, detail)"
+            " VALUES(?,?,?,?,?,?)",
+            [(r.path, r.name, r.qualname, r.line, r.kind, r.detail)
+             for r in parsed.refs])
+        conn.execute(
+            "INSERT OR REPLACE INTO symbol_file(path, parsed, error, defs,"
+            " refs, at) VALUES(?,?,?,?,?,?)",
+            (path, int(parsed.parsed), parsed.error, len(parsed.defs),
+             len(parsed.refs), time.time()))
+        return len(parsed.defs) if parsed.parsed else -1
+
+    @staticmethod
+    def _drop_symbols(conn: sqlite3.Connection, path: str) -> None:
+        for table in ("symbol", "reference", "symbol_file"):
+            conn.execute(f"DELETE FROM {table} WHERE path = ?", (path,))
+
+    def index_file(self, path: str, text: str) -> int:
+        """Index one file's symbols on their own, outside a sync."""
+        path = _rel(path)
+        with self._write() as conn:
+            return self._index_symbols(conn, path, text)
+
+    def reindex_symbols(self) -> int:
+        """Rebuild the index from the text already stored. Returns files read.
+
+        The chunks are the file, so this needs no disk and no revision: it is
+        the same derivation run again, which is what makes it safe to run on
+        a database written before the index existed.
+        """
+        count = 0
+        for path in self.paths():
+            if not symbols.indexes(path):
+                continue
+            self.index_file(path, self.file(path))
+            count += 1
+        return count
+
+    def find_symbol(self, name: str, *, limit: int = 10,
+                    path: str = "") -> list[Definition]:
+        """Where a name is defined, most specific match first.
+
+        A dotted query is a qualified name -- ``Toolbox.round`` finds the
+        method of that class and not every ``round`` in the project. A bare
+        one matches the name itself, and only if nothing is defined under it
+        does the search widen to names that start with it, which is what
+        makes a half-remembered name still worth asking about.
+        """
+        name = str(name or "").strip().lstrip(".")
+        if not name:
+            return []
+        tail = name.rsplit(".", 1)[-1]
+        rungs = [("qualname = ? COLLATE NOCASE", name),
+                 ("qualname LIKE '%.' || ?", name)] if "." in name else []
+        # A dotted query that matched nothing qualified falls back to its last
+        # component: the model may have qualified it by module rather than by
+        # class, which is a different sentence for the same question.
+        rungs += [("name = ? COLLATE NOCASE", tail), ("name LIKE ? || '%'", tail)]
+        for clause, value in rungs:
+            found = self._symbols(clause, value, limit=limit, path=path)
+            if found:
+                return found
+        return []
+
+    def _symbols(self, clause: str, value: str, *, limit: int,
+                 path: str = "") -> list[Definition]:
+        sql = [f"SELECT * FROM symbol WHERE {clause}"]
+        args: list[Any] = [value]
+        if path:
+            sql.append("AND path = ?")
+            args.append(_rel(path))
+        sql.append(f"ORDER BY {_KIND_ORDER}, path, line LIMIT ?")
+        args.append(int(limit))
+        return [_definition(r) for r in self._conn().execute(" ".join(sql), args)]
+
+    def definitions(self, path: str) -> list[Definition]:
+        """Everything one file defines, in the order it defines it."""
+        return [_definition(r) for r in self._conn().execute(
+            "SELECT * FROM symbol WHERE path = ? ORDER BY line", (_rel(path),))]
+
+    def find_references(self, name: str, *, limit: int = 30,
+                        path: str = "") -> list[Reference]:
+        """Every line that uses *name*, by name and nothing more.
+
+        Unresolved on purpose: see :mod:`hermes.symbols`. Two classes with a
+        method of the same name are one answer here, and a caller that
+        presents this as certainty is misreading it.
+        """
+        name = str(name or "").strip().rsplit(".", 1)[-1]
+        if not name:
+            return []
+        sql = ["SELECT * FROM reference WHERE name = ? COLLATE NOCASE"]
+        args: list[Any] = [name]
+        if path:
+            sql.append("AND path = ?")
+            args.append(_rel(path))
+        sql.append("ORDER BY path, line LIMIT ?")
+        args.append(int(limit))
+        return [_reference(r) for r in self._conn().execute(" ".join(sql), args)]
+
+    def count_references(self, name: str, *, path: str = "") -> int:
+        """How many there are, so an answer can say what it cut."""
+        name = str(name or "").strip().rsplit(".", 1)[-1]
+        if not name:
+            return 0
+        sql = ["SELECT COUNT(*) FROM reference WHERE name = ? COLLATE NOCASE"]
+        args: list[Any] = [name]
+        if path:
+            sql.append("AND path = ?")
+            args.append(_rel(path))
+        return int(self._conn().execute(" ".join(sql), args).fetchone()[0])
+
+    def indexed(self, path: str = "") -> dict[str, Any]:
+        """What the symbol index covers -- or, for one file, how it went."""
+        conn = self._conn()
+        if path:
+            row = conn.execute("SELECT * FROM symbol_file WHERE path = ?",
+                               (_rel(path),)).fetchone()
+            return dict(row) if row else {}
+        row = conn.execute(
+            "SELECT COUNT(*) AS files, SUM(parsed) AS parsed, SUM(defs) AS defs "
+            "FROM symbol_file").fetchone()
+        return {"files": int(row["files"] or 0), "parsed": int(row["parsed"] or 0),
+                "defs": int(row["defs"] or 0)}
 
     # -- catching up --------------------------------------------------------
     def delta(self, since: int = 0, *, paths: Iterable[str] = (),
@@ -980,6 +1203,9 @@ class ContextDB:
             "facts": count("SELECT COUNT(*) FROM record WHERE key <> '' AND stale = 0"),
             "files": count("SELECT COUNT(DISTINCT path) FROM chunk WHERE dead = 0"),
             "chunks": count("SELECT COUNT(*) FROM chunk WHERE dead = 0"),
+            "indexed": count("SELECT COUNT(*) FROM symbol_file WHERE parsed = 1"),
+            "symbols": count("SELECT COUNT(*) FROM symbol"),
+            "uses": count("SELECT COUNT(*) FROM reference"),
             "buried": count("SELECT COUNT(*) FROM chunk WHERE dead > 0"),
             "readers": count("SELECT COUNT(*) FROM cursor"),
             "fts": self.fts,
@@ -1113,6 +1339,18 @@ def _chunk(row: sqlite3.Row, body: bool = True) -> Chunk:
                  heading=row["heading"], first_line=row["first_line"],
                  last_line=row["last_line"], rev=row["rev"], at=row["at"],
                  body=row["body"] if body else "")
+
+
+def _definition(row: sqlite3.Row) -> Definition:
+    return Definition(path=row["path"], name=row["name"], qualname=row["qualname"],
+                      kind=row["kind"], line=row["line"], end_line=row["end_line"],
+                      signature=row["signature"], doc=row["doc"],
+                      parent=row["parent"])
+
+
+def _reference(row: sqlite3.Row) -> Reference:
+    return Reference(path=row["path"], name=row["name"], qualname=row["qualname"],
+                     line=row["line"], kind=row["kind"], detail=row["detail"])
 
 
 def _rel(path: Any) -> str:

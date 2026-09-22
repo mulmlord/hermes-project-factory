@@ -6,7 +6,9 @@ sceptical, because a benchmark is a measurement rather than a fact: an
 improvement has to clear the noise the baseline itself exhibits, and it has to
 survive being measured again. Parents are drawn from an archive rather than
 from a single incumbent, so the search is not confined to the first hill it
-happened to climb.
+happened to climb, and the archive can be split into islands that take the
+generations in turn, so a second approach is not judged against the first
+one's score before it has been given a generation to become good.
 """
 from __future__ import annotations
 
@@ -61,6 +63,8 @@ class Candidate:
     at: float = field(default_factory=time.time)
     #: Which mutation family produced it, for the bandit's feedback.
     family: str = ""
+    #: The island it was born on, which is the archive it competes inside.
+    island: int = 0
     #: Every measurement taken of this candidate, not just the one that counted.
     samples: list[float] = field(default_factory=list)
     seconds: float = 0.0
@@ -210,6 +214,18 @@ class Evolution:
         self.best_seconds = 0.0
         self.last_seconds = 0.0
         self.bandit = Bandit(FAMILIES)
+        #: Separate archives, each with its own incumbent, taking the
+        #: generations in turn. One island is the single population.
+        self.islands = max(1, int(self.cfg.get("islands", 1)))
+        self.migrate_every = int(self.cfg.get("migrate_every", 4))
+        #: Which generations each island may mutate. Membership rather than
+        #: ownership: migration lends a candidate to a neighbour without
+        #: taking it from the island that earned it.
+        self.members: list[set[int]] = [set() for _ in range(self.islands)]
+        #: What each island promotes against. An island compared against the
+        #: global best would be an island in name only.
+        self.leaders: list[Candidate | None] = [None] * self.islands
+        self.migrations = 0
         #: Every change that has been through the gates, by the parent it was
         #: made to, so the same one is not bought twice.
         self.tried: list[Tried] = []
@@ -240,6 +256,11 @@ class Evolution:
             "archive": [c.generation for c in self.archive()],
             "families": self.bandit.report(),
             "repeats_refused": self.repeats,
+            "islands": [{"leader": leader.generation if leader else None,
+                         "score": leader.score if leader else None,
+                         "generations": sorted(members)}
+                        for leader, members in zip(self.leaders, self.members)],
+            "migrations": self.migrations,
         }, indent=2, default=str))
 
     def snapshot(self, generation: int) -> Path:
@@ -291,8 +312,8 @@ class Evolution:
     def full_timeout(self) -> int:
         return int(self.cfg.get("benchmark_timeout", 900))
 
-    def screen_timeout(self) -> int:
-        """Bound a candidate's first run by what the incumbent already achieves.
+    def screen_timeout(self, seconds: float = 0.0) -> int:
+        """Bound a candidate's first run by what its incumbent already achieves.
 
         Successive halving, in the only form a generated project supports:
         there is no cheap variant of the benchmark to screen on, but there is
@@ -301,11 +322,17 @@ class Evolution:
         generations from a full timeout into a few extra seconds. Raise
         ``screen_factor`` to switch it off; the cost of it being wrong is one
         discarded candidate, and the log says which.
+
+        *seconds* is that island's incumbent, because the global best's time
+        is the wrong bar for an island that is deliberately behind it: every
+        candidate on a slower island would be cut off before it finished, and
+        the island would never get to show what its approach becomes.
         """
         factor = float(self.cfg.get("screen_factor", 2.0))
-        if not self.best_seconds or factor <= 0:
+        incumbent = seconds or self.best_seconds
+        if not incumbent or factor <= 0:
             return self.full_timeout()
-        return max(30, min(self.full_timeout(), int(factor * self.best_seconds) + 5))
+        return max(30, min(self.full_timeout(), int(factor * incumbent) + 5))
 
     def _quiet(self):
         """Hold the machine as still as it can be made for a measurement."""
@@ -344,25 +371,34 @@ class Evolution:
             return True
         return abs(score - incumbent) >= self.margin(incumbent)
 
-    def archive(self) -> list[Candidate]:
-        """Correct candidates worth mutating again.
+    def archive(self, island: int | None = None) -> list[Candidate]:
+        """Correct candidates worth mutating again, on *island* or anywhere.
 
         The top of the ranking plus the Pareto front: the best score is the
         obvious parent, but a candidate that is slightly worse and much
         smaller is often the one a further change can actually build on.
+
+        The Pareto front is filtered by membership too: it is a property of
+        the whole history, and an island that could parent from it would be
+        reading the other islands' work without a migration having happened.
         """
         limit = int(self.cfg.get("archive", 12))
-        correct = [c for c in self.history if c.correct and c.score is not None]
+        correct = [c for c in self.history
+                   if c.correct and c.score is not None and self.resident(c, island)]
         ranked = sorted(correct, key=lambda c: c.score,
                         reverse=self.objective.direction == "maximize")
         keep = ranked[:limit]
         for candidate in self.pareto():
-            if candidate not in keep:
+            if candidate not in keep and self.resident(candidate, island):
                 keep.append(candidate)
         return keep
 
-    def sample_parent(self) -> Candidate:
-        """Choose what to mutate: usually the incumbent, sometimes not.
+    def resident(self, candidate: Candidate, island: int | None) -> bool:
+        """Whether *island* may mutate *candidate*. None means any island."""
+        return island is None or candidate.generation in self.members[island]
+
+    def sample_parent(self, island: int = 0) -> Candidate:
+        """Choose what to mutate on *island*: usually its incumbent, sometimes not.
 
         Always mutating the best candidate is 1+1 hill climbing, which cannot
         leave a local optimum: once the obvious change is in, every further
@@ -370,10 +406,35 @@ class Evolution:
         starting from a worse but different candidate is what makes a second
         basin reachable at all.
         """
-        pool = [c for c in self.archive() if self.snapshot_exists(c.generation)]
+        pool = [c for c in self.archive(island) if self.snapshot_exists(c.generation)]
         if len(pool) <= 1 or self.rng.random() < 0.7:
-            return self.best
+            return self.incumbent(island)
         return self.rng.choice(pool)
+
+    def incumbent(self, island: int) -> Candidate:
+        """The candidate *island* promotes against, before any of its own."""
+        return self.leaders[island] or self.best
+
+    def migrate(self) -> None:
+        """Lend each island's incumbent to the next one round the ring.
+
+        A migrant is made eligible as a parent rather than installed as the
+        neighbour's incumbent. Installing it would hand every island the same
+        score to beat and undo the separation inside one period, which is the
+        convergence islands exist to prevent; offered as a parent it still has
+        to produce a child that beats the local incumbent on the benchmark,
+        which is the evidence every other promotion needs.
+        """
+        if self.islands < 2:
+            return
+        for index, leader in enumerate(self.leaders):
+            destination = (index + 1) % self.islands
+            if leader is None or leader.generation in self.members[destination]:
+                continue
+            self.members[destination].add(leader.generation)
+            self.migrations += 1
+            self.log.info("evolve.migrate", generation=leader.generation,
+                          score=leader.score, island=index, to=destination)
 
     def snapshot_exists(self, generation: int) -> bool:
         return (self.checkpoints / f"gen-{generation:03d}").is_dir()
@@ -394,6 +455,12 @@ class Evolution:
             self.noise = statistics.pstdev(samples) if len(samples) > 1 else 0.0
             candidate.seconds = self.best_seconds
             self.best = candidate
+            # Every island starts from the same working code: the baseline is
+            # the one candidate known to be correct, and an island with no
+            # parent has nothing to propose against.
+            self.leaders = [candidate] * self.islands
+            for members in self.members:
+                members.add(0)
             self.snapshot(0)
         self.history.append(candidate)
         self.log.info("evolve.baseline", correct=correct, score=candidate.score,
@@ -579,15 +646,22 @@ class Evolution:
 
         try:
             for generation in range(1, max_generations + 1):
+                # Round-robin rather than all islands per generation: the
+                # budget is the number of generations, so N islands each get
+                # 1/N of it either way, and taking turns spends nothing extra
+                # on the ones that are behind.
+                island = (generation - 1) % self.islands
                 improved_this_round = False
                 for _ in range(population):
-                    improved_this_round |= self._attempt(len(self.history))
+                    improved_this_round |= self._attempt(len(self.history), island)
                     self.save()
                     if self.objective.reached(self.best.score):
                         self.log.info("evolve.target_reached", score=self.best.score)
                         self.restore(self.best.generation)
                         self.save()
                         return self.best
+                if self.migrate_every > 0 and generation % self.migrate_every == 0:
+                    self.migrate()
                 stagnant = 0 if improved_this_round else stagnant + 1
                 if stagnant >= patience:
                     self.log.info("evolve.plateau", generations=generation)
@@ -627,9 +701,17 @@ class Evolution:
             change = self._apply(proposal, shown)
         return proposal, change, self.changed_lines(before)
 
-    def _attempt(self, index: int) -> bool:
-        """One candidate: propose, apply, measure, select. True when promoted."""
-        parent = self.sample_parent()
+    def _attempt(self, index: int, island: int = 0) -> bool:
+        """One candidate on *island*: propose, apply, measure, select.
+
+        True when promoted. Everything after the measurement is judged against
+        that island's incumbent rather than the global best, which is the
+        whole of what an island is: a lineage that started out worse is given
+        the generations to become good instead of being discarded on the first
+        one for not already beating the leading approach.
+        """
+        parent = self.sample_parent(island)
+        leader = self.incumbent(island)
         family = self.bandit.select()
         feedback = ""
         for _ in range(2):
@@ -669,13 +751,15 @@ class Evolution:
             self.restore(parent.generation)
             return False
 
-        correct, score, verification = self.measure(timeout=self.screen_timeout())
+        correct, score, verification = self.measure(
+            timeout=self.screen_timeout(leader.seconds))
         candidate = Candidate(index, parent.generation, mutation, score, correct,
-                              change.written, family=family,
+                              change.written, family=family, island=island,
                               samples=[score] if score is not None else [],
                               seconds=self.last_seconds,
                               metrics={"mechanism": proposal.get("mechanism", "")})
         self.history.append(candidate)
+        self.members[island].add(index)
         self.tried.append(Tried(parent.generation, changes, candidate))
 
         if not correct:
@@ -687,14 +771,14 @@ class Evolution:
             return False
 
         self.snapshot(index)  # any correct candidate may become a parent later
-        if not self.significant(score, self.best.score):
-            candidate.notes = f"no significant gain ({score} vs {self.best.score})"
+        if not self.significant(score, leader.score):
+            candidate.notes = f"no significant gain ({score} vs {leader.score})"
             self.remember(family, mutation, False, f"score {score}")
             # Correct but not better is still worth more than broken: it can
             # be mutated again, so the family keeps a fraction of the credit.
             self.bandit.update(family, 0.1 if score is not None else 0.0)
-            self.log.info("evolve.discard", index=index, score=score,
-                          best=self.best.score, margin=round(self.margin(self.best.score), 6))
+            self.log.info("evolve.discard", index=index, score=score, island=island,
+                          best=leader.score, margin=round(self.margin(leader.score), 6))
             self.restore(parent.generation)
             return False
 
@@ -703,24 +787,29 @@ class Evolution:
         samples = [score] + self.repeat(int(self.cfg.get("baseline_repeats", 3)) - 1)
         candidate.samples = samples
         candidate.score = self.objective.aggregate(samples)
-        if not self.significant(candidate.score, self.best.score):
+        if not self.significant(candidate.score, leader.score):
             candidate.notes = (f"gain did not reproduce ({score} once, "
                                f"{candidate.score} over {len(samples)} runs)")
             self.remember(family, mutation, False, "gain did not reproduce")
             self.bandit.update(family, 0.1)
             self.log.info("evolve.unconfirmed", index=index, first=score,
-                          confirmed=candidate.score, best=self.best.score)
+                          confirmed=candidate.score, best=leader.score)
             self.restore(parent.generation)
             return False
 
         self.snapshot(index)  # re-taken: the confirmation runs may have written
-        delta = f"{self.best.score} -> {candidate.score}"
-        self.best = candidate
-        self.best_seconds = candidate.seconds or self.best_seconds
+        delta = f"{leader.score} -> {candidate.score}"
+        self.leaders[island] = candidate
+        # The global best is what the run finally restores, so it is held to
+        # the same scepticism as an island promotion: an island that is ahead
+        # by less than the margin has not been shown to be ahead.
+        if self.significant(candidate.score, self.best.score):
+            self.best = candidate
+            self.best_seconds = candidate.seconds or self.best_seconds
         self.remember(family, mutation, True, f"score {candidate.score}")
         self.bandit.update(family, 1.0)
         self.log.info("evolve.improved", index=index, delta=delta, family=family[:20],
-                      mutation=mutation[:80])
+                      island=island, mutation=mutation[:80])
         return True
 
     def pareto(self) -> list[Candidate]:
@@ -754,6 +843,12 @@ class Evolution:
             lines.append(f"gen {candidate.generation:>3} [{mark:>4}] "
                          f"score={candidate.score} "
                          f"[{candidate.family.split(':')[0]}] {candidate.mutation[:50]}")
+        if self.islands > 1:
+            lines.append(f"\nislands ({self.migrations} migrations):")
+            for index, leader in enumerate(self.leaders):
+                born = sum(1 for c in self.history if c.island == index)
+                lines.append(f"  island {index}: best={leader.score if leader else None} "
+                             f"born={born} may mutate={len(self.members[index])}")
         lines.append("\nmutation families:")
         for family, stats in self.bandit.report().items():
             if stats["tried"]:

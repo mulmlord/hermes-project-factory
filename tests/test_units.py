@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 import random
+import re
 import shlex
 import shutil
 import subprocess
@@ -3750,11 +3751,14 @@ KERNEL = "# hand-tuned, and nothing below is meant to change\nCOST = 10\n" \
          + "SPARE = 'keep me'\n" * 20
 
 
-def _evolving(tmp_path, proposals, targets=("src/kernel.py",), context=None):
+def _evolving(tmp_path, proposals, targets=("src/kernel.py",), context=None,
+              cfg=None):
     """An engine over one measurable file, answered by *proposals* in order.
 
     Returns the engine and the prompts the evolver was sent, which is where a
-    report meant for the next proposal has to turn up.
+    report meant for the next proposal has to turn up. *proposals* may instead
+    be called with the prompt, for a reply that has to depend on the code the
+    evolver was actually shown.
     """
     state = SimpleNamespace(plan={"commands": {"build": "true", "test": "true"}},
                             spec={}, name="p", idea="i")
@@ -3772,12 +3776,12 @@ def _evolving(tmp_path, proposals, targets=("src/kernel.py",), context=None):
 
         def ask_json(self, prompt, **kw):
             prompts.append(prompt)
-            return proposals.pop(0)
+            return proposals(prompt) if callable(proposals) else proposals.pop(0)
 
     engine = Evolution(Sandbox(tmp_path, {"runtime": "local", "timeout": 30}),
                        {"evolver": StubEvolver()}, state, objective, list(targets),
                        {"population": 1, "baseline_repeats": 1,
-                        "min_relative_gain": 0.01}, NULL)
+                        "min_relative_gain": 0.01, **(cfg or {})}, NULL)
     return engine, prompts
 
 
@@ -3965,6 +3969,108 @@ def test_no_two_different_edits_are_taken_for_each_other(tmp_path):
             engine.tried.append(Tried(0, changes, Candidate(1, 0, "tune", 1.0, True, [])))
 
     assert len(drawn) > 100 and refused > 20  # both answers were in fact given
+
+
+def test_a_second_island_keeps_a_lineage_the_leading_score_would_bury(tmp_path):
+    """One incumbent is one lineage, and the second approach never gets a turn.
+
+    A promotion raises the bar every later proposal is judged against, so an
+    approach that starts out worse than the incumbent is discarded on its
+    first generation -- before it is the approach it would have become. The
+    same two proposals are run against one archive and against two, because
+    the property is the difference between them, not either outcome alone.
+    """
+    def cost(value):
+        return {"mutation": f"cost {value}",
+                "files": [{"path": "src/kernel.py", "content": f"COST = {value}\n"}]}
+
+    single, _ = _evolving(tmp_path / "one", [cost(2), cost(8)])
+    single.sandbox.write("src/kernel.py", "COST = 10\n")
+    single.run(max_generations=2, patience=5)
+
+    # One archive: 8 is worse than the 2 already found, so it is weather.
+    assert single.history[2].notes.startswith("no significant gain")
+    assert [c.island for c in single.history] == [0, 0, 0]
+
+    islanded, _ = _evolving(tmp_path / "two", [cost(2), cost(8)],
+                            cfg={"islands": 2, "migrate_every": 0})
+    islanded.sandbox.write("src/kernel.py", "COST = 10\n")
+    best = islanded.run(max_generations=2, patience=5)
+
+    # Two: the second generation is judged against its own island's baseline
+    # of 10, so the lineage survives to be mutated again.
+    assert [c.island for c in islanded.history] == [0, 0, 1]
+    assert islanded.history[2].notes == ""
+    assert [leader.score for leader in islanded.leaders] == [2, 8]
+    # And the run still ends on the best code anyone found, not the newest.
+    assert best.score == 2 and islanded.sandbox.read("src/kernel.py") == "COST = 2\n"
+
+
+def test_migration_lends_an_incumbent_instead_of_installing_it(tmp_path):
+    """Installed, it would hand every island the same score to beat.
+
+    That is the convergence islands exist to prevent, arrived at one period
+    later. Offered as a parent, the migrant still has to produce a child that
+    beats the local incumbent on the benchmark.
+    """
+    assert DEFAULTS["evolution"]["islands"] == 1  # opt-in: one island by default
+    engine = _engine(tmp_path, {"islands": 3})
+    baseline = Candidate(0, None, "baseline", 10.0, True, [])
+    engine.leaders = [baseline, baseline, baseline]
+    for members in engine.members:
+        members.add(0)
+    ahead = Candidate(1, 0, "halve", 4.0, True, [], island=0)
+    engine.history += [baseline, ahead]
+    engine.leaders[0] = ahead
+    engine.members[0].add(1)
+
+    engine.migrate()
+
+    assert engine.resident(ahead, 1) and not engine.resident(ahead, 2)
+    assert engine.leaders[1] is baseline  # lent, not installed
+    assert engine.migrations == 1  # the two islands with nothing new to lend
+    # And a single population has nowhere to migrate to, so nothing happens.
+    alone = _engine(tmp_path, {})
+    alone.migrate()
+    assert alone.islands == 1 and alone.migrations == 0
+
+
+def test_a_generation_is_always_proposed_against_its_own_island_s_code(tmp_path):
+    """Round-robin puts consecutive generations on different lineages.
+
+    An island not restored to its own parent first is shown the island before
+    it, and what it proposes is then measured and recorded against a parent it
+    was never shown: every later selection is made on a score that belongs to
+    other code, and the log reads exactly like a run that went well. Fuzzed
+    rather than fixtured, because which generation first diverges depends on
+    which candidates happened to be promoted and on which parent each island
+    happened to sample.
+    """
+    rng = random.Random(20260922)
+    kernel = re.compile(r"COST = (-?[\d.]+)")
+
+    def answer(prompt):
+        # Whatever the evolver was actually shown, named in the reply, so the
+        # candidate that gets measured carries the claim with it.
+        seen = float(kernel.search(prompt.split("CURRENT CODE:")[1]).group(1))
+        return {"mutation": f"saw {seen}",
+                "files": [{"path": "src/kernel.py",
+                           "content": f"COST = {round(seen * rng.uniform(0.4, 1.6), 5)}\n"}]}
+
+    engine, _ = _evolving(tmp_path, answer, cfg={"islands": 3, "migrate_every": 2})
+    engine.sandbox.write("src/kernel.py", "COST = 10\n")
+    engine.run(max_generations=9, patience=99)
+
+    assert [c.island for c in engine.history[1:]] == [0, 1, 2] * 3
+    for candidate in engine.history[1:]:
+        parent = engine.history[candidate.parent]
+        assert parent.generation == candidate.parent  # history is indexed by generation
+        assert candidate.mutation == f"saw {parent.score}", candidate
+        # And nothing was mutated that its island had not been given.
+        assert engine.resident(parent, candidate.island), candidate
+    # The fuzz drew both answers: some generations were promoted, some were not.
+    promoted = [c for c in engine.history[1:] if not c.notes]
+    assert 0 < len(promoted) < len(engine.history) - 1
 
 
 def test_bandit_tries_every_family_once_before_repeating():

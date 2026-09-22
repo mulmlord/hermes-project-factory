@@ -125,7 +125,15 @@ rewrite that drops a constant nothing tests still passes the gate and then
 parents every generation after it. So a target is shown whole or not offered
 at all — a file too big for the evolver's context is dropped from the target
 list rather than truncated — and a patch that does not anchor is reported back
-and re-asked rather than half-applied.
+and re-asked rather than half-applied. Set `evolution.islands` above 1 and the
+archive is split: each island keeps its own incumbent and they take the
+generations in turn, so an approach that starts out behind the leading score
+is judged against where it started rather than against the other island's
+best, and gets the generations that would make it good. Every
+`evolution.migrate_every` generations each island lends its incumbent to the
+next as a possible parent — lends, because installing it would hand every
+island the same score to beat and collapse them back into one lineage a
+period later. The run still ends on the best code any island found.
 
 **Release** exports a pristine copy of the tracked tree into a fresh sandbox
 and builds and tests it there, proving the repository is reproducible from a

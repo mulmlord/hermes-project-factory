@@ -116,6 +116,15 @@ DEFAULTS: dict[str, Any] = {
         "benchmark_timeout": 900,
         "screen_factor": 2.0,         # kill a run this much slower than the best
         "archive": 12,                # correct candidates kept as possible parents
+        # One archive with one incumbent is one lineage: every promotion
+        # raises the bar the next proposal is judged against, so a second
+        # approach that starts out worse never gets the generations that
+        # would have made it good. Islands are separate archives, each with
+        # its own incumbent, taking the generations in turn; every
+        # `migrate_every` generations each lends its incumbent to the next as
+        # a possible parent. 1 island is the single population.
+        "islands": 1,
+        "migrate_every": 4,           # generations between migrations, 0 to never
         # A proposal that changes the same lines as one already measured
         # against the same parent is the same experiment, and the cycle it
         # would cost is the most expensive thing here. Such a patch is always
@@ -506,6 +515,12 @@ evolution:
   baseline_repeats: 3    # runs used to measure benchmark noise
   min_relative_gain: 0.01
   screen_factor: 2.0     # kill a run this much slower than the incumbent
+  islands: 1             # separate archives, each with its own incumbent, taking
+                         # the generations in turn, so an approach that starts out
+                         # worse than the leading one is not discarded before it
+                         # has had a generation to become better than it
+  migrate_every: 4       # generations between each island lending its incumbent
+                         # to the next as a possible parent. 0 never migrates
   novelty: 0.8           # rather than pay for the same experiment twice, refuse
                          # a proposal sharing this fraction of its changed lines
                          # with one already measured against the same parent,

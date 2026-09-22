@@ -12,6 +12,13 @@ What does not is data -- a file listing, a ticket rendered for reading, a
 failure log -- which stays at its call site, where the budget that sizes it
 is. A caller assembles blocks; this module supplies the words.
 
+Each prompt that asks for JSON carries its shape beside it, built with
+:mod:`hermes.schema`. The shape is sent to the server, which constrains
+decoding to it where it can, and is checked in Python where it cannot; the
+example printed in the prompt text stays regardless, because a model writes a
+better answer having seen one than having merely been constrained to one. The
+two must say the same thing, which is why they live on adjacent lines.
+
 The prompt that proposes self-modifications is the one exception, and it
 stays in :mod:`hermes.improve` on purpose: that module is protected from the
 candidates it evaluates, and the instruction soliciting a candidate belongs
@@ -19,7 +26,13 @@ on the protected side of that line.
 """
 from __future__ import annotations
 
+from typing import Sequence
+
 from .agents import EDIT_RULES
+from .schema import ANY, BOOLEAN, INTEGER, STRING, arr, enum, obj
+
+#: Confidence and verdict vocabularies, shared by everything that reports one.
+CONFIDENCE = enum("verified", "inferred", "uncertain")
 
 # -- intake and planning -----------------------------------------------------
 
@@ -53,6 +66,34 @@ def spec_from_idea(idea: str) -> str:
     )
 
 
+#: Required here is wider than elsewhere because every list may legitimately
+#: come back empty, so demanding the key costs the model nothing and spares
+#: the workspace a specification with no success criteria in it.
+SPEC = obj(
+    {
+        "name": STRING,
+        "objective": STRING,
+        "deliverables": arr(),
+        "platforms": arr(),
+        "technologies": arr(),
+        "functional_requirements": arr(),
+        "nonfunctional_requirements": arr(),
+        "constraints": arr(),
+        "risks": arr(),
+        "unknowns": arr(),
+        "success_criteria": arr(),
+        "assumptions": arr(),
+        "optimization_objective": obj({
+            "metric": STRING,
+            "direction": enum("minimize", "maximize"),
+            "how_measured": STRING,
+        }),
+    },
+    required=("name", "objective", "technologies", "functional_requirements",
+              "success_criteria", "assumptions"),
+)
+
+
 def system_design(spec_json: str, research: str) -> str:
     """Choose the architecture and the commands that build and check it."""
     return (
@@ -81,6 +122,30 @@ def system_design(spec_json: str, research: str) -> str:
         "(for example 'pip install pytest flake8'). Every other command runs "
         "offline."
     )
+
+
+#: ``commands`` is required, and required inside, because the factory does not
+#: merely read it: :func:`hermes.planning.architect` indexes into it, and every
+#: later phase runs what it finds there. A plan without a test command is not a
+#: plan Hermes can act on.
+PLAN = obj(
+    {
+        "approach": STRING,
+        "architecture": STRING,
+        "components": arr(obj({"name": STRING, "responsibility": STRING,
+                               "path": STRING})),
+        "milestones": arr(obj({"name": STRING, "description": STRING,
+                               "exit_criteria": STRING})),
+        "commands": obj({"setup": STRING, "build": STRING, "test": STRING,
+                         "lint": STRING, "benchmark": STRING},
+                        required=("setup", "build", "test")),
+        "layout": arr(),
+        "decisions": arr(obj({"title": STRING, "decision": STRING,
+                              "rationale": STRING, "alternatives": STRING,
+                              "consequences": STRING})),
+    },
+    required=("architecture", "commands"),
+)
 
 
 def ticket_breakdown(spec_json: str, plan_json: str, max_tickets: int,
@@ -114,6 +179,35 @@ def ticket_breakdown(spec_json: str, plan_json: str, max_tickets: int,
     )
 
 
+def tickets_schema(kinds: Sequence[str] = ()) -> dict:
+    """The one ticket shape, shared by breakdown, split and repair.
+
+    ``title`` is the only field :func:`hermes.planning._ingest` refuses a
+    ticket for lacking, so it is the only one required. The scores are offered
+    rather than demanded: a model with no opinion on a ticket's risk is better
+    off omitting it and taking the default than being made to invent a 3.
+    """
+    ticket = obj(
+        {
+            "key": STRING,
+            "title": STRING,
+            "objective": STRING,
+            "context": STRING,
+            "kind": enum(*kinds) if kinds else STRING,
+            "dependencies": arr(),
+            "acceptance": arr(),
+            "validation": arr(),
+            "artifacts": arr(),
+            "priority": INTEGER,
+            "risk": INTEGER,
+            "cost": INTEGER,
+            "info_gain": INTEGER,
+        },
+        required=("title", "objective"),
+    )
+    return obj({"tickets": arr(ticket)}, required=("tickets",))
+
+
 def ticket_split(ticket_json: str, reason: str) -> str:
     """Split a ticket that proved too large into executable children."""
     return (
@@ -136,7 +230,8 @@ def repair_tickets(context: str, report: str, output: str) -> str:
         f"OUTPUT:\n{output}\n\n"
         "Create repair tickets. Return JSON:\n"
         '{"tickets": [{"key": "", "title": "", "objective": "", "context": "", '
-        '"kind": "implementation", "acceptance": [""], "validation": [""], '
+        '"kind": "implementation", "dependencies": ["key of an earlier ticket '
+        'in this list"], "acceptance": [""], "validation": [""], '
         '"artifacts": [""], "priority": 1, "risk": 2, "cost": 2, "info_gain": 1}]}'
     )
 
@@ -160,6 +255,9 @@ def research_topics(context: str, idea: str, unknowns_json: str,
     )
 
 
+TOPICS = obj({"needed": BOOLEAN, "topics": arr()}, required=("needed", "topics"))
+
+
 def feynman_unknowns(max_unknowns: int) -> str:
     """Step 1: explain the problem simply and name what is genuinely unknown."""
     return (
@@ -176,6 +274,19 @@ def feynman_unknowns(max_unknowns: int) -> str:
         f"List at most {max_unknowns} unknowns, ordered by how much each would "
         "change the implementation. Skip anything already established."
     )
+
+
+UNKNOWNS = obj(
+    {
+        "simple_explanation": STRING,
+        "what_we_know": arr(),
+        "unknowns": arr(obj({"question": STRING, "why_it_matters": STRING,
+                             "needs_experiment": BOOLEAN},
+                            required=("question",))),
+        "assumptions_to_challenge": arr(),
+    },
+    required=("unknowns",),
+)
 
 
 def retrieved_material(material: str) -> str:
@@ -224,6 +335,21 @@ def quarantined_reading(max_claims: int) -> str:
     )
 
 
+#: The quarantined call's shape is a containment boundary, not a convenience:
+#: it is what stops a page's prose from reaching a prompt that holds the
+#: project. Constraining the decoder to it means the page cannot talk the model
+#: out of the shape either -- see :func:`hermes.research._claims`, which cuts
+#: what survives this down again on the Python side.
+CLAIMS = obj(
+    {
+        "claims": arr(obj({"claim": STRING, "source": STRING},
+                          required=("claim", "source"))),
+        "covers": enum("none", "partly", "fully"),
+    },
+    required=("claims", "covers"),
+)
+
+
 def feynman_answer(has_material: bool) -> str:
     """Answer one unknown, from the sources where they cover it."""
     return (
@@ -251,6 +377,27 @@ def feynman_answer(has_material: bool) -> str:
     )
 
 
+def answer_schema(has_material: bool) -> dict:
+    """The shape of an answer to one unknown.
+
+    ``sources`` is demanded exactly when there was material to cite and
+    absent from the shape when there was not, so a model with nothing to
+    point at is never constrained into pointing somewhere.
+    """
+    properties = {
+        "answer": STRING,
+        "confidence": CONFIDENCE,
+        "implications": arr(),
+        "alternatives": arr(obj({"option": STRING, "pros": STRING,
+                                 "cons": STRING}, required=("option",))),
+        "recommendation": STRING,
+        "experiment": STRING,
+    }
+    if has_material:
+        properties["sources"] = arr()
+    return obj(properties, required=("answer", "confidence"))
+
+
 def feynman_synthesis() -> str:
     """Challenge the round's findings and convert what survives into action."""
     return (
@@ -269,6 +416,27 @@ def feynman_synthesis() -> str:
     )
 
 
+#: The tickets a synthesis raises are a smaller shape than the planner's: no
+#: keys, no dependencies, no scores. They are folded into the board by the
+#: same :func:`hermes.planning._ingest`, which supplies the rest.
+SYNTHESIS = obj(
+    {
+        "conclusions": arr(),
+        "decisions": arr(obj({"title": STRING, "decision": STRING,
+                              "rationale": STRING, "alternatives": STRING,
+                              "consequences": STRING},
+                             required=("title", "decision"))),
+        "hypotheses": arr(obj({"statement": STRING, "test": STRING},
+                              required=("statement",))),
+        "tickets": arr(obj({"title": STRING, "objective": STRING, "kind": STRING,
+                            "acceptance": arr(), "validation": arr()},
+                           required=("title",))),
+        "remaining_unknowns": arr(),
+    },
+    required=("conclusions",),
+)
+
+
 def search_queries(context: str, topic: str, questions: str, queries: int) -> str:
     """Ask for search terms rather than recalled URLs."""
     return (
@@ -285,6 +453,13 @@ def search_queries(context: str, topic: str, questions: str, queries: int) -> st
     )
 
 
+QUERIES = obj(
+    {"queries": arr(),
+     "urls": arr(obj({"url": STRING, "why": STRING}, required=("url",)))},
+    required=("queries",),
+)
+
+
 def choose_sources(topic: str, questions: str, listing: str, limit: int) -> str:
     """Pick which search results are worth spending a page of the budget on."""
     return (
@@ -298,6 +473,12 @@ def choose_sources(topic: str, questions: str, listing: str, limit: int) -> str:
     )
 
 
+#: ``n`` is an integer because the caller indexes the listing with it, and a
+#: model that answers "3." or "result 3" costs a round trip to find out.
+PICK = obj({"pick": arr(obj({"n": INTEGER, "why": STRING}, required=("n",)))},
+           required=("pick",))
+
+
 def compress_findings(words: int) -> str:
     """Summarise research that no longer fits, without losing a constraint."""
     return (
@@ -306,6 +487,9 @@ def compress_findings(words: int) -> str:
         "measured number, named technology and rejected alternative. "
         'Return JSON: {"findings": ["one finding per entry"]}'
     )
+
+
+FINDINGS = obj({"findings": arr()}, required=("findings",))
 
 
 # -- implementation ----------------------------------------------------------
@@ -345,6 +529,21 @@ REVIEW = (
     "handling at a trust boundary. Do not block on style or taste."
 )
 
+#: A review that comes back without a verdict is not a review, and the gate
+#: that reads it has to guess. ``approved`` is therefore required even though
+#: everything explaining it is optional.
+REVIEW_SHAPE = obj(
+    {
+        "approved": BOOLEAN,
+        "meets_acceptance": BOOLEAN,
+        "blocking": arr(),
+        "advisory": arr(),
+        "security": arr(),
+        "reason": STRING,
+    },
+    required=("approved", "reason"),
+)
+
 TRIAGE = (
     "Diagnose the root cause. Return JSON:\n"
     "{\n"
@@ -359,6 +558,23 @@ TRIAGE = (
     "trivial = a typo, a missing import, a wrong path. implementation = the "
     "code is wrong. architecture = the design cannot work. research_gap = we "
     "do not know enough to fix it. environment = a missing tool or dependency."
+)
+
+#: Both vocabularies are closed, and both decide control flow: ``action``
+#: picks the recovery path in :mod:`hermes.phases`. A word outside the list is
+#: not a shade of meaning, it is a branch the factory does not have.
+TRIAGE_SHAPE = obj(
+    {
+        "diagnosis": STRING,
+        "classification": enum("trivial", "implementation", "architecture",
+                               "research_gap", "environment", "flaky"),
+        "action": enum("retry", "repair", "decompose", "reconsider", "research",
+                       "rollback"),
+        "instructions": STRING,
+        "files": arr(),
+        "research_topic": STRING,
+    },
+    required=("diagnosis", "classification", "action"),
 )
 
 
@@ -391,6 +607,23 @@ def experiment_design(timeout: int, protocol: str) -> str:
     )
 
 
+#: ``parameters`` is the model's own keys, so it is left unconstrained: a
+#: shape cannot be given to something whose whole point is that the experiment
+#: decides what it varies.
+EXPERIMENT = obj(
+    {
+        "design": STRING,
+        "parameters": ANY,
+        "files": arr(obj({"path": STRING, "content": STRING},
+                         required=("path", "content"))),
+        "command": STRING,
+        "supports": STRING,
+        "refutes": STRING,
+    },
+    required=("design", "files", "command"),
+)
+
+
 EXPERIMENT_VERDICT = (
     "Judge the hypothesis against this measurement and nothing else. "
     "If the program does not actually measure the claim, the verdict "
@@ -403,6 +636,17 @@ EXPERIMENT_VERDICT = (
     '  "implications": ["what this changes about what gets built"],\n'
     '  "next": "the action this argues for, or an empty string"\n'
     "}"
+)
+
+VERDICT_SHAPE = obj(
+    {
+        "verdict": enum("supported", "refuted", "inconclusive"),
+        "finding": STRING,
+        "confidence": CONFIDENCE,
+        "implications": arr(),
+        "next": STRING,
+    },
+    required=("verdict", "finding"),
 )
 
 
@@ -427,6 +671,24 @@ def evolution_direction(family: str) -> str:
     )
 
 
+#: A proposal with no edit and no file is a paragraph about optimisation, and
+#: the generation that produced it is spent. Neither key can be required on
+#: its own, though -- a patch and a rewrite are both valid answers -- so the
+#: choice between them is checked where the proposal is applied, not here.
+PROPOSAL = obj(
+    {
+        "mutation": STRING,
+        "mechanism": STRING,
+        "edits": arr(obj({"path": STRING, "find": STRING, "replace": STRING},
+                         required=("path", "find", "replace"))),
+        "files": arr(obj({"path": STRING, "content": STRING},
+                         required=("path", "content"))),
+        "risk": STRING,
+    },
+    required=("mutation",),
+)
+
+
 def evolution_targets(context: str, benchmark) -> str:
     """Find the source files that actually dominate the benchmark's cost."""
     return (
@@ -436,6 +698,9 @@ def evolution_targets(context: str, benchmark) -> str:
         'JSON: {"files": ["src/path.ext"]} with at most 4 files that exist in '
         "the file listing above. Exclude tests and benchmark harnesses."
     )
+
+
+TARGETS = obj({"files": arr()}, required=("files",))
 
 
 # -- documentation -----------------------------------------------------------
@@ -456,9 +721,32 @@ def readme(sections: str) -> str:
     )
 
 
+def readme_schema(sections: Sequence[str]) -> dict:
+    """One markdown string per README section, all of them required.
+
+    The README is the last thing the factory writes and nobody reads it back
+    into a prompt, so a section quietly missing is a hole in the deliverable
+    rather than a retry. Requiring every key is what turns it into a retry.
+    """
+    return obj({name: STRING for name in sections}, required=tuple(sections))
+
+
 ARCHITECTURE_DOC = (
     "Document the architecture as built. Return JSON:\n"
     '{"overview": "", "components": [{"name": "", "path": "", '
     '"responsibility": "", "interfaces": ""}], "data_flow": "", '
     '"key_decisions": [""], "extension_points": [""]}'
+)
+
+ARCHITECTURE_SHAPE = obj(
+    {
+        "overview": STRING,
+        "components": arr(obj({"name": STRING, "path": STRING,
+                               "responsibility": STRING, "interfaces": STRING},
+                              required=("name",))),
+        "data_flow": STRING,
+        "key_decisions": arr(),
+        "extension_points": arr(),
+    },
+    required=("overview",),
 )

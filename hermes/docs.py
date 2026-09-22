@@ -84,7 +84,8 @@ def readme(agents, sandbox: Sandbox, state, board, log: Logger = NULL) -> Path:
     # The source outranks everything optional: a README written from the spec
     # instead of the code is exactly the invented documentation this forbids.
     source.fill("SOURCE:\n" + _source_digest(sandbox, max(0, source.room() - 8)))
-    result = documenter.ask_json(prompt.render())
+    result = documenter.ask_json(prompt.render(),
+                                 schema=prompts.readme_schema(README_SECTIONS))
     title = state.spec.get("name", state.name)
     body = [f"# {title}\n", result.get("purpose", state.idea).strip(), ""]
     for section in README_SECTIONS[1:]:
@@ -106,7 +107,8 @@ def architecture(agents, sandbox: Sandbox, state, log: Logger = NULL) -> Path:
     source = prompt.add("source", priority=10, floor=4000)
     prompt.add("instructions", prompts.ARCHITECTURE_DOC, required=True)
     source.fill("SOURCE:\n" + _source_digest(sandbox, max(0, source.room() - 8)))
-    result = documenter.ask_json(prompt.render())
+    result = documenter.ask_json(prompt.render(),
+                                 schema=prompts.ARCHITECTURE_SHAPE)
     lines = [f"# Architecture\n", result.get("overview", ""), "", "## Components\n"]
     for component in result.get("components") or []:
         if not isinstance(component, dict):

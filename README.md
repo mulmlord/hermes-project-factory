@@ -336,6 +336,7 @@ models:
     base_url: http://localhost:6767/v1
     model: qwen2.5-coder-7b-instruct-awq
     context: 16384                   # must match the server's --max-model-len
+    structured_output: schema        # schema | json | off
   reasoner:
     backend: ollama                  # a second server, if you run one
     base_url: http://localhost:11434
@@ -354,6 +355,22 @@ the config asks for more than one.
 Any endpoint that is not loopback or a private address is refused unless you
 set `allow_remote: true` on that model, which exists for a server you host
 yourself on your own network.
+
+`structured_output` decides how hard the server is asked to hold a reply to
+its shape. Every agent answers in JSON, and every one of those shapes is
+written down next to the prompt that asks for it in `hermes/prompts.py`. At
+`schema`, the shape itself goes over the wire — vLLM compiles it to a grammar
+and masks the tokens that would leave it, ollama takes the same document in
+`format` — so a missing key becomes impossible rather than discovered three
+phases later. `json` asks only for valid JSON, the older and more widely
+supported guarantee; `off` asks for nothing.
+
+Set it and forget it: a server that refuses a rung is downgraded one rung at
+a time, once, and the run continues. A vLLM too old for `json_schema` keeps
+`json_object` rather than losing both. Whatever the server did or did not
+enforce, the same shape is checked in Python afterwards, and a reply of the
+wrong shape is retried with the missing key named — then accepted anyway if
+the model will not fix it, because a thin answer beats a failed phase.
 
 ## Isolation
 

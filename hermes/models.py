@@ -17,6 +17,7 @@ from typing import Any, Iterable
 
 from .config import Config, ConfigError, ModelConfig
 from .log import Logger, NULL
+from .schema import JSON, LEVELS, OFF, SCHEMA, check
 
 _THINK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _FENCE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
@@ -61,11 +62,37 @@ class Backend:
 
     def __init__(self, cfg: ModelConfig):
         self.cfg = cfg
-        #: Constrained decoding, until a server tells us it does not speak it.
-        self.json_mode = cfg.structured_output
+        #: How hard this server is currently asked to hold a reply to its
+        #: shape, from :data:`hermes.schema.LEVELS`. It starts at whatever the
+        #: config asks for and only ever walks down, when a server says it
+        #: does not speak the parameter.
+        self.level = cfg.structured_output
+
+    def effective(self, schema: dict | None) -> str:
+        """The strongest rung this particular call can actually use.
+
+        A caller with no schema cannot ask for one, so it is asking for
+        ``json`` however the config is set. Naming that here keeps
+        :meth:`weaken` honest: the rung that was refused is the rung that
+        gets dropped, and a refusal never costs a retry identical to the
+        request that caused it.
+        """
+        return JSON if self.level == SCHEMA and not schema else self.level
+
+    def weaken(self, schema: dict | None = None) -> str:
+        """Drop below the rung this call actually used.
+
+        One rung at a time, because the rungs are separate features: vLLM
+        builds older than XGrammar take ``json_object`` and refuse
+        ``json_schema``, and throwing away both over one refusal would cost
+        every later call the guarantee the server does support.
+        """
+        self.level = LEVELS[max(0, LEVELS.index(self.effective(schema)) - 1)]
+        return self.level
 
     def complete(self, system: str, prompt: str, *, temperature: float | None = None,
-                 max_tokens: int | None = None, json_mode: bool = False) -> str:
+                 max_tokens: int | None = None, json_mode: bool = False,
+                 schema: dict | None = None) -> str:
         raise NotImplementedError
 
     def available_models(self) -> list[str]:
@@ -74,7 +101,7 @@ class Backend:
 
 class OllamaBackend(Backend):
     def complete(self, system, prompt, *, temperature=None, max_tokens=None,
-                 json_mode=False):
+                 json_mode=False, schema=None):
         payload = {
             "model": self.cfg.model,
             "messages": [
@@ -92,7 +119,12 @@ class OllamaBackend(Backend):
                 **self.cfg.extra.get("options", {}),
             },
         }
-        if json_mode and self.json_mode:
+        # ollama takes the schema document itself in the same field that takes
+        # the string "json", and has since 0.5.
+        level = self.effective(schema)
+        if json_mode and level == SCHEMA:
+            payload["format"] = schema
+        elif json_mode and level != OFF:
             payload["format"] = "json"
         data = _post(f"{self.cfg.base_url.rstrip('/')}/api/chat", payload, self.cfg.timeout)
         return (data.get("message") or {}).get("content", "")
@@ -110,7 +142,7 @@ class OpenAICompatBackend(Backend):
         return base if base.endswith("/v1") else base + "/v1"
 
     def complete(self, system, prompt, *, temperature=None, max_tokens=None,
-                 json_mode=False):
+                 json_mode=False, schema=None):
         payload = {
             "model": self.cfg.model,
             "messages": [
@@ -122,7 +154,20 @@ class OpenAICompatBackend(Backend):
         }
         if max_tokens:
             payload["max_tokens"] = max_tokens
-        if json_mode and self.json_mode:
+        level = self.effective(schema)
+        if json_mode and level == SCHEMA:
+            # vLLM compiles this to a grammar and masks the tokens that would
+            # leave the shape; llama.cpp's server does the same through its
+            # own GBNF conversion. A server that does neither answers 400
+            # naming the parameter, which is what weaken() is for.
+            # No "strict": that flag means OpenAI's dialect, which demands
+            # every property be required and additional ones forbidden --
+            # the opposite of the forgiving shapes hermes.schema.obj builds.
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "hermes_reply", "schema": schema},
+            }
+        elif json_mode and level != OFF:
             payload["response_format"] = {"type": "json_object"}
         data = _post(f"{self._base()}/chat/completions", payload, self.cfg.timeout)
         choices = data.get("choices") or []
@@ -329,36 +374,55 @@ class Router:
                        seconds=round(elapsed, 1), chars_out=len(text))
         return strip_reasoning(text)
 
-    def _json_attempt(self, task: str, system: str, prompt: str, kw: dict) -> str:
-        """One completion asked for under constrained decoding where supported."""
+    def _json_attempt(self, task: str, system: str, prompt: str, kw: dict,
+                      schema: dict | None = None) -> str:
+        """One completion asked for under constrained decoding where supported.
+
+        Walks down :data:`hermes.schema.LEVELS` as the server refuses each
+        rung, so an old or minimal local server ends up answering unconstrained
+        rather than failing the task. The walk is remembered on the backend:
+        the probe costs one round trip per run, not one per call.
+        """
         backend = self.backend(task)
-        try:
-            return self.complete(task, system, prompt, json_mode=True, **kw)
-        except ModelError as exc:
-            if not (backend.json_mode and _rejects_parameter(exc)):
-                raise
-            # The server does not speak this parameter. Losing the guarantee is
-            # survivable; failing the task over a capability probe is not.
-            backend.json_mode = False
-            self.log.warn("model.json_mode_unsupported", task=task, error=str(exc)[:200])
-            return self.complete(task, system, prompt, **kw)
+        while True:
+            try:
+                return self.complete(task, system, prompt, json_mode=True,
+                                     schema=schema, **kw)
+            except ModelError as exc:
+                if backend.effective(schema) == OFF or not _rejects_parameter(exc):
+                    raise
+                # The server does not speak this parameter. Losing the
+                # guarantee is survivable; failing the task over a capability
+                # probe is not.
+                was = backend.effective(schema)
+                self.log.warn("model.structured_output_downgraded", task=task,
+                              was=was, now=backend.weaken(schema),
+                              error=str(exc)[:200])
 
     def complete_json(self, task: str, system: str, prompt: str, *, attempts: int = 3,
-                      **kw: Any) -> Any:
-        """Completion that must parse as JSON. Retries with a repair nudge.
+                      schema: dict | None = None, **kw: Any) -> Any:
+        """Completion that must parse as JSON, and should match *schema*.
 
-        Constrained decoding makes malformed JSON structurally impossible on
-        servers that support it, so the repair loop is the fallback for the
-        ones that do not rather than the normal path. Each repair costs a whole
-        generation, which on a local model is the most expensive thing here.
+        Constrained decoding makes a malformed or misshapen reply structurally
+        impossible on servers that support it, so the repair loop is the
+        fallback for the ones that do not rather than the normal path. Each
+        repair costs a whole generation, which on a local model is the most
+        expensive thing here.
+
+        A reply that parses but departs from the schema is retried while
+        attempts remain and then returned anyway. Every caller already reads
+        its reply with ``.get`` and a default, so a missing key is a thinner
+        answer; refusing it outright would turn a thin answer into a failed
+        phase, which is a worse trade than the one the schema is here to make.
         """
         last_error = ""
         current = prompt
         for attempt in range(1, attempts + 1):
             text = self._json_attempt(
-                task, system + "\n\nRespond with JSON only. No prose.", current, kw)
+                task, system + "\n\nRespond with JSON only. No prose.", current, kw,
+                schema)
             try:
-                return extract_json(text)
+                value = extract_json(text)
             except ValueError as exc:
                 last_error = str(exc)
                 self.log.warn("model.json_retry", task=task, attempt=attempt)
@@ -367,6 +431,21 @@ class Router:
                     "Reply with a single valid JSON value and nothing else."
                 )
                 kw["temperature"] = min(0.8, kw.get("temperature", 0.2) + 0.2 * attempt)
+                continue
+            faults = check(schema, value) if schema else []
+            if not faults:
+                return value
+            if attempt == attempts:
+                self.log.warn("model.json_shape_accepted", task=task,
+                              faults="; ".join(faults))
+                return value
+            self.log.warn("model.json_shape_retry", task=task, attempt=attempt,
+                          faults="; ".join(faults))
+            current = (
+                f"{prompt}\n\nYour previous reply was valid JSON of the wrong "
+                f"shape: {'; '.join(faults)}. Send the whole reply again, in "
+                "the shape asked for above."
+            )
         raise ModelError(f"task {task}: no parseable JSON after {attempts} attempts: {last_error}")
 
     def routed_tasks(self) -> list[str]:

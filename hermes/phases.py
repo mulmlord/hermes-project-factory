@@ -20,6 +20,7 @@ from .implement import Change, execute_ticket
 from .log import scope
 from .planning import _ingest, architect, generate_tickets, intake as specify
 from .research import investigate, topics_for
+from .tickets import KINDS
 from .verify import record_evaluation, scan_unsafe, verify_project
 
 
@@ -284,8 +285,10 @@ def _repair_from_validation(factory, verification) -> None:
         factory.state.notes.append(
             "Validation did not converge. Known defects:\n" + verification.report())
         return
-    fix = factory.agents["triager"].ask_json(prompts.repair_tickets(
-        factory.context(), verification.report(), verification.failure_output()))
+    fix = factory.agents["triager"].ask_json(
+        prompts.repair_tickets(factory.context(), verification.report(),
+                               verification.failure_output()),
+        schema=prompts.tickets_schema(KINDS))
     created = _ingest(factory.board, fix.get("tickets") or [], log=factory.log)
     if not created:
         factory.board.add(title="Fix failing project validation", priority=1,
@@ -331,9 +334,11 @@ def optimization(factory) -> None:
 
 def _evolution_targets(factory) -> list[str]:
     """Source files that actually influence the benchmark."""
-    result = factory.agents["architect"].ask_json(prompts.evolution_targets(
-        factory.context(),
-        (factory.state.plan.get("commands") or {}).get("benchmark")))
+    result = factory.agents["architect"].ask_json(
+        prompts.evolution_targets(
+            factory.context(),
+            (factory.state.plan.get("commands") or {}).get("benchmark")),
+        schema=prompts.TARGETS)
     return [f for f in (result.get("files") or [])
             if isinstance(f, str) and (factory.root / f).is_file()][:4]
 

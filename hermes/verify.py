@@ -377,7 +377,7 @@ def review(agents, ticket, sandbox: Sandbox, change, verification: Verification,
     header = "CHANGE:\n"
     view.fill(header + change_view(sandbox, change,
                                    max(0, view.room() - len(header))))
-    verdict = lookup.ask()
+    verdict = lookup.ask(schema=prompts.REVIEW_SHAPE)
     blocking = [b for b in (verdict.get("blocking") or []) if str(b).strip()]
     security = [s for s in (verdict.get("security") or []) if str(s).strip()]
     verdict["approved"] = bool(verdict.get("approved")) and not blocking and not security
@@ -405,7 +405,7 @@ def triage(agents, ticket, verification: Verification, context: str,
     header = "OUTPUT:\n"
     output.fill(header + verification.failure_output(
         max(0, output.room() - len(header))))
-    verdict = triager.ask_json(prompt.render())
+    verdict = triager.ask_json(prompt.render(), schema=prompts.TRIAGE_SHAPE)
     log.info("triage", ticket=ticket.id, classification=verdict.get("classification"),
              action=verdict.get("action"))
     return verdict

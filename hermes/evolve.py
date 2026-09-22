@@ -421,7 +421,7 @@ class Evolution:
                 f"none of {', '.join(self.targets) or '(no targets)'} fits the "
                 f"{code.room()} characters this prompt has left for source")
         code.fill("CURRENT CODE:\n" + sources)
-        return evolver.ask_json(prompt.render()), shown
+        return evolver.ask_json(prompt.render(), schema=prompts.PROPOSAL), shown
 
     def _sources(self, budget: int) -> tuple[str, list[str]]:
         """Targets that fit *budget* whole, and which ones those are.

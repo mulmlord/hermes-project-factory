@@ -43,7 +43,19 @@ from pathlib import Path
 
 from .agents import Prompt
 from .log import Logger, NULL
+from .schema import STRING, arr, obj
 from .verify import Gate
+
+#: The shape of a self-modification proposal. It stays here with the prompt
+#: that asks for it, on the protected side of the line this module draws:
+#: a candidate that could edit the schema could widen what a candidate may
+#: return.
+PROPOSAL = obj(
+    {"rationale": STRING,
+     "files": arr(obj({"path": STRING, "content": STRING},
+                      required=("path", "content")))},
+    required=("rationale", "files"),
+)
 
 #: Paths a self-modification may never touch, because they are what decides
 #: whether a self-modification is any good. Matched as path prefixes against
@@ -387,7 +399,7 @@ class Improvement:
         sources.fill("\n\n".join(
             f"--- {relative} ---\n{(self.root / relative).read_text()[:share]}"
             for relative in TARGETS[target] if (self.root / relative).is_file()))
-        answer = agent.ask_json(prompt.render())
+        answer = agent.ask_json(prompt.render(), schema=PROPOSAL)
         return answer if isinstance(answer, dict) else {}
 
     def promote(self, record: Attempt) -> bool:

@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import prompts
-from .agents import Prompt, context_block, escalate, file_protocol, ticket_block
+from .agents import (Prompt, change_schema, context_block, escalate,
+                     file_protocol, ticket_block)
 from .anchor import locate
 from .ledger import ABANDONED, FAILED, FIXED, NullLedger
 from .log import Logger, NULL, scope
@@ -349,7 +350,7 @@ def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
                                          limit=files,
                                          budget=max(0, sources.room() - len(header))))
     extra = {} if temperature is None else {"temperature": temperature}
-    return lookup.ask(**extra)
+    return lookup.ask(schema=change_schema(edits=allow_edits), **extra)
 
 
 def signature_of(verification: Verification | None = None,

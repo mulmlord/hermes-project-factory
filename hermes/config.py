@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 
 import yaml
 
+from .schema import LEVELS, OFF, SCHEMA
+
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", "host.docker.internal"}
 
 #: Task kinds the router knows about. Each maps to a model role in config.
@@ -40,7 +42,8 @@ DEFAULTS: dict[str, Any] = {
             "context": 16384,
             "temperature": 0.2,
             "timeout": 900,
-            "structured_output": True,   # constrained decoding where supported
+            # Constrained decoding where supported: schema | json | off.
+            "structured_output": SCHEMA,
             "keep_alive": "30m",         # ollama only; vLLM never evicts
         },
     },
@@ -185,8 +188,10 @@ class ModelConfig:
     temperature: float = 0.2
     timeout: int = 900
     allow_remote: bool = False
-    #: Ask the server to constrain decoding to JSON where it supports it.
-    structured_output: bool = True
+    #: How hard the server is asked to constrain decoding: ``schema`` sends
+    #: the per-task JSON Schema, ``json`` asks only for some JSON, ``off``
+    #: asks for nothing. See :func:`structured_level`.
+    structured_output: str = SCHEMA
     #: How long ollama should hold the weights between calls. Ignored by vLLM,
     #: which keeps the model resident for the lifetime of the process.
     keep_alive: str = "30m"
@@ -203,6 +208,26 @@ class ModelConfig:
                 "Hermes refuses hosted inference APIs; set allow_remote: true only "
                 "for a self-hosted server on your own network."
             )
+        if self.structured_output not in LEVELS:
+            raise ConfigError(
+                f"model '{self.role}': structured_output is "
+                f"{self.structured_output!r}; it must be one of "
+                f"{', '.join(LEVELS)} (or true/false for the outer two)."
+            )
+
+
+def structured_level(value: Any) -> str:
+    """Read ``structured_output`` in either the old spelling or the new one.
+
+    It was a boolean before schemas existed, and configs written then are
+    still correct: ``true`` meant "constrain as hard as you can", which is now
+    ``schema``, and ``false`` still means ask for nothing. An unrecognised
+    value is passed through for :meth:`ModelConfig.validate` to reject by
+    name, rather than being silently read as a truthy string.
+    """
+    if isinstance(value, bool):
+        return SCHEMA if value else OFF
+    return str(value).strip().lower()
 
 
 def is_local_url(url: str) -> bool:
@@ -295,7 +320,7 @@ class Config:
             temperature=float(spec.get("temperature", 0.2)),
             timeout=int(spec.get("timeout", 900)),
             allow_remote=bool(spec.get("allow_remote", False)),
-            structured_output=bool(spec.get("structured_output", True)),
+            structured_output=structured_level(spec.get("structured_output", SCHEMA)),
             keep_alive=str(spec.get("keep_alive", "30m")),
             extra={k: v for k, v in spec.items() if k not in known},
         )
@@ -329,7 +354,7 @@ models:
     model: qwen2.5-coder-7b-instruct-awq
     context: 16384                   # must match the server's --max-model-len
     temperature: 0.2
-    structured_output: true          # constrain decoding to JSON server-side
+    structured_output: schema        # schema | json | off (see README)
     keep_alive: 30m                  # ollama only; vLLM never evicts
   # coder:
   #   backend: ollama                # a second server, if you run one

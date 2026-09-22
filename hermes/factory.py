@@ -154,7 +154,8 @@ class Factory:
         keep = max(0, findings_block.room() - len(head))
         findings_block.fill(head + (text[-keep:] if keep else ""))
         try:
-            payload = summariser.ask_json(prompt.render())
+            payload = summariser.ask_json(prompt.render(),
+                                          schema=prompts.FINDINGS)
             findings = [f"- {item}" for item in (payload.get("findings") or []) if item]
         except Exception as exc:  # noqa: BLE001 - truncation is a valid fallback
             self.log.warn("research.compress_failed", error=str(exc)[:200])

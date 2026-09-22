@@ -694,6 +694,29 @@ $ hermes eval --compare evaluations/before/results.json \
                         evaluations/after/results.json
 ```
 
+Eight of the tasks are one-line ideas. Three more — `cronspec` (a cron
+expression library), `stencil` (a template engine) and `tally` (double-entry
+bookkeeping) — are shaped like NL2Repo-Bench: the idea is a requirements
+document that pins the package, its modules and its public API, the workspace
+starts empty, and the result is scored by tests the factory never sees. Those
+live in `hermes/suite/`. When the run ends, however it ends, the committed
+tree is exported to a fresh sandbox, the held-out tests are dropped beside
+it, and pytest runs with the project's `conftest.py` files, pytest
+configuration and plugins all ignored, because those are the ways a project
+can change what a run reports without changing what its code does. The score
+is tests passed out of tests declared in the source. A library that fails to
+import is 0 of 35, not 0 of 0. A reference solution for each task, under
+`tests/reference/`, scores full marks on every commit, so a lower score
+reflects the factory and never the tests.
+
+The held-out numbers are partial credit: a run that gets 20 of 35 tests
+passing ranks above one that gets 5, even though neither completed. They
+outrank the factory's own verdict in two places. The report prints a task
+that reached `COMPLETED` while failing held-out tests as `overclaimed`, which
+is the premature termination NL2Repo-Bench names as the first failure of
+long-horizon agents. And `hermes improve` refuses a change that passes fewer
+held-out tests, whatever it did to the first-pass rate.
+
 Each task also gets a wall-clock ceiling (`--budget MINUTES`, 30 by default),
 because iterations bound how many phases run rather than how long one takes,
 and without it a single stuck command lets one idea consume the whole run. A
@@ -778,10 +801,12 @@ halfway through.
   real local model, is still unmeasured.
 - `hermes eval` has only ever been run against the stub model in the test
   suite. Its bookkeeping, budgets and the honesty checks above are tested, but
-  no suite run against a real local model has been recorded, so the eight
-  tasks are uncalibrated: whether they can actually separate a better factory
+  no suite run against a real local model has been recorded, so the tasks
+  are uncalibrated: whether they can actually separate a better factory
   from a worse one on your model is exactly what the `resolution` line will
-  tell you the first time you run it.
+  tell you the first time you run it. The held-out tests are calibrated
+  against a hand-written reference solution, not against anything a model
+  wrote, so no number yet shows where a local model lands on them.
 - Research works from what the model knows until you set
   `research.network: true`, which buys it real sources within a page, search,
   byte and time budget. The search and retrieval path is exercised against a

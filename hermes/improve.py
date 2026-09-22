@@ -64,6 +64,7 @@ PROTECTED = (
     "tests",              # the suite that says pass or fail
     "hermes/improve.py",  # this gate
     "hermes/harness.py",  # the measurement the benefit gate reads
+    "hermes/suite",       # the held-out tests that measurement runs
     "conftest.py",
     "pyproject.toml",     # testpaths, dependencies, entry points
     "install.sh",
@@ -151,7 +152,17 @@ def measured_gain(before: Path, after: Path) -> tuple[bool, str]:
         return sum(runs[n].get("first_pass", 0.0) * runs[n].get("tickets_completed", 0)
                    for n in shared) / weight
 
+    # Tests the factory never saw outrank its own verdict: a change that
+    # completes as many tasks while building less working library is worse.
+    held_before = sum(old[n].get("holdout_passed", 0) for n in shared)
+    held_after = sum(new[n].get("holdout_passed", 0) for n in shared)
+    if held_after < held_before:
+        return False, f"held-out tests passed {held_after}, was {held_before}"
+
     pass_before, pass_after = weighted(old), weighted(new)
+    if held_after > held_before:
+        return True, (f"held-out tests passed {held_before} -> {held_after} "
+                      f"at {done_after}/{len(shared)} completed")
     if done_after > done_before:
         return True, (f"completed {done_after}/{len(shared)}, was {done_before}; "
                       f"first-pass {pass_before:.0%} -> {pass_after:.0%}")

@@ -32,6 +32,17 @@ is a reference adapter over the ``laya`` SDK. It answers::
     GET /health -> 200
 
 When nothing answers, the gate is exactly what it was before.
+
+The same service is also asked a second question it is not yet trusted to
+answer: what class of failure a broken attempt is. The triager -- a full
+reasoning-model call per failure -- answers that today, and the answer is one
+word out of six, which is a classifier's shape of decision. Whether a cheap
+model could take it over is an empirical question, so it is asked in *shadow*:
+the guess is written to :mod:`hermes.ledger` beside the triager's answer and
+never read by the loop. ``hermes ledger --shadow`` reports how often the two
+agree, which is the evidence any later promotion has to be argued from.
+A request may carry ``criteria``, a label -> description mapping, for
+questions the adapter has no descriptions of its own for.
 """
 from __future__ import annotations
 
@@ -64,6 +75,21 @@ SECURITY_LABELS: tuple[str, ...] = (
     "sql injection",
     "weak cryptography",
 )
+
+#: The shadow question, asked of the tail of a failed attempt's output.
+TRIAGE_QUESTION = "What is the root cause of this build or test failure?"
+
+#: The triager's own vocabulary and its own definitions of it (see
+#: ``hermes.prompts.TRIAGE``), so that agreement between the two is agreement
+#: about the same six words and not a translation between taxonomies.
+TRIAGE_LABELS: dict[str, str] = {
+    "trivial": "a typo, a missing import, a wrong path",
+    "implementation": "the code is wrong",
+    "architecture": "the design cannot work",
+    "research_gap": "we do not know enough to fix it",
+    "environment": "a missing tool or dependency",
+    "flaky": "the failure does not depend on the code; it passes on a rerun",
+}
 
 #: Characters one chunk shows the classifier. The smallest useful checkpoints
 #: take 512 tokens, so this stays near a quarter of that in characters and
@@ -117,6 +143,14 @@ class Finding:
                 f"({self.confidence:.0%} confidence, unconfirmed)")
 
 
+@dataclass(frozen=True)
+class Guess:
+    """One label the classifier chose, and how sure it said it was."""
+
+    label: str
+    confidence: float
+
+
 @dataclass
 class ClassifierConfig:
     enabled: bool = False
@@ -132,6 +166,9 @@ class ClassifierConfig:
     block: bool = False
     #: Chunks one scan may classify, across every file it was given.
     max_chunks: int = 400
+    #: Also guess each failure's triage class, for the ledger only. Costs one
+    #: request per triaged failure and changes no decision the loop makes.
+    shadow: bool = True
     allow_remote: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -183,13 +220,14 @@ class Classifier:
         return self._up
 
     def ask(self, question: str, options: list[str],
-            items: list[dict]) -> list[dict]:
+            items: list[dict], criteria: dict[str, str] | None = None) -> list[dict]:
         """Classify *items*, batched. Returns whatever came back, or ``[]``."""
         url = f"{self.cfg.base_url.rstrip('/')}/classify"
         out: list[dict] = []
         for at in range(0, len(items), BATCH):
             payload = {"model": self.cfg.model, "question": question,
                        "options": options, "items": items[at:at + BATCH],
+                       **({"criteria": criteria} if criteria else {}),
                        **self.cfg.extra}
             try:
                 answer = _post(url, payload, self.cfg.timeout)
@@ -202,6 +240,27 @@ class Classifier:
             if isinstance(results, list):
                 out.extend(r for r in results if isinstance(r, dict))
         return out
+
+    def guess(self, question: str, criteria: dict[str, str],
+              text: str) -> Guess | None:
+        """Pick one of *criteria*'s labels for *text*, or ``None``.
+
+        ``None`` covers every way of not having an answer -- disabled, down,
+        or a label outside the options -- because a shadow guess that is
+        wrong about its own vocabulary is not a guess anyone can score.
+        """
+        if not self.cfg.enabled or not text.strip() or not self.available():
+            return None
+        for result in self.ask(question, list(criteria),
+                               [{"id": "g0", "text": text}], criteria):
+            label = str(result.get("label") or "").strip()
+            try:
+                confidence = float(result.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if label in criteria:
+                return Guess(label, confidence)
+        return None
 
     def scan(self, sources: dict[str, str]) -> list[Finding]:
         """Classify every chunk of *sources*, keeping what looks like a defect.

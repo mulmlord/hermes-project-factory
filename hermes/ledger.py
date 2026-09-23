@@ -30,6 +30,12 @@ is wrong is worse than a fixed one that is merely unproven:
 Cold, with no rows at all, every one of those rules falls through to the
 ladder, and the factory behaves exactly as it did before this existed.
 
+It also keeps a second, smaller record: guesses a cheap classifier made in
+*shadow* about a decision the factory already makes another way, kept beside
+the answer that was actually used. Nothing reads those rows back into a
+decision. They are how "the classifier could triage failures" would stop
+being an opinion too; see :mod:`hermes.classify`.
+
 The database lives outside every workspace -- it is the factory's memory, not
 any one project's -- and it is advisory: a lost or corrupt ledger costs the
 learning and nothing else, which is why every method here swallows its own
@@ -47,7 +53,7 @@ from pathlib import Path
 
 from .log import Logger, NULL
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: A rung as the ledger stores it: samples raced, existing sources shown, the
 #: role asked, and whether the answer was demanded as complete files rather
@@ -74,6 +80,10 @@ KEEP = 50_000
 #: back, which says nothing about the rung and is never counted for or
 #: against it.
 FIXED, FAILED, ABANDONED = "fixed", "failed", "abandoned"
+
+#: The shadow question about a failed attempt: which of the triager's classes
+#: it belongs to. The key the rows are stored under, not the text asked.
+TRIAGE = "triage"
 
 
 def default_path() -> Path:
@@ -130,6 +140,30 @@ class Evidence:
         return (f"{self.candidates}x{self.files} {role}: "
                 f"{self.fixed}/{self.tried} fixed ({self.rate:.0%}, "
                 f"confidence {self.confidence:.0%})")
+
+
+@dataclass(frozen=True)
+class Agreement:
+    """How often one shadow guess matched the answer the factory used."""
+
+    guess: str
+    agreed: int = 0
+    seen: int = 0
+
+    @property
+    def rate(self) -> float:
+        return self.agreed / self.seen if self.seen else 0.0
+
+    @property
+    def confidence(self) -> float:
+        """Lower bound of the agreement rate, for the same reason as
+        :attr:`Evidence.confidence`: a handful of lucky matches is not a
+        classifier anyone should hand a decision to."""
+        return wilson(self.agreed, self.seen)
+
+    def describe(self) -> str:
+        return (f"{self.guess}: {self.agreed}/{self.seen} agreed "
+                f"({self.rate:.0%}, confidence {self.confidence:.0%})")
 
 
 @dataclass(frozen=True)
@@ -213,6 +247,20 @@ class Ledger:
             );
             CREATE INDEX IF NOT EXISTS attempt_lookup
                 ON attempt(signature, stack, candidates, files, role, whole);
+            CREATE TABLE IF NOT EXISTS shadow (
+                id         INTEGER PRIMARY KEY,
+                at         REAL    NOT NULL,
+                question   TEXT    NOT NULL,
+                project    TEXT    NOT NULL DEFAULT '',
+                stack      TEXT    NOT NULL DEFAULT '',
+                kind       TEXT    NOT NULL DEFAULT '',
+                signature  TEXT    NOT NULL DEFAULT '',
+                attempt    INTEGER NOT NULL DEFAULT 1,
+                guess      TEXT    NOT NULL,
+                confidence REAL    NOT NULL DEFAULT 0,
+                answer     TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS shadow_lookup ON shadow(question, guess);
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
             );
@@ -276,7 +324,46 @@ class Ledger:
         except sqlite3.Error as exc:
             self.log.warn("ledger.write_failed", error=str(exc)[:200])
 
+    def record_guess(self, question: str, guess: str, confidence: float,
+                     answer: str, *, project: str = "", stack: str = "",
+                     kind: str = "", signature: str = "", attempt: int = 1) -> None:
+        """Record a shadow *guess* at *question* beside the *answer* used."""
+        if not self.ok:
+            return
+        try:
+            self._conn().execute(
+                "INSERT INTO shadow(at, question, project, stack, kind, signature,"
+                " attempt, guess, confidence, answer) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (time.time(), question[:40], project[:80], stack[:40], kind[:40],
+                 signature[:80], attempt, guess[:40], round(confidence, 4),
+                 answer[:40]))
+        except sqlite3.Error as exc:
+            self.log.warn("ledger.write_failed", error=str(exc)[:200])
+
     # -- reading ---------------------------------------------------------
+    def agreement(self, question: str, *, above: float = 0.0) -> list[Agreement]:
+        """How often each shadow guess at *question* matched, most-seen first.
+
+        Grouped by what was guessed rather than by what was true, because
+        the question a promotion has to answer is "when it says X, is it
+        right" -- and restricted to guesses at or *above* a confidence, since
+        a classifier that is only ever handed its confident answers is judged
+        on those alone.
+        """
+        if not self.ok:
+            return []
+        try:
+            rows = self._conn().execute(
+                "SELECT guess, COUNT(*) AS seen, SUM(guess = answer) AS agreed"
+                " FROM shadow WHERE question = ? AND confidence >= ?"
+                " GROUP BY guess ORDER BY seen DESC, guess",
+                (question, above)).fetchall()
+            return [Agreement(row["guess"], row["agreed"] or 0, row["seen"])
+                    for row in rows]
+        except sqlite3.Error as exc:
+            self.log.warn("ledger.read_failed", error=str(exc)[:200])
+            return []
+
     def evidence(self, signature: str, *, stack: str = "") -> list[Evidence]:
         """Every rung ever tried against *signature*, most-watched first.
 
@@ -389,6 +476,10 @@ class Ledger:
                 "DELETE FROM attempt WHERE id NOT IN"
                 " (SELECT id FROM attempt ORDER BY id DESC LIMIT ?)", (keep,))
             dropped = cursor.rowcount or 0
+            dropped += conn.execute(
+                "DELETE FROM shadow WHERE id NOT IN"
+                " (SELECT id FROM shadow ORDER BY id DESC LIMIT ?)",
+                (keep,)).rowcount or 0
             if dropped:
                 conn.execute("VACUUM")
             return dropped
@@ -409,7 +500,13 @@ class NullLedger:
     def record(self, *_args, **_kwargs) -> None:
         return None
 
+    def record_guess(self, *_args, **_kwargs) -> None:
+        return None
+
     def evidence(self, *_args, **_kwargs) -> list[Evidence]:
+        return []
+
+    def agreement(self, *_args, **_kwargs) -> list[Agreement]:
         return []
 
     def advice(self, signature: str, default: Spec,

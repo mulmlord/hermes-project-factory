@@ -6012,7 +6012,7 @@ def test_the_failure_signature_names_the_class_and_not_the_text(tmp_path):
     assert signature_of(failing("ticket:T-12", detail="x")) == "gates:ticket"
 
 
-def _always_fails(tmp_path, ledger, state=None, ladder=None):
+def _always_fails(tmp_path, ledger, state=None, ladder=None, classifier=None):
     """Run one ticket whose gates never pass, recording every attempt."""
     sandbox, board, ticket, built = _escalating_ticket(tmp_path)
     asked: list[tuple[str, int]] = []
@@ -6036,7 +6036,8 @@ def _always_fails(tmp_path, ledger, state=None, ladder=None):
     outcome = execute_ticket(agents, sandbox, state or built, board, ticket,
                              lambda: "src/a.py", max_attempts=3,
                              ladder=ladder or Ladder.from_config(Config(DEFAULTS)),
-                             ledger=ledger, project="carrier")
+                             ledger=ledger, project="carrier",
+                             classifier=classifier)
     return outcome, asked
 
 
@@ -6054,6 +6055,120 @@ def test_running_a_ticket_leaves_the_factory_something_to_learn_from(tmp_path):
     # the two after it are recorded against the one they were handed.
     assert sum(row.tried for row in ledger.evidence("gates:ticket")) == 2
     assert ledger.evidence("")[0].tried == 1
+
+
+def test_the_classifier_guesses_every_triage_in_shadow_and_decides_nothing(tmp_path):
+    """The guess goes to the ledger beside the triager's answer, and the run
+    is the same run it would have been without a classifier at all."""
+    from hermes.classify import TRIAGE_LABELS
+    from hermes.ledger import TRIAGE
+    (tmp_path / "plain").mkdir()
+    (tmp_path / "shadowed").mkdir()
+    plain, shadowed = _ledger(tmp_path / "plain"), _ledger(tmp_path / "shadowed")
+
+    expected, asked = _always_fails(tmp_path / "plain", plain)
+    with _classifier_service(
+            lambda text: {"label": "trivial", "confidence": 0.9}) as (url, sent):
+        outcome, shadow_asked = _always_fails(tmp_path / "shadowed", shadowed,
+                                              classifier=_classifier(url))
+
+    assert (outcome["status"], outcome["action"]) == (expected["status"],
+                                                      expected["action"])
+    assert shadow_asked == asked
+    assert plain.stats()["attempts"] == shadowed.stats()["attempts"]
+    # One guess per triaged failure, asked in the triager's own vocabulary;
+    # the security scan's requests share the service and are not counted.
+    guesses = [payload for payload in sent if "criteria" in payload]
+    assert len(guesses) == 3
+    assert guesses[0]["options"] == list(TRIAGE_LABELS)
+    assert guesses[0]["criteria"] == TRIAGE_LABELS
+    assert "grep -q good" in guesses[0]["items"][0]["text"]
+    [row] = shadowed.agreement(TRIAGE)
+    assert (row.guess, row.agreed, row.seen) == ("trivial", 0, 3)
+    assert not plain.agreement(TRIAGE)
+
+
+def test_shadow_triage_can_be_switched_off_without_losing_the_security_scan(tmp_path):
+    from hermes.ledger import TRIAGE
+    ledger = _ledger(tmp_path)
+
+    with _classifier_service(
+            lambda text: {"label": "trivial", "confidence": 0.9}) as (url, sent):
+        _always_fails(tmp_path, ledger, classifier=_classifier(url, shadow=False))
+
+    assert not any("criteria" in payload for payload in sent)
+    assert not ledger.agreement(TRIAGE)
+
+
+def test_a_dead_classifier_costs_the_shadow_and_nothing_else(tmp_path):
+    from hermes.ledger import TRIAGE
+    ledger = _ledger(tmp_path)
+
+    outcome, _ = _always_fails(tmp_path, ledger,
+                               classifier=_classifier("http://127.0.0.1:9", timeout=2))
+
+    assert outcome["status"] == "failed"
+    assert ledger.stats()["attempts"] == 3
+    assert not ledger.agreement(TRIAGE)
+
+
+def test_agreement_is_judged_per_guess_and_on_the_confident_ones_alone(tmp_path):
+    """Promotion asks "when it says X, is it right" -- of the answers it
+    would actually be handed, which are the confident ones."""
+    from hermes.ledger import TRIAGE
+    ledger = _ledger(tmp_path)
+    for guess, confidence, answer in [
+            ("trivial", 0.9, "trivial"), ("trivial", 0.9, "trivial"),
+            ("trivial", 0.3, "implementation"), ("environment", 0.95, "environment"),
+            ("environment", 0.2, "flaky")]:
+        ledger.record_guess(TRIAGE, guess, confidence, answer)
+    ledger.record_guess("other", "trivial", 0.9, "flaky")
+
+    every = {row.guess: (row.agreed, row.seen) for row in ledger.agreement(TRIAGE)}
+    sure = {row.guess: (row.agreed, row.seen)
+            for row in ledger.agreement(TRIAGE, above=0.75)}
+
+    assert every == {"trivial": (2, 3), "environment": (1, 2)}
+    assert sure == {"trivial": (2, 2), "environment": (1, 1)}
+    # Two agreements are two agreements, not a proven classifier.
+    assert ledger.agreement(TRIAGE, above=0.75)[0].confidence < 0.5
+
+
+def test_a_guess_outside_the_triagers_vocabulary_is_not_a_guess(tmp_path):
+    """A label the triager cannot give can never agree with it, and scoring
+    it as a disagreement would blame the classifier for a protocol fault."""
+    with _classifier_service(lambda text: {"label": "banana", "confidence": 0.99}) as (url, _):
+        assert _classifier(url).guess("q", {"trivial": "a typo"}, "boom") is None
+    with _classifier_service(lambda text: {"label": "trivial", "confidence": 0.6}) as (url, _):
+        guess = _classifier(url).guess("q", {"trivial": "a typo"}, "boom")
+    assert (guess.label, guess.confidence) == ("trivial", 0.6)
+
+
+def test_the_shadow_speaks_the_triagers_vocabulary():
+    """Agreement is only meaningful if both sides choose from the same words."""
+    from hermes.classify import TRIAGE_LABELS
+    from hermes.prompts import TRIAGE_SHAPE
+    assert list(TRIAGE_LABELS) == TRIAGE_SHAPE["properties"]["classification"]["enum"]
+
+
+def test_the_shadow_report_separates_confident_guesses(tmp_path, monkeypatch, capsys):
+    from hermes.cli import main
+    from hermes.ledger import TRIAGE, open_ledger
+    monkeypatch.setenv("HERMES_LEDGER", str(tmp_path / "factory.db"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    ledger = open_ledger()
+    ledger.record_guess(TRIAGE, "trivial", 0.9, "trivial")
+    ledger.record_guess(TRIAGE, "flaky", 0.2, "implementation")
+    ledger.close()
+
+    assert main(["ledger", "--shadow"]) == 0
+    out = capsys.readouterr().out
+
+    every, sure = out.split("confidence >=")
+    assert "all: 1/2 agreed" in every and "flaky: 0/1" in every
+    assert "all: 1/1 agreed" in sure and "flaky" not in sure
 
 
 def test_the_toolchain_is_recorded_with_the_attempt(tmp_path):

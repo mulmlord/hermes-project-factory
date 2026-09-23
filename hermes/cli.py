@@ -244,6 +244,8 @@ def cmd_ledger(args) -> int:
     if args.prune:
         print(f"dropped {ledger.prune()} old attempt(s)")
         return 0
+    if args.shadow:
+        return _shadow_report(ledger, _config(args))
     since = stats.get("since") or 0
     print(f"{stats['path']}\n{stats['attempts']} attempt(s) across "
           f"{stats['projects']} project(s), {stats['repaired']:.0%} repaired"
@@ -270,6 +272,31 @@ def cmd_ledger(args) -> int:
             # hidden: "not yet enough to act on" is the useful thing to know
             # about it, and hiding it reads as "never tried".
             mark = " " if row.tried >= MIN_EVIDENCE else "?"
+            print(f"  {mark} {row.describe()}")
+    return 0
+
+
+def _shadow_report(ledger, config) -> int:
+    """How often the classifier's shadow triage matched the triager's.
+
+    Shown twice: every guess, and only the guesses at or above the
+    configured threshold, because a classifier promoted to decide would be
+    handed the confident ones and judged on those alone.
+    """
+    from .ledger import MIN_EVIDENCE, TRIAGE, Agreement
+    threshold = float(config.get("security.classifier.threshold") or 0.0)
+    for title, above in (("every guess", 0.0),
+                         (f"confidence >= {threshold:.0%}", threshold)):
+        rows = ledger.agreement(TRIAGE, above=above)
+        total = Agreement("all", sum(r.agreed for r in rows),
+                          sum(r.seen for r in rows))
+        print(f"\ntriage shadow, {title}")
+        if not rows:
+            print("  nothing recorded; the classifier has not been asked yet"
+                  if not above else "  no guess cleared the threshold")
+            continue
+        for row in [total] + rows:
+            mark = " " if row.seen >= MIN_EVIDENCE else "?"
             print(f"  {mark} {row.describe()}")
     return 0
 
@@ -831,6 +858,8 @@ def build_parser() -> argparse.ArgumentParser:
     ledger.add_argument("-n", "--lines", type=int, default=12)
     ledger.add_argument("--prune", action="store_true",
                         help="drop the oldest attempts beyond the cap")
+    ledger.add_argument("--shadow", action="store_true",
+                        help="how often the classifier's guesses matched triage")
     ledger.set_defaults(func=cmd_ledger)
 
     context = sub.add_parser(

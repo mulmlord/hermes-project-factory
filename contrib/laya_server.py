@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A local classification service for the Hermes security gate.
 
+Also asked, in shadow, what class of failure a broken attempt is; see
+:mod:`hermes.classify`.
+
 Hermes talks to this over HTTP rather than importing it, because a classifier
 wants torch and transformers and Hermes deliberately wants neither. Run it
 beside the inference server, on the same machine, and point
@@ -75,15 +78,21 @@ class Model:
         self.agent = laya.load(name, **kwargs)
 
     def classify(self, question: str, options: list[str],
-                 items: list[dict], escalate_below: float) -> list[dict]:
+                 items: list[dict], escalate_below: float,
+                 criteria: dict[str, str] | None = None) -> list[dict]:
         """One forward pass per chunk. Chunks are separate states, and the
         SDK batches questions about one state rather than many states, so the
         batching here is over the request rather than inside a predict call.
+
+        *criteria* are descriptions the caller sent with the request; they
+        win over this adapter's own, which only know the security labels.
         """
-        questions = {"vulnerability": {
+        criteria = criteria or {}
+        questions = {"answer": {
             "type": "choice",
             "instructions": question,
-            "criteria": {opt: DESCRIPTIONS.get(opt, opt) for opt in options},
+            "criteria": {opt: criteria.get(opt) or DESCRIPTIONS.get(opt, opt)
+                         for opt in options},
         }}
         results = []
         for item in items:
@@ -91,7 +100,7 @@ class Model:
             if not text.strip():
                 continue
             try:
-                answer = self.agent.predict(text, questions)["answers"]["vulnerability"]
+                answer = self.agent.predict(text, questions)["answers"]["answer"]
                 label = str(answer["choice"])
                 confidence = float(answer["confidence"])
             except Exception as exc:  # noqa: BLE001 - one bad chunk is not an outage
@@ -130,10 +139,13 @@ def handler(model: Model, escalate_below: float):
                 size = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(size) or b"{}")
                 items = [i for i in payload.get("items") or [] if isinstance(i, dict)]
+                criteria = payload.get("criteria")
                 results = model.classify(
                     str(payload.get("question") or ""),
                     [str(o) for o in payload.get("options") or []],
-                    items, escalate_below)
+                    items, escalate_below,
+                    {str(k): str(v) for k, v in criteria.items()}
+                    if isinstance(criteria, dict) else None)
             except Exception as exc:  # noqa: BLE001 - answer with the reason
                 self._send(400, {"error": str(exc)[:400]})
                 return

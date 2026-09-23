@@ -631,7 +631,7 @@ rate against your own code, and `block` is worth setting only after that.
 ```
 project/
 ├── CONTEXT.md          always-current orientation
-├── AGENTS.md           rules for whoever works on this next
+├── AGENTS.md           the conventional agent guide, filled from the plan
 ├── SPEC.md  PLAN.md    what and how
 ├── src/  tests/  benchmarks/
 ├── experiments/        one directory per experiment: program, runs, record

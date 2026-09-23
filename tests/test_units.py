@@ -4486,10 +4486,15 @@ def test_the_ladder_refuses_to_credit_the_planner_fallback_command(tmp_path):
     assert graded.total == 5 and graded.passed == 5
 
 
-def test_a_file_named_like_a_test_is_not_a_test(tmp_path):
-    """The trap the rung exists for: `unittest discover` over a directory with
-    no tests in it exits 0, so a project that wrote none reports the same green
-    suite as one that wrote them and passed."""
+def test_a_green_test_command_is_not_evidence_that_tests_exist(tmp_path):
+    """Why `tests-present` is read from the source instead of inferred from the
+    rung below it.
+
+    A test command that ran nothing still exits 0 -- an `echo` standing in for
+    a suite, a wrapper script that swallows its own failure -- and a file named
+    `test_widget.py` holding no test function is free. Writing no tests at all
+    is otherwise the cheapest way for the factory to report a green suite.
+    """
     root = tmp_path / "hollow"
     (root / "widget").mkdir(parents=True)
     (root / "widget" / "__init__.py").write_text("def add(a, b):\n    return a + b\n")
@@ -4497,7 +4502,7 @@ def test_a_file_named_like_a_test_is_not_a_test(tmp_path):
     (root / "tests" / "test_widget.py").write_text(
         "from widget import add\n\n\ndef check_add():\n    assert add(1, 1) == 2\n")
     graded = harness.grade(root, {"runtime": "local"},
-                           {"test": f"{PROJECT_PYTHON} -m unittest discover -s tests"})
+                           {"test": "echo 'no tests to run'"})
     assert graded.verdicts()["tests-pass"] == "pass"
     assert graded.verdicts()["tests-present"] == "FAIL"
 

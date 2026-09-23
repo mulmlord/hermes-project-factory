@@ -484,7 +484,7 @@ def test_the_schema_reaches_the_server_as_the_shape_asked_for(refusing_server,
     router.complete_json("coding", "sys", "prompt", schema=prompts.TOPICS)
     sent = refusing_server["requests"][0]["response_format"]
     assert sent["type"] == "json_schema"
-    assert sent["json_schema"]["schema"]["required"] == ["needed", "topics"]
+    assert sent["json_schema"]["schema"]["required"] == ["topics", "needed"]
     # Never the OpenAI-only flag: it means "every property required, no
     # others allowed", which is not what any shape here says.
     assert "strict" not in sent["json_schema"]
@@ -568,6 +568,62 @@ def test_every_shape_is_satisfied_by_an_empty_object(text, shape):
     assert len(schema.check(shape, {}, limit=99)) == len(shape.get("required", []))
 
 
+@pytest.mark.parametrize("text,shape", SHAPES, ids=range(len(SHAPES)))
+def test_no_shape_asks_for_a_verdict_before_the_evidence_for_it(text, shape):
+    """A decoder writes keys in order, so the order is the order of thought.
+
+    A model that has already written ``"approved": true`` writes its reasons
+    to fit. Checked in both orders a grammar may emit: XGrammar keeps the
+    declared order, llama.cpp writes every required key before any optional
+    one -- so evidence left optional is hoisted below the verdict there.
+    """
+    for where, keys in _objects(shape):
+        for order in (keys, sorted(keys, key=lambda k: not k[2])):
+            names = [name for name, _, _ in order]
+            kinds = [kind for _, kind, _ in order]
+            if "verdict" in kinds:
+                assert "evidence" in kinds[: kinds.index("verdict")], (
+                    f"{where}: {names[kinds.index('verdict')]!r} is written "
+                    f"before anything that explains it, in the order {names}")
+
+
+def test_a_reordered_prompt_still_shows_the_evidence_first():
+    """The example the model reads must agree with the grammar it is held to."""
+    for text, first, verdict in ((prompts.REVIEW, '"blocking"', '"approved"'),
+                                 (prompts.mutation_screen(1), '"reason"', '"observable"'),
+                                 (prompts.EXPERIMENT_VERDICT, '"finding"', '"verdict"')):
+        assert text.index(first) < text.index(verdict)
+
+
+def _objects(shape, where="reply"):
+    """Every object in *shape*, as (name, kind, required) in declared order.
+
+    A verdict is a boolean or a closed vocabulary; evidence is prose, or a
+    list of findings. Anything else -- an index, a count, a nested object -- is
+    neither and does not count for or against the order.
+    """
+    if not isinstance(shape, dict) or not shape:
+        return
+    properties = shape.get("properties", {})
+    if properties:
+        required = set(shape.get("required", ()))
+        yield where, [(name, _kind(sub), name in required)
+                      for name, sub in properties.items()]
+    for name, sub in properties.items():
+        yield from _objects(sub, f"{where}.{name}")
+    yield from _objects(shape.get("items", {}), f"{where}[]")
+    for branch in shape.get("anyOf", []):
+        yield from _objects(branch, where)
+
+
+def _kind(sub) -> str:
+    if sub.get("type") == "boolean" or "enum" in sub:
+        return "verdict"
+    if sub.get("type") == "string" or sub.get("type") == "array":
+        return "evidence"
+    return "other"
+
+
 def _keys(shape) -> set:
     """Every property name anywhere in *shape*."""
     found = set()
@@ -614,11 +670,13 @@ def test_either_shape_of_a_tool_using_reply_satisfies_the_union():
     """An agent holding lookups may answer or may ask, and the grammar
     must not take the second option away."""
     union = schema.any_of(prompts.REVIEW_SHAPE, LOOKUP_REQUEST)
-    assert schema.check(union, {"approved": True, "reason": "fine"}) == []
+    review = {"blocking": [], "security": [], "reason": "fine",
+              "meets_acceptance": True, "approved": True}
+    assert schema.check(union, review) == []
     assert schema.check(union, {"lookup": [{"tool": "read_file",
                                             "path": "src/x.py"}]}) == []
     # Neither: the complaint comes from the nearest branch, not from both.
-    faults = schema.check(union, {"approved": True})
+    faults = schema.check(union, {k: v for k, v in review.items() if k != "reason"})
     assert len(faults) == 1 and "reason" in faults[0]
 
 

@@ -217,6 +217,8 @@ DEFAULTS: dict[str, Any] = {
             "threshold": 0.75,   # calibrate the checkpoint before trusting this
             "block": False,      # let a finding fail the gate, not just warn
             "max_chunks": 400,   # windows one scan may classify
+            "shadow": True,      # also guess each failure's triage class, for
+                                 # the ledger only; see `hermes ledger --shadow`
         },
     },
     "git": {"enabled": True, "author": "Hermes Factory <hermes@localhost>"},

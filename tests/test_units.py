@@ -1,6 +1,8 @@
 """Unit checks for the logic that has to be right for the loop to terminate."""
 import ast
 import contextlib
+import importlib
+import itertools
 import json
 import os
 import random
@@ -8,6 +10,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 
@@ -4381,6 +4384,165 @@ def test_partial_credit_ranks_a_suite_nobody_finished():
     assert "resolution     NONE" not in harness.summarise(trials)
     unscored = [harness.Trial(name="a", holdout_total=20, holdout_note="pytest missing")]
     assert "unscored       a" in harness.summarise(unscored)
+
+
+# -- the grading ladder ------------------------------------------------------
+
+PROJECT_PYTHON = shlex.quote(sys.executable)
+
+
+def _workspace(root: Path) -> dict:
+    """A tiny project shaped like what the factory ships, plus the commands its
+    plan would carry: a package, tests beside it, a benchmark printing a score.
+    """
+    (root / "widget").mkdir(parents=True)
+    (root / "widget" / "__init__.py").write_text("def add(a, b):\n    return a + b\n")
+    (root / "tests").mkdir()
+    (root / "tests" / "test_widget.py").write_text(
+        "from widget import add\n\n\ndef test_add_sums_its_arguments():\n"
+        "    assert add(1, 1) == 2\n")
+    (root / "bench.py").write_text("print('SCORE: 0.25')\n")
+    return {"setup": "true",
+            "build": f"{PROJECT_PYTHON} -c 'import widget'",
+            "test": f"{PROJECT_PYTHON} -m pytest -q tests",
+            "benchmark": f"{PROJECT_PYTHON} bench.py"}
+
+
+#: Three independent ways to take something away from that project, one per
+#: rung family: the code, the tests, and a command the plan declared.
+DEGRADATIONS = ("break-import", "drop-tests", "drop-benchmark")
+
+
+def _degrade(root: Path, applied: frozenset, commands: dict) -> dict:
+    if "break-import" in applied:
+        (root / "widget" / "__init__.py").write_text("import nosuchthirdparty\n")
+    if "drop-tests" in applied:
+        shutil.rmtree(root / "tests")
+    if "drop-benchmark" in applied:
+        commands = {k: v for k, v in commands.items() if k != "benchmark"}
+    return commands
+
+
+def test_the_ladder_never_pays_for_taking_something_away(tmp_path):
+    """Every subset of three ways to break a healthy project, graded and
+    compared pairwise.
+
+    Rungs *passed* must fall or hold as more is removed, never rise. The rate
+    is deliberately not the quantity under test: dropping a rung the project
+    was failing raises the rate, and that is precisely the accounting that
+    would let a factory improve its score by deleting its own benchmark.
+    """
+    passed = {}
+    for size in range(len(DEGRADATIONS) + 1):
+        for applied in itertools.combinations(DEGRADATIONS, size):
+            root = tmp_path / ("-".join(applied) or "healthy")
+            commands = _degrade(root, frozenset(applied), _workspace(root))
+            passed[frozenset(applied)] = harness.grade(
+                root, {"runtime": "local"}, commands).passed
+    assert passed[frozenset()] == 6, "a healthy project is asked and passes every rung"
+    for smaller, more in passed.items():
+        for bigger, fewer in passed.items():
+            if smaller < bigger:
+                assert fewer <= more, (sorted(smaller), sorted(bigger))
+    assert passed[frozenset(DEGRADATIONS)] < passed[frozenset()]
+
+
+def test_the_import_rung_names_what_a_real_repository_offers():
+    """Run over this repository, because a rung calibrated only on fixtures is
+    calibrated on what its author already believed. It must find the package
+    and nothing else -- not `tests`, not `contrib`, not `setup.py` -- and every
+    name it returns must actually import.
+    """
+    names = harness.importable(Path(__file__).resolve().parent.parent)
+    assert names == ["hermes"]
+    for name in names:
+        importlib.import_module(name)
+
+
+def test_counting_test_functions_agrees_with_the_held_out_counter():
+    """Two counters written for different jobs, over the same real files: if
+    they disagree, one of them is wrong about what a test is."""
+    for task in LIBRARIES:
+        folder = harness.SUITE_DIR / task.name
+        assert harness.test_functions(folder) == len(harness.expected_tests(folder))
+
+
+def test_a_run_that_produced_nothing_is_graded_zero_of_one(tmp_path):
+    """0 of 0 reads as unmeasured. A factory that built nothing was measured
+    and failed, and the suite has to be able to tell those two apart."""
+    graded = harness.grade(tmp_path / "never-created", {"runtime": "local"}, {})
+    assert (graded.passed, graded.total) == (0, 1)
+    assert graded.verdicts() == {"exports": "FAIL"}
+
+
+def test_the_ladder_refuses_to_credit_the_planner_fallback_command(tmp_path):
+    """`true` is what planning writes when the architect named no build, so
+    crediting it would hand a rung to every project that skipped the question.
+    """
+    root = tmp_path / "fallback"
+    commands = _workspace(root)
+    graded = harness.grade(root, {"runtime": "local"}, dict(commands, build="true"))
+    assert graded.verdicts()["builds"] == "skip"
+    assert graded.total == 5 and graded.passed == 5
+
+
+def test_a_file_named_like_a_test_is_not_a_test(tmp_path):
+    """The trap the rung exists for: `unittest discover` over a directory with
+    no tests in it exits 0, so a project that wrote none reports the same green
+    suite as one that wrote them and passed."""
+    root = tmp_path / "hollow"
+    (root / "widget").mkdir(parents=True)
+    (root / "widget" / "__init__.py").write_text("def add(a, b):\n    return a + b\n")
+    (root / "tests").mkdir()
+    (root / "tests" / "test_widget.py").write_text(
+        "from widget import add\n\n\ndef check_add():\n    assert add(1, 1) == 2\n")
+    graded = harness.grade(root, {"runtime": "local"},
+                           {"test": f"{PROJECT_PYTHON} -m unittest discover -s tests"})
+    assert graded.verdicts()["tests-pass"] == "pass"
+    assert graded.verdicts()["tests-present"] == "FAIL"
+
+
+def _graded(name: str, verdicts: dict) -> harness.Trial:
+    return harness.Trial(
+        name=name, grade_gates=verdicts,
+        grade_passed=sum(1 for v in verdicts.values() if v == "pass"),
+        grade_total=sum(1 for v in verdicts.values() if v != "skip"))
+
+
+def test_the_ladder_ranks_two_suites_that_finished_nothing():
+    """`completed` is one bit, and two factories that both finish nothing are
+    not equally good: one stopped at imports, the other at its own tests."""
+    early = _graded("a", {"exports": "pass", "imports": "FAIL",
+                          "tests-present": "FAIL", "tests-pass": "FAIL"})
+    late = _graded("b", {"exports": "pass", "imports": "pass",
+                         "tests-present": "pass", "tests-pass": "FAIL"})
+    text = harness.summarise([early, late])
+    assert "resolution     NONE" not in text
+    assert "2 distinct ladder rate(s)" in text
+    assert "ladder         50% of 8 rung(s) asked across 2 task(s)" in text
+    assert "exports 2/2" in text and "imports 1/2" in text
+    assert "tests-pass 0/2" in text and "builds" not in text
+    assert "rungs=1/4" in early.row()
+    assert "ungraded" not in text
+    assert "ungraded       c" in harness.summarise(
+        [harness.Trial(name="c", grade_note="the sandbox would not start")])
+
+
+def test_compare_reads_a_pair_that_moved_only_on_the_ladder(tmp_path):
+    """Three more projects importing, with the same tasks finished and the same
+    first-pass rate, is exactly the change pass/fail accounting called no
+    evidence."""
+    def report(name, rungs):
+        trial = harness.Trial(name="roman", model_calls=9, grade_passed=rungs,
+                              grade_total=5)
+        harness.write_report(tmp_path / name, [trial])
+        return tmp_path / name / "results.json"
+
+    text = harness.compare(report("before", 2), report("after", 4))
+    assert "rungs 2/5 -> 4/5" in text
+    assert "1 of 1 task(s) moved: roman" in text
+    assert "does not support" in harness.compare(report("b2", 2), report("a2", 2))
+
 
 
 # -- self-improvement --------------------------------------------------------

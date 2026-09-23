@@ -744,6 +744,24 @@ is the premature termination NL2Repo-Bench names as the first failure of
 long-horizon agents. And `hermes improve` refuses a change that passes fewer
 held-out tests, whatever it did to the first-pass rate.
 
+The eight one-line ideas get partial credit too, from a ladder rather than a
+held-out suite. The committed tree is exported the same way and graded on six
+rungs — `exports`, `builds`, `imports`, `tests-present`, `tests-pass` and
+`benchmark` — each a stronger claim about the deliverable than the one before
+it, and each answered either by a command the project's own plan declared or
+from its own source, so the ladder costs sandbox time and no inference at all.
+Eight tasks scored pass/fail are eight bits, and at that N a real improvement
+and a run of luck look alike; a factory whose projects now import where they
+used to only export has visibly done better, and the report says so without
+anyone adding tasks. A rung the project never declared — no build command, no
+benchmark — is skipped and left out of the denominator, because an unasked
+question is not a failed one, and `true`, which planning writes when the
+architect named no build, counts as no command rather than as a passed one. A
+run that produced nothing scores 0 of 1 rather than the 0 of 0 that would read
+as unmeasured. Under the totals the report prints one line per rung, which
+says where the suite is losing its projects rather than only that the number
+moved.
+
 Each task also gets a wall-clock ceiling (`--budget MINUTES`, 30 by default),
 because iterations bound how many phases run rather than how long one takes,
 and without it a single stuck command lets one idea consume the whole run. A
@@ -755,8 +773,9 @@ is printed as `unaccounted`, time both ledgers claim is printed as `overlap`
 (prefetch generates while gates run, so the two may legitimately exceed the
 clock), and a suite where every task passed identically, or none passed at
 all, is labelled as having no resolution — real numbers that still cannot rank
-one factory against another. `--compare` says the same thing about a pair of
-runs where nothing moved.
+one factory against another, unless the held-out tests or the ladder can tell
+the runs apart after all. `--compare` says the same thing about a pair of runs
+where nothing moved.
 
 This exists because everything else in this section is a trade. Constrained
 decoding, search/replace edits, workspace lookups, prefetching the next
@@ -833,7 +852,10 @@ halfway through.
   from a worse one on your model is exactly what the `resolution` line will
   tell you the first time you run it. The held-out tests are calibrated
   against a hand-written reference solution, not against anything a model
-  wrote, so no number yet shows where a local model lands on them.
+  wrote, so no number yet shows where a local model lands on them. The ladder
+  ranks and reports but does not gate: `hermes improve` still promotes on
+  completion, first-pass rate and held-out tests, because a metric that has
+  never produced a number on a real model has not earned a veto.
 - Research works from what the model knows until you set
   `research.network: true`, which buys it real sources within a page, search,
   byte and time budget. The search and retrieval path is exercised against a

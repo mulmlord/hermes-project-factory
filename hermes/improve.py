@@ -84,7 +84,7 @@ TARGETS: dict[str, tuple[str, ...]] = {
     "routing": ("hermes/models.py",),
     "prompts": ("hermes/prompts.py", "hermes/agents.py"),
     "lookups": ("hermes/tools.py",),
-    "evaluation": ("hermes/verify.py", "hermes/mutate.py"),
+    "evaluation": ("hermes/verify.py", "hermes/mutate.py", "hermes/tamper.py"),
     "candidates": ("hermes/evolve.py",),
     "scheduling": ("hermes/tickets.py",),
     "caching": ("hermes/models.py",),

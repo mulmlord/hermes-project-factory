@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .config import Config
+from .verify import Gate, SOURCE_SUFFIXES, Verification, run_commands
 
 #: Requirements documents and the held-out tests that score them, one folder
 #: per library task. Shipped with the package and protected from
@@ -218,6 +219,211 @@ def score(task: Task, root: Path, sandbox_cfg: dict, setup: str = "") -> Holdout
         shutil.rmtree(staging, ignore_errors=True)
 
 
+#: The ladder a finished workspace is graded on, weakest rung first. Each rung
+#: is a strictly stronger claim about the deliverable than the one before it.
+#: Eight small tasks scored pass/fail are eight bits, and at that N a real
+#: improvement and a run of luck look alike; a factory that got two rungs
+#: further on three tasks has visibly done better without anyone adding tasks
+#: or spending more inference. Judged from a pristine export rather than from
+#: the factory's own gates, for the reason :func:`score` is: what a release
+#: would ship is the only thing worth grading.
+LADDER = ("exports", "builds", "imports", "tests-present", "tests-pass",
+          "benchmark")
+
+#: Per-rung wall-clock ceiling. A project that hangs its own test suite should
+#: lose that rung rather than stall the suite run queued behind it.
+GRADE_TIMEOUT = 300
+
+#: Directories whose Python is not the deliverable. Importing a test module
+#: only reports the library's failure a second time, and ``build``/``dist``
+#: hold copies of it that would be graded twice.
+NOT_LIBRARY = frozenset({
+    "tests", "test", "docs", "benchmarks", "experiments", "research",
+    "artifacts", "examples", "scripts", "tickets", "build", "dist",
+})
+
+#: Module names that are scripts by convention. Importing one runs it, and a
+#: benchmark's whole job is to take minutes, so a rung meant to ask whether
+#: the library loads would instead be timing the sieve.
+NOT_LIBRARY_MODULES = frozenset({
+    "setup", "conftest", "main", "run", "bench", "benchmark", "demo", "example",
+})
+
+#: Written into the export, never into the workspace itself.
+IMPORT_CHECK_FILE = "hermes_import_check.py"
+
+#: Handed every top-level name at once, so the detail names each module that
+#: broke rather than only the first. ``BaseException`` on purpose: a module
+#: that parses argv at import time raises ``SystemExit``, and a library that
+#: exits the interpreter on import is one that cannot be imported.
+IMPORT_CHECK = """\
+import importlib, sys
+sys.path.insert(0, "src")
+broken = 0
+for name in sys.argv[1:]:
+    try:
+        importlib.import_module(name)
+    except BaseException as exc:
+        broken += 1
+        print("%s: %s: %s" % (name, type(exc).__name__, exc))
+sys.exit(1 if broken else 0)
+"""
+
+
+def importable(root: Path) -> list[str]:
+    """Top-level names an export offers an importer, in either layout.
+
+    Flat and ``src/`` are the two layouts the architect picks between and a
+    package sits under only one of them, so both are looked at. Where there
+    are packages they are the whole answer: importing a module runs it, and a
+    loose ``bench.py`` beside the library is a script that exists to take
+    minutes. Tests and ``setup.py`` are never the deliverable, and a name
+    starting with an underscore is private or is ``__main__``, which runs the
+    program on import.
+    """
+    packages: list[str] = []
+    modules: list[str] = []
+    for base in (Path(root), Path(root) / "src"):
+        if not base.is_dir():
+            continue
+        for entry in sorted(base.iterdir()):
+            if entry.name.startswith((".", "_")) or entry.name in NOT_LIBRARY:
+                continue
+            if entry.is_dir() and (entry / "__init__.py").is_file():
+                packages.append(entry.name)
+            elif (entry.is_file() and entry.suffix == ".py"
+                    and entry.stem not in NOT_LIBRARY_MODULES
+                    and not entry.stem.startswith("test_")
+                    and not entry.stem.endswith("_test")
+                    and entry.stem.isidentifier()):
+                modules.append(entry.stem)
+    return sorted(set(packages or modules))
+
+
+def test_functions(root: Path) -> int:
+    """Test functions an export defines, counted from its source.
+
+    From the source and not from a pytest run, because the rung below this one
+    is whether the tests pass: a project that wrote no tests would otherwise
+    report the same green suite as one that wrote them and passed, and writing
+    none is the cheapest way for the factory to look finished.
+    """
+    total = 0
+    for path in sorted(Path(root).rglob("*.py")):
+        if not (path.name.startswith("test_") or path.stem.endswith("_test")):
+            continue
+        try:
+            tree = ast.parse(path.read_text(errors="replace"))
+        except SyntaxError:
+            continue  # a test file that does not parse defines no tests
+        total += sum(1 for node in ast.walk(tree)
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                     and node.name.startswith("test_"))
+    return total
+
+
+@dataclass
+class Grade:
+    """How far a finished workspace climbed :data:`LADDER`.
+
+    A rung the project never declared -- no build command, no benchmark --
+    is skipped and left out of the denominator, because an unasked question is
+    not a failed one. ``exports`` is asked of every project, so a run that
+    produced nothing scores 0 of 1 rather than the 0 of 0 that would read as
+    unmeasured.
+    """
+
+    gates: list[Gate] = field(default_factory=list)
+    #: Why the rungs are not a measurement of the project, when they are not.
+    note: str = ""
+
+    @property
+    def passed(self) -> int:
+        return sum(1 for g in self.gates if g.passed and not g.skipped)
+
+    @property
+    def total(self) -> int:
+        return sum(1 for g in self.gates if not g.skipped)
+
+    def mark(self, name: str, passed: bool, detail: str = "",
+             skipped: bool = False) -> None:
+        self.gates.append(Gate(name, passed, detail, skipped))
+
+    def verdicts(self) -> dict[str, str]:
+        """One word per rung, which is what the report and ``compare`` read."""
+        return {g.name: ("skip" if g.skipped else "pass" if g.passed else "FAIL")
+                for g in self.gates}
+
+
+def grade(root: Path, sandbox_cfg: dict, commands: dict | None = None) -> Grade:
+    """Climb the ladder against a pristine export of the workspace.
+
+    Same export and same fresh sandbox as :func:`score`: a gate the factory
+    ran for itself is the factory's own verdict, and the run that most needs
+    grading is the one that crashed holding a workspace it never validated.
+    No rung costs inference -- each is a command the project already declared
+    or a question answered from its own source.
+    """
+    from .release import export
+    from .sandbox import Sandbox
+
+    commands = commands or {}
+    result = Grade()
+    root = Path(root)
+    if not root.is_dir():
+        result.mark("exports", False, "no workspace to grade")
+        return result
+    staging = Path(tempfile.mkdtemp(prefix="hermes-grade-", dir=root.parent))
+    try:
+        export(root, staging)
+        sources = [p for p in staging.rglob("*")
+                   if p.is_file() and p.suffix in SOURCE_SUFFIXES]
+        result.mark("exports", bool(sources), f"{len(sources)} source file(s)")
+        modules = importable(staging)
+        cases = test_functions(staging)
+        box = Sandbox(staging, dict(sandbox_cfg))
+        # The host's interpreter when the box is the host, since a bare
+        # ``python`` there may be one the project was never installed into.
+        python = "python" if box.runtime == "docker" else shlex.quote(sys.executable)
+        with box:
+            # Setup is plumbing, not a rung: a project is not better for
+            # needing dependencies, and the rungs after this one cannot run
+            # without them.
+            run_commands(box, [commands.get("setup", "")], "setup", Verification(),
+                         required=False, install=True, autofix=False)
+            _rung(box, result, "builds", commands.get("build", ""))
+            if modules:
+                box.write(IMPORT_CHECK_FILE, IMPORT_CHECK)
+                run = box.run(f"{python} {IMPORT_CHECK_FILE} {' '.join(modules)}",
+                              timeout=GRADE_TIMEOUT)
+                result.mark("imports", run.ok,
+                            ", ".join(modules) if run.ok else run.summary(400))
+            elif any(p.suffix == ".py" for p in sources):
+                result.mark("imports", False, "no top-level module to import")
+            else:
+                result.mark("imports", False, "not a Python project", skipped=True)
+            result.mark("tests-present", cases > 0, f"{cases} test function(s)")
+            _rung(box, result, "tests-pass", commands.get("test", ""))
+            _rung(box, result, "benchmark", commands.get("benchmark", ""))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return result
+
+
+def _rung(box, result: Grade, name: str, command: str) -> None:
+    """Run one declared command and fold its single gate into the ladder.
+
+    Through :func:`~hermes.verify.run_commands` rather than around it, so a
+    rung means here exactly what the same command meant when the factory ran
+    it -- including the fallback ``true`` counting as no command at all, which
+    is what stops an architect that skipped the question from being credited
+    with an answer.
+    """
+    scratch = Verification()
+    run_commands(box, [command], name, scratch, timeout=GRADE_TIMEOUT)
+    result.gates.extend(scratch.gates)
+
+
 @dataclass
 class Trial:
     """What one suite entry cost and what it produced."""
@@ -255,12 +461,23 @@ class Trial:
     holdout_passed: int = 0
     holdout_total: int = 0
     holdout_note: str = ""
+    #: Rungs of :data:`LADDER` the finished workspace passed, of those it was
+    #: asked. Dense where ``completed`` is one bit: two runs that both failed
+    #: every task can still be several rungs apart.
+    grade_passed: int = 0
+    grade_total: int = 0
+    #: Rung name -> pass/FAIL/skip, so the suite can say which rung the factory
+    #: loses its projects on rather than only that the number moved.
+    grade_gates: dict[str, str] = field(default_factory=dict)
+    grade_note: str = ""
 
     def row(self) -> str:
         mark = "pass" if self.completed else ("TIME" if self.timed_out else "FAIL")
         return (f"{self.name:<14} {mark:>4} {self.phase:<14} "
                 f"tickets={self.tickets_completed}/{self.tickets} "
                 f"first_pass={self.first_pass:.0%} "
+                + (f"rungs={self.grade_passed}/{self.grade_total} "
+                   if self.grade_total else "")
                 + (f"held-out={self.holdout_passed}/{self.holdout_total} "
                    if self.holdout_total else "")
                 + f"{self.seconds / 60:.1f}m "
@@ -271,7 +488,8 @@ class Trial:
 
 def collect(name: str, state, board, usage: list[dict], sandbox_seconds: float,
             seconds: float, error: str = "", root: str = "",
-            timed_out: bool = False, holdout: Holdout | None = None) -> Trial:
+            timed_out: bool = False, holdout: Holdout | None = None,
+            graded: Grade | None = None) -> Trial:
     """Turn a finished run into numbers.
 
     Kept free of the factory so the accounting can be tested without standing
@@ -284,6 +502,7 @@ def collect(name: str, state, board, usage: list[dict], sandbox_seconds: float,
     inference = round(sum(c.get("seconds", 0.0) for c in usage), 1)
     ledgers = inference + sandbox_seconds
     holdout = holdout or Holdout()
+    graded = graded or Grade()
     return Trial(
         name=name,
         phase=getattr(state, "phase", "UNKNOWN"),
@@ -306,6 +525,10 @@ def collect(name: str, state, board, usage: list[dict], sandbox_seconds: float,
         holdout_passed=holdout.passed,
         holdout_total=holdout.total,
         holdout_note=holdout.note,
+        grade_passed=graded.passed,
+        grade_total=graded.total,
+        grade_gates=graded.verdicts(),
+        grade_note=graded.note,
     )
 
 
@@ -329,27 +552,32 @@ def run_task(task: Task, root: Path, config: Config | None = None,
     except Exception as exc:  # noqa: BLE001 - a crashed entry is a result, not a stop
         error = f"{type(exc).__name__}: {exc}"[:300]
     seconds = time.time() - started  # the scoring is ours, not the factory's
+    # Whatever state the run ended in is what gets measured: a crashed or
+    # timed-out run is exactly the one whose partial project is worth grading.
+    config = factory.config if factory is not None else (config or Config.load())
+    commands = ((factory.state.plan.get("commands") or {})
+                if factory is not None else {})
+    sandbox_cfg = config.data.get("sandbox", {})
+    try:
+        graded = grade(root, sandbox_cfg, commands)
+    except Exception as exc:  # noqa: BLE001 - a grading fault is reported, not raised
+        graded = Grade(note=f"grading failed: {type(exc).__name__}: {exc}"[:300])
     holdout = None
     if task.holdout:
-        # Scored whatever state the run ended in: a crashed or timed-out run
-        # is exactly the one whose partial library is worth counting.
-        config = factory.config if factory is not None else (config or Config.load())
-        setup = ((factory.state.plan.get("commands") or {}).get("setup", "")
-                 if factory is not None else "")
         try:
-            holdout = score(task, root, config.data.get("sandbox", {}), setup)
+            holdout = score(task, root, sandbox_cfg, commands.get("setup", ""))
         except Exception as exc:  # noqa: BLE001 - a scoring fault is reported, not raised
             holdout = Holdout(0, sum(expected_tests(SUITE_DIR / task.holdout).values()),
                               f"scoring failed: {type(exc).__name__}: {exc}"[:300])
     if factory is None:
         return collect(task.name, State(idea=task.idea), Board(root), [], 0.0,
-                       seconds, error, str(root), holdout=holdout)
+                       seconds, error, str(root), holdout=holdout, graded=graded)
     return collect(task.name, factory.state, factory.board,
                    list(getattr(factory.router, "usage", [])),
                    float(getattr(getattr(factory, "sandbox", None), "spent", 0.0)),
                    seconds, error, str(root),
                    timed_out=bool(factory.state.metrics.get("deadline_reached")),
-                   holdout=holdout)
+                   holdout=holdout, graded=graded)
 
 
 def run_suite(root: Path, config: Config | None = None,
@@ -401,8 +629,13 @@ def summarise(trials: list[Trial]) -> str:
         f"of clock neither ledger explains",
         f"overlap        {sum(t.overlap_seconds for t in trials) / 60:.1f}m "
         f"claimed by both ledgers, which prefetch makes possible",
+        ladder(trials),
         resolution(trials),
     ]
+    ungraded = [t.name for t in trials if t.grade_note]
+    if ungraded:
+        lines.append(f"ungraded       {', '.join(ungraded)}: the ladder did not "
+                     "measure the project (see grade_note)")
     scored = [t for t in trials if t.holdout_total]
     if scored:
         passed = sum(t.holdout_passed for t in scored)
@@ -429,6 +662,30 @@ def summarise(trials: list[Trial]) -> str:
     return "\n".join(lines)
 
 
+def ladder(trials: list[Trial]) -> str:
+    """Where on the ladder the suite is losing its projects.
+
+    The rate says a change helped; the per-rung line says what it helped at,
+    which is the difference between a number and somewhere to work next. A
+    rung a project was never asked -- no benchmark declared, say -- is absent
+    from both, so the denominators differ per rung on purpose.
+    """
+    graded = [t for t in trials if t.grade_total]
+    if not graded:
+        return "ladder         no workspace was graded"
+    rungs = []
+    for name in LADDER:
+        asked = [t for t in graded if t.grade_gates.get(name, "skip") != "skip"]
+        if asked:
+            ok = sum(1 for t in asked if t.grade_gates.get(name) == "pass")
+            rungs.append(f"{name} {ok}/{len(asked)}")
+    passed = sum(t.grade_passed for t in graded)
+    total = sum(t.grade_total for t in graded)
+    return (f"ladder         {passed / total:.0%} of {total} rung(s) asked "
+            f"across {len(graded)} task(s)\n"
+            + " " * 15 + "  ".join(rungs))
+
+
 def resolution(trials: list[Trial]) -> str:
     """Whether this suite can rank a change at all.
 
@@ -446,15 +703,22 @@ def resolution(trials: list[Trial]) -> str:
     # factories that both fail can differ in how much of the library works.
     held = {round(t.holdout_passed / t.holdout_total, 2)
             for t in trials if t.holdout_total}
-    if completed == 0 and len(held) <= 1:
+    # The ladder is what separates two runs that both finished nothing: a
+    # suite stuck at `imports` and one stuck at `tests-pass` are different
+    # factories, and `completed` cannot say so.
+    rungs = {round(t.grade_passed / t.grade_total, 2)
+             for t in trials if t.grade_total}
+    if completed == 0 and len(held) <= 1 and len(rungs) <= 1:
         return ("resolution     NONE: no task completed. Nothing here can rank "
                 "a change; fix the factory or the model first")
-    if completed == len(trials) and len(rates) <= 1 and len(held) <= 1:
+    if (completed == len(trials) and len(rates) <= 1 and len(held) <= 1
+            and len(rungs) <= 1):
         return ("resolution     NONE: every task completed at one first-pass "
                 "rate, so this suite cannot tell two factories apart")
     return (f"resolution     {completed}/{len(trials)} completed, "
             f"{len(rates)} distinct first-pass rate(s)"
-            + (f", {len(held)} distinct held-out rate(s)" if held else ""))
+            + (f", {len(held)} distinct held-out rate(s)" if held else "")
+            + (f", {len(rungs)} distinct ladder rate(s)" if rungs else ""))
 
 
 def write_report(directory: Path, trials: list[Trial]) -> Path:
@@ -494,7 +758,11 @@ def compare(before: Path, after: Path) -> str:
         held = ("  held-out {} -> {}".format(a.get("holdout_passed", 0),
                                            b.get("holdout_passed", 0))
                 if a.get("holdout_total") or b.get("holdout_total") else "")
-        lines.append(f"{name:<14} {done:>18} {passed:>16} {clock:>18}{held}")
+        rungs = ("  rungs {}/{} -> {}/{}".format(
+            a.get("grade_passed", 0), a.get("grade_total", 0),
+            b.get("grade_passed", 0), b.get("grade_total", 0))
+            if a.get("grade_total") or b.get("grade_total") else "")
+        lines.append(f"{name:<14} {done:>18} {passed:>16} {clock:>18}{held}{rungs}")
     return "\n".join(lines + ["", _verdict(old, new)])
 
 
@@ -511,9 +779,11 @@ def _verdict(old: dict, new: dict) -> str:
         if old[name]["completed"] != new[name]["completed"]
         or abs(old[name].get("first_pass", 0) - new[name].get("first_pass", 0)) > 0.01
         or old[name].get("holdout_passed", 0) != new[name].get("holdout_passed", 0)
+        or (old[name].get("grade_passed", 0), old[name].get("grade_total", 0))
+        != (new[name].get("grade_passed", 0), new[name].get("grade_total", 0))
     )
     if not moved:
-        return ("no task changed completion, first-pass rate or held-out "
-                "tests: this pair does not support accepting or rejecting the "
-                "change")
+        return ("no task changed completion, first-pass rate, held-out tests "
+                "or ladder rungs: this pair does not support accepting or "
+                "rejecting the change")
     return f"{len(moved)} of {len(shared)} task(s) moved: {', '.join(moved)}"

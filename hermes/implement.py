@@ -516,6 +516,7 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
                    allow_edits: bool = True, prefetched: dict | None = None,
                    tool_calls: int = 6, tool_rounds: int = 3, db=None,
                    classifier=None, mutation: dict | None = None,
+                   baseline=None, tampering: dict | None = None,
                    on_apply=None, log: Logger = NULL) -> dict:
     """Run one ticket to a verdict.
 
@@ -543,6 +544,12 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
     *classifier* is the security gate's second opinion, and is also asked in
     shadow to classify every triaged failure; the guess goes to the ledger
     and nowhere else. See :func:`_shadow_triage`.
+
+    *baseline* is the test surface at the last completed ticket, which every
+    attempt here is compared against rather than the attempt before it: an
+    attempt that weakened the tests and failed leaves its files for the next,
+    and the next must not inherit the weaker suite as its standard. See
+    :mod:`hermes.tamper`.
     """
     ladder = ladder or Ladder()
     ledger = ledger or NullLedger()
@@ -590,7 +597,8 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
         return verify_ticket(
             sandbox, ticket, state.plan, change.written, log=log,
             tests_required=bool(state.metrics.get("tests_passed")),
-            classifier=classifier, mutation=mutation, agents=agents)
+            classifier=classifier, mutation=mutation, agents=agents,
+            baseline=baseline, tampering=tampering)
 
     for attempt in range(1, max_attempts + 1):
         # Every record from here down -- model call, sandbox command, gate --

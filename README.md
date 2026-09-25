@@ -573,6 +573,53 @@ never asked, so the gate stands down instead. Each write also carries its own
 mtime, because a same-length mutant written within a second of what it
 replaced would otherwise run from stale bytecode and be blamed on the tests.
 
+Mutation testing catches tests that are weak. It cannot catch tests that were
+made weaker, and the implementer is free to edit the tests in the same change
+as the code. Asking it not to has been measured to barely help. So once a
+ticket clears every other gate, and before mutation runs, the tests are
+compared with how they stood at the last *completed* ticket. Findings:
+
+- an `assert`, a `pytest.raises` or a `self.assert*` that exists nowhere in
+  the suite any more, including one rewritten to a different value;
+- a test deleted, or newly skipped or marked xfail, singly or a whole file at
+  a time;
+- a `conftest.py` that lost a definition, or gained a hook, an ignore list
+  or an autouse fixture;
+- a changed pytest section in `pytest.ini`, `tox.ini`, `setup.cfg` or
+  `pyproject.toml`;
+- fewer tests collected by the project's own test command, run with
+  `--collect-only`.
+
+The comparison is over syntax, not text. Reformatting a test, renaming it,
+moving it to another file or moving its assert into a helper finds nothing.
+
+A smaller suite fails the ticket outright unless the ticket is a `test` or
+`refactor` ticket, because no implementation ticket needs fewer tests. An
+obsolete test is replaced, not deleted. Every other finding is only a fact
+about the edit, because a ticket that changes behaviour does change the check
+for it. Those edits go to the reviewer on their own, with the ticket and
+without the code, and one question: does this weaken what the tests check?
+An edit fails the ticket unless the reviewer answers that it does not *and*
+gives a reason. The prompt asks for that reason to be where the same
+behaviour is still checked. This is the reverse of the
+mutation screen. A surviving mutant is usually a fault no test could catch,
+so there silence is no veto. A removed assert is not a guess, and the model
+being asked is the one that removed it. The repair prompt names each check
+to put back.
+
+The baseline is kept in `.hermes/state/tests.json` and replaced only when a
+ticket completes. A failed attempt leaves its files for the next attempt to
+build on. If the baseline moved with it, the first attempt could delete the
+failing assert and the second could pass against what was left.
+
+```yaml
+verification:
+  tampering:
+    enabled: true        # the default: one test collection per ticket
+    screen: true         # false: every flagged edit fails the ticket
+    block: true          # false: report the findings and pass
+```
+
 That scan is a pattern list, which means it reads what it was told to look
 for and nothing else. You can put a second opinion behind it: a local text
 classifier that scores each chunk of generated source against a small
@@ -835,6 +882,14 @@ halfway through.
   that separates a real gap from an uncatchable one is the same class of model
   that wrote the tests, which is why its only power is to *withdraw* a
   complaint, never to raise one.
+- The tampering gate reads Python tests only, and counts tests only when the
+  test command is one plain pytest run. On any other stack it says there was
+  nothing to compare. It catches what leaves a trace in the tests. A test
+  kept intact while the code special-cases the inputs that test uses is out
+  of its reach, and so is a check deleted from one place and pasted,
+  word for word, into a function nothing runs. Whether its screen excuses
+  legitimate edits often enough to be worth the extra repair cycles has not
+  been measured against a real model.
 - Optimisation needs its targets to fit the evolver's context whole. A project
   whose hot file is larger than that gets no optimisation rather than a
   half-informed one; the log names the file and the room it missed by, and the

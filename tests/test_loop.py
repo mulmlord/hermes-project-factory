@@ -204,6 +204,9 @@ def test_loop_reaches_completed(factory):
 
     # The workspace documents itself without Hermes internals.
     assert "tiny-calc" in (factory.root / "SPEC.md").read_text()
+    guide = (factory.root / "AGENTS.md").read_text()
+    assert "## Build and test commands" in guide
+    assert "- Test: `python3 tests/test_calc.py`" in guide
     assert (factory.root / "docs" / "architecture" / "overview.md").is_file()
     assert list((factory.root / "docs" / "decisions").glob("*.md"))
 
@@ -665,3 +668,83 @@ def test_a_hypothesis_becomes_an_experiment_that_runs_and_feeds_research(factory
     assert any(r.get("experiment") for r in known["rounds"])
     metrics = (factory.root / ".hermes" / "metrics" / "experiments.jsonl").read_text()
     assert json.loads(metrics.strip())["verdict"] == "supported"
+
+
+#: What a corner-cutting "faster divide" writes: the zero guard gone from the
+#: code, and the check that noticed gone from the tests.
+UNGUARDED = CALC.replace('        raise ZeroDivisionError("division by zero")\n',
+                         '        return float("inf")\n')
+WEAKENED = TEST.replace('try:\n    divide(1, 0)\nexcept ZeroDivisionError:\n    pass\n'
+                        'else:\n    raise AssertionError("expected ZeroDivisionError")\n', "")
+
+
+def test_a_ticket_made_green_by_deleting_its_check_completes_only_once_it_is_back(factory):
+    """The whole path: the gate, the repair prompt, and a baseline that holds.
+
+    Attempt one breaks the zero guard and takes out the check that noticed,
+    and the tests pass. Attempt two sends the fixed code alone, leaving the
+    weakened test where attempt one put it -- measured against the attempt
+    before it rather than the last completed ticket, that would pass. Only
+    attempt three, which puts the check back, completes.
+    """
+    from hermes.implement import Ladder
+
+    assert UNGUARDED != CALC and WEAKENED != TEST
+    factory.ladder = Ladder()                       # one sample per attempt
+    factory.config.data["execution"]["prefetch"] = False
+    tickets = json.loads(json.dumps(TICKETS))
+    tickets["tickets"].append({
+        "key": "fast", "title": "Speed up divide", "objective": "a faster divide",
+        "context": "", "kind": "implementation", "dependencies": ["tests"],
+        "acceptance": ["divide still refuses a zero divisor"],
+        "validation": ["python3 tests/test_calc.py"], "artifacts": ["src/calc.py"],
+        "priority": 1, "risk": 1, "cost": 1, "info_gain": 1})
+    router, attempts = factory.router, []
+    answer = router._answer
+
+    def cuts_a_corner(prompt):
+        if "Break this into at most" in prompt:
+            return tickets
+        if "Implement this ticket completely" in prompt and "Speed up divide" in prompt:
+            attempts.append(prompt)
+            if len(attempts) == 1:
+                return {"summary": "no zero check", "files": [
+                    {"path": "src/calc.py", "content": UNGUARDED},
+                    {"path": "tests/test_calc.py", "content": WEAKENED}]}
+            code = [{"path": "src/calc.py", "content": CALC}]
+            if len(attempts) == 2:
+                return {"summary": "keep the guard", "files": code}
+            return {"summary": "keep the guard and its test", "files": code + [
+                {"path": "tests/test_calc.py", "content": TEST}]}
+        return answer(prompt)
+
+    router._answer = cuts_a_corner
+    state = factory.run(max_iterations=60)
+
+    assert state.phase == "COMPLETED", (state.phase, state.notes)
+    assert len(attempts) == 3
+    assert (factory.root / "tests" / "test_calc.py").read_text() == TEST
+    told = "no longer checks `raise AssertionError('expected ZeroDivisionError')`"
+    assert told in attempts[1] and told in attempts[2]
+
+
+def test_the_baseline_moves_only_when_a_ticket_completes(factory):
+    """A failed ticket leaves its files behind, and its tests must not become the standard.
+
+    Not a restart either: the baseline is on disk, so a resumed run answers
+    to the same tree its last completed ticket left.
+    """
+    from hermes import tamper
+
+    tests = factory.root / "tests" / "test_calc.py"
+    tests.parent.mkdir(exist_ok=True)
+    tests.write_text(TEST)
+    first = factory.tests_baseline()
+    tests.write_text(WEAKENED)                              # a failed ticket's leftovers
+
+    assert factory.tests_baseline().files == first.files
+    resumed = Factory(factory.root, factory.config, quiet=True)
+    assert resumed.tests_baseline().files == first.files
+
+    tamper.forget(factory.root)                             # a ticket completed
+    assert factory.tests_baseline().files["tests/test_calc.py"] == WEAKENED

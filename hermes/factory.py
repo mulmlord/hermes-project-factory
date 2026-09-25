@@ -16,7 +16,7 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
-from . import prompts, workspace
+from . import prompts, tamper, workspace
 from .agents import Prompt, build as build_agents, context_block
 from .classify import Classifier
 from .config import Config
@@ -102,6 +102,10 @@ class Factory:
         self.state.save(self.root)
         self.board.save()
         workspace.write_context(self.root, self.state, self._board_extra())
+        # Refreshed beside CONTEXT.md rather than at planning time: the guide
+        # quotes the project's build and test commands, and those are only
+        # real once the architect has chosen them.
+        workspace.write_agents(self.root, self.state)
         if self.config.get("github.issues", True):
             # Free while GitHub is disabled or the project has no repository,
             # and free again on a board that did not move.
@@ -112,6 +116,27 @@ class Factory:
 
     def _board_extra(self) -> str:
         return f"## Board\n```\n{self.board.summary()}\n```\n"
+
+    def tests_baseline(self) -> tamper.Surface:
+        """The tests as they stood when the last ticket completed.
+
+        Read the first time a ticket needs it after a completion, and kept on
+        disk until the next one, so every ticket that fails in between -- and
+        leaves its files behind -- is compared against the same tree rather
+        than the one the failure left. See :mod:`hermes.tamper`.
+        """
+        surface = tamper.load(self.root)
+        if surface is None:
+            test = (self.state.plan.get("commands") or {}).get("test", "")
+            surface = tamper.capture(
+                self.sandbox, tamper.collect_command(test),
+                timeout=int(self.config.get("verification.tampering.timeout", 120)),
+                log=self.log)
+            tamper.save(self.root, surface)
+            self.log.info("tampering.baseline", files=len(surface.files),
+                          collected=-1 if surface.collected is None
+                          else len(surface.collected))
+        return surface
 
     def commit(self, message: str, kind: str = "chore") -> str | None:
         """Returns the short SHA so the journal can point at the real commit."""

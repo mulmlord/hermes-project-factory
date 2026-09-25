@@ -573,6 +573,53 @@ never asked, so the gate stands down instead. Each write also carries its own
 mtime, because a same-length mutant written within a second of what it
 replaced would otherwise run from stale bytecode and be blamed on the tests.
 
+Mutation testing catches tests that are weak. It cannot catch tests that were
+made weaker, and the implementer is free to edit the tests in the same change
+as the code. Asking it not to has been measured to barely help. So once a
+ticket clears every other gate, and before mutation runs, the tests are
+compared with how they stood at the last *completed* ticket. Findings:
+
+- an `assert`, a `pytest.raises` or a `self.assert*` that exists nowhere in
+  the suite any more, including one rewritten to a different value;
+- a test deleted, or newly skipped or marked xfail, singly or a whole file at
+  a time;
+- a `conftest.py` that lost a definition, or gained a hook, an ignore list
+  or an autouse fixture;
+- a changed pytest section in `pytest.ini`, `tox.ini`, `setup.cfg` or
+  `pyproject.toml`;
+- fewer tests collected by the project's own test command, run with
+  `--collect-only`.
+
+The comparison is over syntax, not text. Reformatting a test, renaming it,
+moving it to another file or moving its assert into a helper finds nothing.
+
+A smaller suite fails the ticket outright unless the ticket is a `test` or
+`refactor` ticket, because no implementation ticket needs fewer tests. An
+obsolete test is replaced, not deleted. Every other finding is only a fact
+about the edit, because a ticket that changes behaviour does change the check
+for it. Those edits go to the reviewer on their own, with the ticket and
+without the code, and one question: does this weaken what the tests check?
+An edit fails the ticket unless the reviewer answers that it does not *and*
+gives a reason. The prompt asks for that reason to be where the same
+behaviour is still checked. This is the reverse of the
+mutation screen. A surviving mutant is usually a fault no test could catch,
+so there silence is no veto. A removed assert is not a guess, and the model
+being asked is the one that removed it. The repair prompt names each check
+to put back.
+
+The baseline is kept in `.hermes/state/tests.json` and replaced only when a
+ticket completes. A failed attempt leaves its files for the next attempt to
+build on. If the baseline moved with it, the first attempt could delete the
+failing assert and the second could pass against what was left.
+
+```yaml
+verification:
+  tampering:
+    enabled: true        # the default: one test collection per ticket
+    screen: true         # false: every flagged edit fails the ticket
+    block: true          # false: report the findings and pass
+```
+
 That scan is a pattern list, which means it reads what it was told to look
 for and nothing else. You can put a second opinion behind it: a local text
 classifier that scores each chunk of generated source against a small
@@ -631,7 +678,7 @@ rate against your own code, and `block` is worth setting only after that.
 ```
 project/
 ├── CONTEXT.md          always-current orientation
-├── AGENTS.md           rules for whoever works on this next
+├── AGENTS.md           the conventional agent guide, filled from the plan
 ├── SPEC.md  PLAN.md    what and how
 ├── src/  tests/  benchmarks/
 ├── experiments/        one directory per experiment: program, runs, record
@@ -744,6 +791,24 @@ is the premature termination NL2Repo-Bench names as the first failure of
 long-horizon agents. And `hermes improve` refuses a change that passes fewer
 held-out tests, whatever it did to the first-pass rate.
 
+The eight one-line ideas get partial credit too, from a ladder rather than a
+held-out suite. The committed tree is exported the same way and graded on six
+rungs — `exports`, `builds`, `imports`, `tests-present`, `tests-pass` and
+`benchmark` — each a stronger claim about the deliverable than the one before
+it, and each answered either by a command the project's own plan declared or
+from its own source, so the ladder costs sandbox time and no inference at all.
+Eight tasks scored pass/fail are eight bits, and at that N a real improvement
+and a run of luck look alike; a factory whose projects now import where they
+used to only export has visibly done better, and the report says so without
+anyone adding tasks. A rung the project never declared — no build command, no
+benchmark — is skipped and left out of the denominator, because an unasked
+question is not a failed one, and `true`, which planning writes when the
+architect named no build, counts as no command rather than as a passed one. A
+run that produced nothing scores 0 of 1 rather than the 0 of 0 that would read
+as unmeasured. Under the totals the report prints one line per rung, which
+says where the suite is losing its projects rather than only that the number
+moved.
+
 Each task also gets a wall-clock ceiling (`--budget MINUTES`, 30 by default),
 because iterations bound how many phases run rather than how long one takes,
 and without it a single stuck command lets one idea consume the whole run. A
@@ -755,8 +820,9 @@ is printed as `unaccounted`, time both ledgers claim is printed as `overlap`
 (prefetch generates while gates run, so the two may legitimately exceed the
 clock), and a suite where every task passed identically, or none passed at
 all, is labelled as having no resolution — real numbers that still cannot rank
-one factory against another. `--compare` says the same thing about a pair of
-runs where nothing moved.
+one factory against another, unless the held-out tests or the ladder can tell
+the runs apart after all. `--compare` says the same thing about a pair of runs
+where nothing moved.
 
 This exists because everything else in this section is a trade. Constrained
 decoding, search/replace edits, workspace lookups, prefetching the next
@@ -816,6 +882,14 @@ halfway through.
   that separates a real gap from an uncatchable one is the same class of model
   that wrote the tests, which is why its only power is to *withdraw* a
   complaint, never to raise one.
+- The tampering gate reads Python tests only, and counts tests only when the
+  test command is one plain pytest run. On any other stack it says there was
+  nothing to compare. It catches what leaves a trace in the tests. A test
+  kept intact while the code special-cases the inputs that test uses is out
+  of its reach, and so is a check deleted from one place and pasted,
+  word for word, into a function nothing runs. Whether its screen excuses
+  legitimate edits often enough to be worth the extra repair cycles has not
+  been measured against a real model.
 - Optimisation needs its targets to fit the evolver's context whole. A project
   whose hot file is larger than that gets no optimisation rather than a
   half-informed one; the log names the file and the room it missed by, and the
@@ -833,7 +907,10 @@ halfway through.
   from a worse one on your model is exactly what the `resolution` line will
   tell you the first time you run it. The held-out tests are calibrated
   against a hand-written reference solution, not against anything a model
-  wrote, so no number yet shows where a local model lands on them.
+  wrote, so no number yet shows where a local model lands on them. The ladder
+  ranks and reports but does not gate: `hermes improve` still promotes on
+  completion, first-pass rate and held-out tests, because a metric that has
+  never produced a number on a real model has not earned a veto.
 - Research works from what the model knows until you set
   `research.network: true`, which buys it real sources within a page, search,
   byte and time budget. The search and retrieval path is exercised against a

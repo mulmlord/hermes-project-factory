@@ -202,6 +202,19 @@ DEFAULTS: dict[str, Any] = {
                                # ticket, which sends the concrete failing case
                                # back to the repair path. false only reports it
         },
+        # Test tampering: a change that passes because the tests it changed
+        # ask less -- an assert gone, a test skipped, fewer tests collected.
+        # On by default because it is cheap: one test collection per ticket,
+        # and a model call only when an existing test was edited. See
+        # hermes.tamper.
+        "tampering": {
+            "enabled": True,
+            "screen": True,    # ask whether a flagged edit weakens the tests;
+                               # only a reason it does not excuses one. A smaller
+                               # suite is never screened for implementation work
+            "block": True,     # false reports what was found and passes
+            "timeout": 120,    # seconds one test collection may take
+        },
     },
     "security": {
         # A second opinion on the security gate, for the defects no regex in
@@ -217,6 +230,8 @@ DEFAULTS: dict[str, Any] = {
             "threshold": 0.75,   # calibrate the checkpoint before trusting this
             "block": False,      # let a finding fail the gate, not just warn
             "max_chunks": 400,   # windows one scan may classify
+            "shadow": True,      # also guess each failure's triage class, for
+                                 # the ledger only; see `hermes ledger --shadow`
         },
     },
     "git": {"enabled": True, "author": "Hermes Factory <hermes@localhost>"},
@@ -547,6 +562,14 @@ verification:
                          # most are faults no test could ever have caught
     block: true          # a confirmed survivor fails the ticket, which sends
                          # the failing case to the repair path. false reports it
+  tampering:             # refuse a change that passes by weakening the tests:
+    enabled: true        # an assert removed or rewritten, a test deleted or
+                         # skipped, the pytest settings or conftest changed, or
+                         # fewer tests collected than at the last completed ticket
+    screen: true         # an edit to an existing test stands unless the reviewer
+                         # gives a reason it does not weaken what they check
+    block: true          # false reports the findings and passes
+    timeout: 120         # seconds one test collection may take
 
 github:
   enabled: false

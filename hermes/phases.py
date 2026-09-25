@@ -13,7 +13,7 @@ taking the factory can be handed as little as the phase actually touches.
 """
 from __future__ import annotations
 
-from . import prompts, workspace
+from . import prompts, tamper, workspace
 from .evolve import Evolution, objective_from_spec
 from .experiment import run_ticket as run_experiment_ticket
 from .implement import Change, execute_ticket
@@ -177,6 +177,7 @@ def implementation(factory) -> None:
         elif factory.openhands.should_handle(ticket) and _run_openhands(factory, ticket):
             return
         else:
+            tampering = factory.config.get("verification.tampering") or {}
             outcome = execute_ticket(
                 factory.agents, factory.sandbox, factory.state, factory.board, ticket, factory.tree,
                 journal=factory.journal,
@@ -191,6 +192,9 @@ def implementation(factory) -> None:
                 db=factory.context_db,
                 classifier=factory.classifier,
                 mutation=factory.config.get("verification.mutation") or {},
+                baseline=(factory.tests_baseline()
+                          if tampering.get("enabled", True) else None),
+                tampering=tampering,
                 on_apply=lambda: factory._prefetch_next(ticket),
                 log=factory.log)
 
@@ -203,6 +207,9 @@ def implementation(factory) -> None:
             sha = factory.commit(f"{_commit_kind(ticket.kind)}: {ticket.title}\n\n"
                                  f"Ticket {ticket.id}. {outcome['change'].summary}",
                                  kind=_commit_kind(ticket.kind))
+            # The tree just committed passed every gate, so it is the standard
+            # the next ticket's tests answer to; a failed ticket moves nothing.
+            tamper.forget(factory.root)
             factory.journal.record(ticket, outcome, commit=sha or "")
             factory.log.info("ticket.completed",
                              progress=f"{factory.board.progress():.0%}")
@@ -235,6 +242,11 @@ def _run_experiment(factory, ticket) -> dict:
 def _run_openhands(factory, ticket) -> bool:
     factory.board.move(ticket.id, "active", "delegated to OpenHands")
     factory.board.save()
+    # Taken before the agent runs: it holds a shell over the workspace for the
+    # whole ticket, which is more room to edit a test than the native
+    # implementer ever has.
+    tampering = factory.config.get("verification.tampering") or {}
+    baseline = factory.tests_baseline() if tampering.get("enabled", True) else None
     result = factory.openhands.run_ticket(factory.root, ticket, factory.context())
     if not result["ok"]:
         factory.board.move(ticket.id, "ready", "OpenHands failed; native agent will retry")
@@ -242,12 +254,15 @@ def _run_openhands(factory, ticket) -> bool:
         return False
     from .verify import verify_ticket
     verification = verify_ticket(factory.sandbox, ticket, factory.state.plan, [],
-                                 factory.log, classifier=factory.classifier)
+                                 factory.log, classifier=factory.classifier,
+                                 agents=factory.agents, baseline=baseline,
+                                 tampering=tampering)
     if verification.passed:
         factory.board.move(ticket.id, "completed", "OpenHands + gates passed")
         sha = factory.commit(f"{_commit_kind(ticket.kind)}: {ticket.title}\n\n"
                              f"Ticket {ticket.id}, implemented via OpenHands.",
                              kind=_commit_kind(ticket.kind))
+        tamper.forget(factory.root)
         # OpenHands edits the workspace itself, so the commit is the only
         # record of which files it actually touched.
         factory.journal.record(

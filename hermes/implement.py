@@ -11,7 +11,8 @@ from . import prompts
 from .agents import (Prompt, change_schema, context_block, escalate,
                      file_protocol, ticket_block)
 from .anchor import locate
-from .ledger import ABANDONED, FAILED, FIXED, NullLedger, Spec
+from .classify import CHUNK_CHARS, TRIAGE_LABELS, TRIAGE_QUESTION
+from .ledger import ABANDONED, FAILED, FIXED, TRIAGE, NullLedger, Spec
 from .log import Logger, NULL, scope
 from .sandbox import Sandbox, SandboxError
 from .tools import Lookup, Toolbox
@@ -476,6 +477,7 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
                    allow_edits: bool = True, prefetched: dict | None = None,
                    tool_calls: int = 6, tool_rounds: int = 3, db=None,
                    classifier=None, mutation: dict | None = None,
+                   baseline=None, tampering: dict | None = None,
                    on_apply=None, log: Logger = NULL) -> dict:
     """Run one ticket to a verdict.
 
@@ -499,6 +501,16 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
     what lets an implementer ask where something is defined and what earlier
     tickets recorded, rather than grep for it. Without one the lookups are
     the three that read the disk.
+
+    *classifier* is the security gate's second opinion, and is also asked in
+    shadow to classify every triaged failure; the guess goes to the ledger
+    and nowhere else. See :func:`_shadow_triage`.
+
+    *baseline* is the test surface at the last completed ticket, which every
+    attempt here is compared against rather than the attempt before it: an
+    attempt that weakened the tests and failed leaves its files for the next,
+    and the next must not inherit the weaker suite as its standard. See
+    :mod:`hermes.tamper`.
     """
     ladder = ladder or Ladder()
     ledger = ledger or NullLedger()
@@ -546,7 +558,8 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
         return verify_ticket(
             sandbox, ticket, state.plan, change.written, log=log,
             tests_required=bool(state.metrics.get("tests_passed")),
-            classifier=classifier, mutation=mutation, agents=agents)
+            classifier=classifier, mutation=mutation, agents=agents,
+            baseline=baseline, tampering=tampering)
 
     for attempt in range(1, max_attempts + 1):
         # Every record from here down -- model call, sandbox command, gate --
@@ -671,6 +684,10 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
 
             diagnosis = triage(agents, ticket, verification,
                                context_block(state, tree_fn()), attempt, log=log)
+            _shadow_triage(classifier, ledger, verification, diagnosis,
+                           project=project, stack=stack, kind=ticket.kind,
+                           signature=signature_of(verification), attempt=attempt,
+                           log=log)
             action = diagnosis.get("action", "repair")
             if action in ("decompose", "reconsider", "research", "rollback"):
                 # The run stopped asking, which says nothing about the rung:
@@ -689,6 +706,27 @@ def execute_ticket(agents, sandbox: Sandbox, state, board, ticket, tree_fn,
             "diagnosis": {"diagnosis": f"exhausted {max_attempts} attempts",
                           "classification": "implementation", "action": "decompose"},
             "verification": last_verification, "change": last_change}
+
+
+def _shadow_triage(classifier, ledger, verification: Verification, diagnosis: dict,
+                   *, log: Logger, **where) -> None:
+    """Ask the classifier what the triager just decided, and only record it.
+
+    The triager is a reasoning-model call per failure to pick one of six
+    words; whether a classifier could pick the same word is what the ledger
+    is collecting evidence for. Nothing returned here reaches the loop, so a
+    wrong, slow or missing guess costs one row and changes no decision.
+    """
+    answer = diagnosis.get("classification")
+    if classifier is None or not classifier.cfg.shadow or answer not in TRIAGE_LABELS:
+        return
+    guess = classifier.guess(TRIAGE_QUESTION, TRIAGE_LABELS,
+                             verification.failure_output(CHUNK_CHARS))
+    if guess is None:
+        return
+    ledger.record_guess(TRIAGE, guess.label, guess.confidence, answer, **where)
+    log.info("triage.shadow", guess=guess.label, answer=answer,
+             confidence=round(guess.confidence, 2), agreed=guess.label == answer)
 
 
 def _propose(agents, sandbox, state, ticket, tree_fn, instructions, failure, prior,

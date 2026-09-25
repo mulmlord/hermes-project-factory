@@ -249,13 +249,15 @@ def research_topics(context: str, idea: str, unknowns_json: str,
         "start. Research is warranted only when the problem is poorly "
         "understood, several approaches compete, the best method is uncertain, "
         "or the reasoning is non-obvious. Routine engineering needs no research."
-        f"\n\nReturn JSON: {{\"needed\": true|false, \"topics\": [\"specific "
-        f"research question\"]}}. At most {limit} topics. Return needed=false "
-        "with an empty list when the implementation path is already clear."
+        f"\n\nReturn JSON: {{\"topics\": [\"specific research question\"], "
+        f"\"needed\": true|false}}. At most {limit} topics. Return an empty "
+        "list and needed=false when the implementation path is already clear."
     )
 
 
-TOPICS = obj({"needed": BOOLEAN, "topics": arr()}, required=("needed", "topics"))
+#: The list comes first so the decoder writes the questions before it writes
+#: whether there are any; see :data:`REVIEW_SHAPE` for why the order matters.
+TOPICS = obj({"topics": arr(), "needed": BOOLEAN}, required=("topics", "needed"))
 
 
 def feynman_unknowns(max_unknowns: int) -> str:
@@ -534,33 +536,41 @@ IMPLEMENT = (
 # -- review and triage -------------------------------------------------------
 
 REVIEW = (
-    "Review this change. Return JSON:\n"
+    "Review this change. Find the issues first and decide afterwards: the "
+    "verdict follows from what you found, so it comes last. Return JSON:\n"
     "{\n"
-    '  "approved": true|false,\n'
-    '  "meets_acceptance": true|false,\n'
     '  "blocking": ["issue that must be fixed before this can be accepted"],\n'
-    '  "advisory": ["worth improving but not blocking"],\n'
     '  "security": ["security concern, or empty"],\n'
-    '  "reason": "one sentence verdict"\n'
+    '  "advisory": ["worth improving but not blocking"],\n'
+    '  "reason": "one sentence: why the issues above do or do not block it",\n'
+    '  "meets_acceptance": true|false,\n'
+    '  "approved": true|false\n'
     "}\n"
     "Block only on real defects: incorrect behaviour, unmet acceptance "
     "criteria, stubbed-out work, security problems, or missing error "
     "handling at a trust boundary. Do not block on style or taste."
 )
 
-#: A review that comes back without a verdict is not a review, and the gate
-#: that reads it has to guess. ``approved`` is therefore required even though
-#: everything explaining it is optional.
+#: The evidence comes before the verdict, and is required so that it stays
+#: there. A constrained decoder writes keys in a fixed order -- XGrammar in the
+#: order declared, llama.cpp (and so ollama) every required key first and the
+#: optional ones after -- and a model that has written ``"approved": true``
+#: then spends its reasons justifying it. That arrangement is most of what the
+#: format tax costs (*The Format Tax*, arXiv 2604.03616), and a small local
+#: model pays it hardest. Every key before the verdict is one an honest
+#: reviewer can fill with nothing to say, an empty list or a sentence, so
+#: requiring them costs no invention. ``advisory`` alone is left optional: it
+#: blocks nothing, so where it lands does not steer the verdict.
 REVIEW_SHAPE = obj(
     {
-        "approved": BOOLEAN,
-        "meets_acceptance": BOOLEAN,
         "blocking": arr(),
-        "advisory": arr(),
         "security": arr(),
+        "advisory": arr(),
         "reason": STRING,
+        "meets_acceptance": BOOLEAN,
+        "approved": BOOLEAN,
     },
-    required=("approved", "reason"),
+    required=("blocking", "security", "reason", "meets_acceptance", "approved"),
 )
 
 TRIAGE = (
@@ -619,8 +629,10 @@ def mutation_screen(count: int) -> str:
         "Return JSON:\n"
         "{\n"
         '  "verdicts": [\n'
-        '    {"index": 0, "observable": true|false,\n'
-        '     "reason": "the call or input that tells the two apart"}\n'
+        '    {"index": 0,\n'
+        '     "reason": "the call or input that tells the two apart, or why '
+        'none can",\n'
+        '     "observable": true|false}\n'
         "  ]\n"
         "}\n"
         "Answer for every fault, by the index it was given. Judge only the "
@@ -629,12 +641,60 @@ def mutation_screen(count: int) -> str:
 
 
 #: A verdict without an index cannot be matched back to the fault it judges,
-#: and a verdict without ``observable`` is not a verdict, so both are required
-#: of each entry while the reasoning that justifies them is not.
+#: and a verdict without ``observable`` is not a verdict. The reason is
+#: required as well, and sits between them: it is where the model looks for
+#: the distinguishing input, and asked after ``observable`` it would only be
+#: defending a guess. See :data:`REVIEW_SHAPE`.
 MUTATION_SHAPE = obj(
-    {"verdicts": arr(obj({"index": INTEGER, "observable": BOOLEAN,
-                          "reason": STRING},
-                         required=("index", "observable")))},
+    {"verdicts": arr(obj({"index": INTEGER, "reason": STRING,
+                          "observable": BOOLEAN},
+                         required=("index", "reason", "observable")))},
+    required=("verdicts",),
+)
+
+
+def tamper_screen(count: int) -> str:
+    """Ask whether edits to existing tests weaken what those tests check.
+
+    Shown only the edits and the ticket, never the code beside them: the code
+    is what an agent that deleted a failing assert would point to as the
+    reason, and the question is about the tests. Whether an edit happened is
+    already settled mechanically; what is asked is the one thing mechanics
+    cannot tell -- whether the same behaviour is still checked somewhere, or
+    the ticket asked for it to change.
+    """
+    return (
+        f"This change edits tests that existed before it, and {count} of those "
+        "edits make the suite ask less than it did: a check removed or "
+        "rewritten, a test deleted or skipped, the test setup or settings "
+        "changed. For every edit decide one thing: does it weaken what the "
+        "tests check? It does not when the same behaviour is still checked -- "
+        "the check moved, a helper makes it, a replacement test covers it -- "
+        "or when the ticket's acceptance criteria require that behaviour to "
+        "change and the edit checks the new behaviour at least as strictly. "
+        "It does when a check that was failing has been removed, loosened or "
+        "skipped instead of the code being fixed.\n"
+        "Return JSON:\n"
+        "{\n"
+        '  "verdicts": [\n'
+        '    {"index": 0,\n'
+        '     "reason": "where the same behaviour is still checked, or what '
+        'is no longer checked",\n'
+        '     "weakened": true|false}\n'
+        "  ]\n"
+        "}\n"
+        "Answer for every edit, by the index it was given. An edit you cannot "
+        "account for weakens the tests."
+    )
+
+
+#: Same arrangement as :data:`MUTATION_SHAPE`, and for the same reason: the
+#: reason is where the model looks for the place the check went, and asked
+#: after ``weakened`` it would only be defending the answer.
+TAMPER_SHAPE = obj(
+    {"verdicts": arr(obj({"index": INTEGER, "reason": STRING,
+                          "weakened": BOOLEAN},
+                         required=("index", "reason", "weakened")))},
     required=("verdicts",),
 )
 
@@ -691,23 +751,25 @@ EXPERIMENT_VERDICT = (
     "is inconclusive and the finding says why. A refuted hypothesis is "
     "a good result; do not soften it.\nReturn JSON:\n"
     "{\n"
-    '  "verdict": "supported|refuted|inconclusive",\n'
     '  "finding": "what this establishes, with the numbers in it",\n'
+    '  "verdict": "supported|refuted|inconclusive",\n'
     '  "confidence": "verified|inferred|uncertain",\n'
     '  "implications": ["what this changes about what gets built"],\n'
     '  "next": "the action this argues for, or an empty string"\n'
     "}"
 )
 
+#: The finding, numbers and all, is written before the verdict it supports;
+#: see :data:`REVIEW_SHAPE`.
 VERDICT_SHAPE = obj(
     {
-        "verdict": enum("supported", "refuted", "inconclusive"),
         "finding": STRING,
+        "verdict": enum("supported", "refuted", "inconclusive"),
         "confidence": CONFIDENCE,
         "implications": arr(),
         "next": STRING,
     },
-    required=("verdict", "finding"),
+    required=("finding", "verdict"),
 )
 
 

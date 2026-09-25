@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import mutate, prompts
+from . import mutate, prompts, tamper
 from .agents import Prompt
 from .log import Logger, NULL
 from .sandbox import Result, Sandbox
@@ -60,11 +60,18 @@ class Verification:
         return "\n".join(str(g) for g in self.gates)
 
     def failure_output(self, limit: int = 6000) -> str:
-        """The tail of what failed: a build log puts the error last."""
+        """The tail of what failed: a build log puts the error last.
+
+        A gate that ran no command -- a judgement over the tree, like the
+        mutation or the tampering gate -- has only its detail to say what
+        failed, and :meth:`report` cuts that to a line. So when no command
+        failed, the failing gates are given whole.
+        """
         if limit <= 0:            # [-0:] is the whole string, which is not "none"
             return ""
         chunks = [r.summary() for r in self.results if not r.ok]
-        return ("\n\n".join(chunks) or self.report())[-limit:]
+        judged = "\n\n".join(f"[FAIL] {g.name}: {g.detail}" for g in self.failures)
+        return ("\n\n".join(chunks) or judged or self.report())[-limit:]
 
 
 _MISSING_TOOL = re.compile(r"([\w.+-]+): (?:not found|command not found)")
@@ -340,6 +347,104 @@ def screen_mutants(agents, survivors: list, log: Logger = NULL) -> tuple[list, l
     return confirmed, dismissed
 
 
+def tampering_gate(sandbox: Sandbox, ticket, baseline: tamper.Surface, cfg: dict,
+                   *, agents=None, log: Logger = NULL) -> Gate:
+    """Refuse a change that made the tests pass by making them ask less.
+
+    *baseline* is the test surface at the last completed ticket; see
+    :mod:`hermes.tamper` for what is compared and why it is that tree.
+
+    A smaller collected suite fails the gate outright for any ticket whose
+    kind cannot need one. Everything else found -- a check gone, a test
+    skipped, the setup changed -- is a fact about the edit that only becomes
+    a failure unless the screen gives a reason it does not weaken the tests.
+    That is the reverse of the mutation screen, and on purpose: a surviving
+    mutant is usually a fault no test could catch, so there silence means no
+    veto, whereas an assert that is no longer there is not a guess, and the
+    agent asked about it is the one that removed it. Without a screen, or
+    with one that fails, every finding stands. ``block: false`` makes the
+    whole gate a report.
+    """
+    after = tamper.capture(sandbox, baseline.command,
+                           timeout=int(cfg.get("timeout", 120)), log=log)
+    findings = tamper.compare(baseline, after, ticket.kind)
+    if not findings:
+        counted = (f" ({len(after.collected)} tests collected, "
+                   f"{len(baseline.collected)} before)"
+                   if baseline.collected is not None and after.collected is not None
+                   else f" (ids not compared: {baseline.note})" if baseline.note else "")
+        clean = ("no Python tests existed before this ticket" if baseline.empty
+                 else "no existing test lost a check, a test or its settings")
+        return Gate("tampering", True, clean + counted)
+    hard = [f for f in findings if f.hard]
+    soft = [f for f in findings if not f.hard]
+    cleared: dict[int, str] = {}
+    if soft and agents and cfg.get("screen", True):
+        cleared = screen_edits(agents, ticket, soft,
+                               tamper.evidence(baseline, after, soft), log=log)
+    standing = hard + [f for i, f in enumerate(soft) if i not in cleared]
+    excused = [f"{soft[i].describe()} -- {reason}" for i, reason in sorted(cleared.items())]
+    log.info("tampering.found", hard=len(hard), soft=len(soft), cleared=len(cleared))
+    if not standing:
+        return Gate("tampering", True,
+                    f"{len(excused)} edit(s) to existing tests, judged not to weaken "
+                    "them:\n" + "\n".join(f"- {line}" for line in excused))
+    lines = ["the tests ask less than they did at the last completed ticket:"]
+    lines += [f"- {f.describe()}" for f in standing]
+    lines.append("Put back what was removed. A check that no longer applies is "
+                 "replaced by one that tests the new behaviour, never deleted, "
+                 "skipped or loosened.")
+    if excused:
+        lines.append(f"({len(excused)} other edit(s) judged not to weaken them: "
+                     + "; ".join(excused) + ")")
+    return Gate("tampering", not cfg.get("block", True), "\n".join(lines))
+
+
+def screen_edits(agents, ticket, findings: list, evidence: str,
+                 log: Logger = NULL) -> dict[int, str]:
+    """The findings the reviewer gives a reason to excuse, by index.
+
+    Only an explicit ``"weakened": false`` with a reason attached excuses
+    one. A screen that failed, skipped an index or gave no reason excuses
+    nothing, which is the direction that costs a repair cycle rather than a
+    weakened suite.
+    """
+    reviewer = agents["reviewer"]
+    prompt = Prompt(reviewer, log=log)
+    prompt.add("ticket",
+               f"TICKET {ticket.id} ({ticket.kind}): {ticket.title}\n"
+               f"OBJECTIVE: {ticket.objective}\n"
+               "ACCEPTANCE CRITERIA:\n"
+               + "\n".join(f"- {a}" for a in ticket.acceptance), required=True)
+    edits = prompt.add("edits", priority=10, floor=600)
+    prompt.add("instructions", prompts.tamper_screen(len(findings)), required=True)
+    listing = ("EDITS TO EXISTING TESTS:\n"
+               + "\n".join(f"[{i}] {f.describe()}" for i, f in enumerate(findings))
+               + "\n\nTHE EDITS:\n")
+    edits.fill(listing + evidence[: max(0, edits.room() - len(listing))])
+    try:
+        verdicts = reviewer.ask_json(prompt.render(), schema=prompts.TAMPER_SHAPE)
+    except Exception as exc:  # noqa: BLE001 - no answer excuses nothing
+        log.warn("tampering.screen_failed", error=str(exc)[:200])
+        return {}
+    cleared = {}
+    for verdict in (verdicts.get("verdicts") or []) if isinstance(verdicts, dict) else []:
+        if not isinstance(verdict, dict) or verdict.get("weakened") is not False:
+            continue
+        index, reason = _int(verdict.get("index")), str(verdict.get("reason") or "").strip()
+        if index is not None and 0 <= index < len(findings) and reason:
+            cleared[index] = reason[:300]
+    log.info("tampering.screened", findings=len(findings), cleared=len(cleared))
+    return cleared
+
+
+def _int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def record_installs(sandbox: Sandbox, plan: dict) -> None:
     """Fold anything Hermes had to install into the project's own setup command.
 
@@ -377,12 +482,21 @@ def verify_project(sandbox: Sandbox, plan: dict, *, include_benchmark: bool = Fa
 def verify_ticket(sandbox: Sandbox, ticket, plan: dict, changed: list[str],
                   log: Logger = NULL, tests_required: bool = True,
                   classifier=None, mutation: dict | None = None,
-                  agents=None) -> Verification:
+                  agents=None, baseline: tamper.Surface | None = None,
+                  tampering: dict | None = None) -> Verification:
     """Gate a single ticket: its own validation commands plus the project tests.
 
     Early in a project the test suite does not exist yet, so failing it would
     block the very ticket that creates it. Until the suite has passed once,
     it is advisory; from then on it is a hard regression gate.
+
+    *baseline* is the test surface at the last completed ticket, and with it
+    the tampering gate asks whether the tests passed because they were made
+    to ask less; *tampering* configures it. It runs only once everything else
+    passed -- a weakening that did not make the suite pass bought nothing,
+    and the next attempt is checked against the same baseline anyway -- and
+    before the mutation gate, which would otherwise measure a suite that had
+    already been weakened.
 
     *mutation* configures the gate that measures those tests rather than
     trusting them; it runs last and only when everything before it passed,
@@ -400,6 +514,10 @@ def verify_ticket(sandbox: Sandbox, ticket, plan: dict, changed: list[str],
                  required=tests_required, log=log)
     verification.gates.append(
         security_gate(sandbox.root, changed, classifier=classifier, clean="clean"))
+    tampering = tampering or {}
+    if baseline is not None and tampering.get("enabled", True) and verification.passed:
+        verification.gates.append(
+            tampering_gate(sandbox, ticket, baseline, tampering, agents=agents, log=log))
     if mutation and mutation.get("enabled") and verification.passed:
         verification.gates.append(
             mutation_gate(sandbox, plan, changed, mutation, agents=agents, log=log))

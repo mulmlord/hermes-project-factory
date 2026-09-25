@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 
@@ -38,16 +39,16 @@ from hermes.models import (ModelError, PromptTooLarge, Router, extract_json,
 from hermes.openhands import OpenHands
 from hermes.research import ResearchLog, investigate
 from hermes.resources import Governor
-from hermes import harness, mutate, prompts, schema
+from hermes import harness, mutate, prompts, schema, tamper
 from hermes.sandbox import Sandbox, SandboxError
 from hermes.sources import Librarian, marker, quarantine
 from hermes.state import State, StateError, checkpoint, restore
 from hermes.tickets import Board, split_validation
 from hermes.tools import LOOKUP_REQUEST, Lookup, Quarantined, Toolbox
 from hermes.classify import Classifier, ClassifierConfig, chunks
-from hermes.verify import (Verification, installs, mutation_gate, review,
-                           scan_unsafe, security_gate, text_gate, verify_project,
-                           verify_ticket)
+from hermes.verify import (Gate, Verification, installs, mutation_gate, review,
+                           scan_unsafe, security_gate, tampering_gate, text_gate,
+                           verify_project, verify_ticket)
 from hermes import cli, workspace
 
 
@@ -535,6 +536,7 @@ SHAPES = [
     (prompts.REVIEW, prompts.REVIEW_SHAPE),
     (prompts.TRIAGE, prompts.TRIAGE_SHAPE),
     (prompts.mutation_screen(2), prompts.MUTATION_SHAPE),
+    (prompts.tamper_screen(2), prompts.TAMPER_SHAPE),
     (prompts.experiment_design(60, "protocol"), prompts.EXPERIMENT),
     (prompts.EXPERIMENT_VERDICT, prompts.VERDICT_SHAPE),
     (prompts.evolution_direction("family"), prompts.PROPOSAL),
@@ -591,6 +593,7 @@ def test_a_reordered_prompt_still_shows_the_evidence_first():
     """The example the model reads must agree with the grammar it is held to."""
     for text, first, verdict in ((prompts.REVIEW, '"blocking"', '"approved"'),
                                  (prompts.mutation_screen(1), '"reason"', '"observable"'),
+                                 (prompts.tamper_screen(1), '"reason"', '"weakened"'),
                                  (prompts.EXPERIMENT_VERDICT, '"finding"', '"verdict"')):
         assert text.index(first) < text.index(verdict)
 
@@ -3714,6 +3717,328 @@ def test_mutation_is_off_until_an_operator_turns_it_on(tmp_path):
 
     assert verification.passed
     assert "mutation" not in [g.name for g in verification.gates]
+
+
+# -- test tampering ----------------------------------------------------------
+
+#: A suite holding each thing a change can take away from it: a boundary
+#: check, a test of its own, and an exception check inside a class.
+SUITE = '''\
+import pytest
+from calc import over
+
+
+def test_over():
+    assert over(11)
+    assert not over(10)
+
+
+class TestErrors:
+    def test_none(self):
+        with pytest.raises(TypeError):
+            over(None)
+'''
+
+#: Edits that make SUITE ask less, and the one finding each must produce.
+WEAKENINGS = {
+    "assert removed": ("    assert not over(10)\n", "",
+                       "test_over no longer checks `assert not over(10)`"),
+    "assert rewritten": ("not over(10)", "not over(9)",
+                         "test_over no longer checks `assert not over(10)`"),
+    "test deleted": ("def test_over():\n    assert over(11)\n    assert not over(10)\n", "",
+                     "test_over was deleted"),
+    "test skipped": ("def test_over", "@pytest.mark.skip(reason='flaky')\ndef test_over",
+                     "test_over is now skipped or expected to fail"),
+    "class xfailed": ("class TestErrors", "@pytest.mark.xfail\nclass TestErrors",
+                      "TestErrors::test_none is now skipped or expected to fail"),
+    "skip call": ("        with pytest", "        pytest.skip('later')\n        with pytest",
+                  "TestErrors::test_none is now skipped or expected to fail"),
+    "module marked": ("from calc import over", "from calc import over\n"
+                      "pytestmark = pytest.mark.skip", "now skips every test in it"),
+    "importorskip": ("import pytest\n", "import pytest\nnp = pytest.importorskip('numpy')\n",
+                     "now skips every test in it"),
+}
+
+#: Edits that leave SUITE asking everything it asked before.
+KEPT = {
+    "reformatted": ("assert over(11)", "assert over( 11 )  # the obvious case"),
+    "renamed": ("def test_over", "def test_over_boundary"),
+    "into a helper": ("    assert not over(10)\n",
+                      "    _not_at_boundary()\n\n\ndef _not_at_boundary():\n"
+                      "    assert not over(10)\n"),
+    "test added": ("class TestErrors", "def test_far():\n    assert over(99)\n\n\n"
+                                       "class TestErrors"),
+}
+
+
+def _surface(text: str | None = SUITE, **kw) -> tamper.Surface:
+    return tamper.Surface(files={} if text is None else {"tests/test_calc.py": text}, **kw)
+
+
+def _found(after: str, kind: str = "implementation") -> list[str]:
+    return [f.describe() for f in tamper.compare(_surface(), _surface(after), kind)]
+
+
+@pytest.mark.parametrize("name", WEAKENINGS)
+def test_every_way_of_asking_the_suite_less_is_found(name):
+    """One finding per edit: a deleted test is not also reported per assert."""
+    old, new, expected = WEAKENINGS[name]
+    found = _found(SUITE.replace(old, new))
+    assert len(found) == 1 and expected in found[0], found
+    assert not tamper.compare(_surface(), _surface(SUITE.replace(old, new)))[0].hard
+
+
+@pytest.mark.parametrize("name", KEPT)
+def test_a_check_that_moved_is_still_a_check(name):
+    """Compared as syntax over the whole suite, so layout and location do not count."""
+    old, new = KEPT[name]
+    assert _found(SUITE.replace(old, new)) == []
+
+
+def test_a_test_moved_to_another_file_was_not_deleted():
+    moved = tamper.Surface(files={"tests/test_boundary.py": SUITE})
+    assert tamper.compare(_surface(), moved) == []
+    gone = [f.describe() for f in tamper.compare(_surface(), _surface(None))]
+    assert gone == ["tests/test_calc.py::test_over was deleted",
+                    "tests/test_calc.py::TestErrors::test_none was deleted"]
+
+
+def test_nothing_is_weakened_where_there_was_nothing():
+    """The ticket that writes the first test is not held to the empty suite before it."""
+    assert tamper.compare(tamper.Surface(), _surface()) == []
+    assert tamper.compare(tamper.Surface(collected=[]), _surface(collected=[])) == []
+
+
+@pytest.mark.parametrize("after,flagged", [
+    ("@pytest.fixture\ndef calc():\n    return 1\n\n\n@pytest.fixture\ndef other():\n"
+     "    return 2\n", False),
+    ("@pytest.fixture\ndef calc():\n    return 2\n", True),
+    ("@pytest.fixture\ndef calc():\n    return 1\n\n\ndef pytest_collection_modifyitems"
+     "(items):\n    items[:] = items[:1]\n", True),
+    ("@pytest.fixture\ndef calc():\n    return 1\n\n\ncollect_ignore = ['tests']\n", True),
+    ("@pytest.fixture\ndef calc():\n    return 1\n\n\n@pytest.fixture(autouse=True)\n"
+     "def quiet(monkeypatch):\n    pass\n", True),
+], ids=["fixture added", "fixture rewritten", "hook added", "ignore list", "autouse"])
+def test_shared_setup_is_flagged_where_it_can_change_which_tests_run(after, flagged):
+    before = "import pytest\n\n\n@pytest.fixture\ndef calc():\n    return 1\n"
+    found = tamper.compare(tamper.Surface(files={"tests/test_calc.py": SUITE,
+                                                 "conftest.py": before}),
+                           tamper.Surface(files={"tests/test_calc.py": SUITE,
+                                                 "conftest.py": "import pytest\n\n\n" + after}))
+    assert bool(found) is flagged, found
+
+
+def test_only_the_pytest_section_of_a_settings_file_is_compared():
+    toml = '[project]\nname = "calc"\n\n[tool.pytest.ini_options]\naddopts = "-q"\n'
+
+    def found(text):
+        section = lambda t: {"pyproject.toml": tamper._section(t, tamper.SETTINGS["pyproject.toml"])}
+        return tamper.compare(_surface(settings=section(toml)), _surface(settings=section(text)))
+
+    assert found(toml.replace('"calc"', '"calc"\ndependencies = ["attrs"]')) == []
+    assert found(toml + "# a comment is not a setting\n") == []
+    deselected = found(toml.replace('"-q"', '"-q -k \'not over\'"'))
+    assert [f.describe() for f in deselected] == [
+        "pyproject.toml has different pytest settings under `[tool.pytest.ini_options]`"]
+
+
+def test_a_smaller_suite_is_refused_outright_only_where_nothing_needs_one():
+    """The one finding no reason can excuse, except for the kinds that own tests."""
+    ids = ["tests/test_calc.py::test_over", "tests/test_calc.py::test_none",
+           "tests/test_calc.py::test_far"]
+    before, after = _surface(collected=ids), _surface(collected=ids[:1])
+    [smaller] = tamper.compare(before, after, "implementation")
+    assert smaller.hard
+    assert "2 fewer tests are collected (1, was 3)" in smaller.what
+    assert "test_none" in smaller.what and "test_far" in smaller.what
+    for kind in tamper.MAY_SHRINK:
+        assert not tamper.compare(before, after, kind)[0].hard
+    [lost] = tamper.compare(before, _surface(collected=None, note="collection failed"),
+                            "test")
+    assert lost.hard, "a suite that cannot be counted cannot be shown to be whole"
+
+
+@pytest.mark.parametrize("command,collects", [
+    ("pytest -q", True),
+    ("python3 -m pytest -q tests", True),
+    ("PYTHONPATH=src python -m pytest", True),
+    ("cd pkg && pytest", True),
+    ("/opt/venv/bin/python3.12 -m pytest", True),
+    ("pytest && flake8", False),        # the flags would land on flake8
+    ("pytest | tee log", False),        # and this output is not ours to read
+    ("make test", False),
+    ("python3 tests/test_calc.py", False),
+])
+def test_only_a_plain_pytest_run_is_asked_for_its_ids(command, collects):
+    collect = tamper.collect_command(command)
+    assert bool(collect) is collects
+    if collects:
+        assert collect.startswith(command) and collect.endswith("--verbosity=-1")
+
+
+def test_ids_stop_where_the_warnings_start():
+    """A warnings summary groups its lines under node ids, and those are not tests."""
+    output = ("tests/t.py::test_a\ntests/t.py::test_b[1]\n\n"
+              "=== warnings summary ===\ntests/t.py::test_a\n  DeprecationWarning\n\n"
+              "2 tests collected in 0.01s\n")
+    assert tamper._ids(output) == ["tests/t.py::test_a", "tests/t.py::test_b[1]"]
+
+
+def test_the_tests_are_the_same_files_to_both_gates(tmp_path):
+    """What mutation never breaks is exactly what tampering guards."""
+    for path in ("tests/helpers.py", "conftest.py", "pkg/test_io.py", "pkg/io_test.py",
+                 "test/conftest.py"):
+        assert tamper.is_test(path), path
+    for path in ("src/calc.py", "src/contest.py", "tests/data.json", "testing.py"):
+        assert not tamper.is_test(path), path
+    sandbox, _ = _project(tmp_path, WEAK)
+    sandbox.write("conftest.py", "LIMIT = 1\n")
+    assert {m.path for m in mutate.candidates(sandbox, ["calc.py", "conftest.py"])} == {"calc.py"}
+
+
+def _tamper_screen(weakened, reason="the boundary is still checked", seen=None, fail=False):
+    def answer(prompt):
+        if seen is not None:
+            seen.append(prompt)
+        if fail:
+            raise RuntimeError("the reviewer's server went away")
+        return {"verdicts": [{"index": i, "reason": reason, "weakened": weakened}
+                             for i in range(4)]}
+    return {"reviewer": _agent(answer, task="review", name="reviewer")}
+
+
+def _tampered(tmp_path, suite: str):
+    """A workspace whose suite was SUITE at the last completed ticket, now *suite*."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 60})
+    sandbox.write("src/calc.py", DECISION)
+    sandbox.write("tests/test_calc.py", SUITE)
+    baseline = tamper.capture(sandbox, "")
+    sandbox.write("tests/test_calc.py", suite)
+    ticket = Board(tmp_path).add(title="tune the boundary", status="active",
+                                 acceptance=["over(10) is still false"])
+    return sandbox, ticket, baseline
+
+
+def test_an_edit_to_an_existing_test_stands_unless_the_screen_says_where_it_went(tmp_path):
+    """The reverse of the mutation screen: silence here excuses nothing."""
+    sandbox, ticket, baseline = _tampered(
+        tmp_path, SUITE.replace("    assert not over(10)\n", ""))
+
+    seen: list = []
+    refused = tampering_gate(sandbox, ticket, baseline, {},
+                             agents=_tamper_screen(True, "nothing else checks it", seen))
+    assert not refused.passed
+    assert "test_over no longer checks `assert not over(10)`" in refused.detail
+    # The screen is shown the edit and what the ticket asked for, and nothing else.
+    assert "-    assert not over(10)" in seen[0] and "over(10) is still false" in seen[0]
+    assert "return n > 10" not in seen[0]
+
+    excused = tampering_gate(sandbox, ticket, baseline, {}, agents=_tamper_screen(False))
+    assert excused.passed and "the boundary is still checked" in excused.detail
+
+    for unexcused in (tampering_gate(sandbox, ticket, baseline, {},
+                                     agents=_tamper_screen(False, reason="")),
+                      tampering_gate(sandbox, ticket, baseline, {},
+                                     agents=_tamper_screen(False, fail=True)),
+                      tampering_gate(sandbox, ticket, baseline, {}, agents=None),
+                      tampering_gate(sandbox, ticket, baseline, {"screen": False},
+                                     agents=_tamper_screen(False))):
+        assert not unexcused.passed, unexcused.detail
+
+    reported = tampering_gate(sandbox, ticket, baseline, {"block": False})
+    assert reported.passed and "no longer checks" in reported.detail
+
+
+def test_an_untouched_suite_passes_and_says_what_it_compared(tmp_path):
+    sandbox, ticket, baseline = _tampered(tmp_path, SUITE + "\n\ndef test_far():\n"
+                                                            "    assert over(99)\n")
+    gate = tampering_gate(sandbox, ticket, baseline, {}, agents=None)
+    assert gate.passed and "no existing test lost" in gate.detail
+    assert "not a single pytest run" in gate.detail     # and what it could not
+
+
+def _pytest_project(tmp_path):
+    """SUITE under the real pytest running these tests, so the ids are real ids."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 120})
+    sandbox.write("src/calc.py", DECISION)
+    sandbox.write("tests/test_calc.py", SUITE)
+    command = f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider"
+    baseline = tamper.capture(sandbox, tamper.collect_command(command))
+    return sandbox, baseline
+
+
+def test_a_setting_that_deselects_a_test_is_caught_by_the_count(tmp_path):
+    """The one edit no syntax shows: the test is intact and never runs.
+
+    A reason from the screen excuses the settings change, which is only a
+    fact about a file; it cannot excuse the suite getting smaller, which is
+    the effect.
+    """
+    sandbox, baseline = _pytest_project(tmp_path)
+    assert baseline.collected == ["tests/test_calc.py::test_over",
+                                  "tests/test_calc.py::TestErrors::test_none"], baseline.note
+    sandbox.write("pytest.ini", "[pytest]\naddopts = -k 'not over'\n")
+    ticket = Board(tmp_path).add(title="tune the boundary", status="active")
+
+    gate = tampering_gate(sandbox, ticket, baseline, {}, agents=_tamper_screen(False))
+
+    assert not gate.passed
+    assert "1 fewer test is collected (1, was 2)" in gate.detail
+    assert "tests/test_calc.py::test_over" in gate.detail
+    assert "judged not to weaken" in gate.detail      # the settings edit, excused
+
+    ticket.kind = "refactor"          # a kind that may merge tests may be believed
+    assert tampering_gate(sandbox, ticket, baseline, {},
+                          agents=_tamper_screen(False)).passed
+
+
+def test_a_suite_made_green_by_removing_its_check_fails_the_ticket(tmp_path):
+    """Through verify_ticket: after every other gate, and before mutation.
+
+    Mutation run on the weakened suite would measure the wrong suite, and the
+    repair path has to be told which check to put back, not that a gate failed.
+    """
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 30})
+    sandbox.write("src/calc.py", DECISION)
+    sandbox.write("tests/test_calc.py", STRONG)
+    plan = {"commands": {"test": "python3 tests/test_calc.py"}}
+    baseline = tamper.capture(sandbox, tamper.collect_command(plan["commands"]["test"]))
+    ticket = Board(tmp_path).add(title="tune the boundary", status="active",
+                                 validation=["true"])
+    # The "fix": the boundary moved, and the check that noticed taken out.
+    sandbox.write("src/calc.py", "def over(n):\n    return n >= 10\n")
+    sandbox.write("tests/test_calc.py", WEAK)
+    changed = ["src/calc.py", "tests/test_calc.py"]
+
+    verification = verify_ticket(sandbox, ticket, plan, changed, baseline=baseline,
+                                 tampering={}, mutation={"enabled": True, "mutants": 2},
+                                 agents=_tamper_screen(True))
+
+    assert not verification.passed
+    assert [g.name for g in verification.gates][-1] == "tampering"
+    assert "no longer checks `assert not over(10)`" in verification.failure_output()
+    assert "tampering" not in [g.name for g in verify_ticket(
+        sandbox, ticket, plan, changed).gates]        # no baseline, nothing to compare
+    assert "tampering" not in [g.name for g in verify_ticket(
+        sandbox, ticket, plan, changed, baseline=baseline,
+        tampering={"enabled": False}).gates]
+
+    sandbox.write("tests/test_calc.py", STRONG)       # the check back: the code fails it
+    red = verify_ticket(sandbox, ticket, plan, changed, baseline=baseline, tampering={})
+    assert not red.passed and "tampering" not in [g.name for g in red.gates]
+
+
+def test_a_judged_gate_reaches_the_repair_path_whole():
+    """A gate with no command behind it has only its detail to say what failed."""
+    detail = "the tests ask less:\n" + "\n".join(f"- check {i} is gone" for i in range(40))
+    verification = Verification(gates=[Gate("tests", True, "ok"),
+                                       Gate("tampering", False, detail)])
+    assert len(detail) > 200 and "check 39 is gone" in verification.failure_output()
+
+
+def test_tampering_is_checked_unless_an_operator_turns_it_off():
+    assert DEFAULTS["verification"]["tampering"]["enabled"] is True
+    assert DEFAULTS["verification"]["tampering"]["block"] is True
 
 
 # -- evolution ---------------------------------------------------------------

@@ -27,10 +27,10 @@ import os
 import time
 from dataclasses import dataclass, field, replace
 from itertools import count
-from pathlib import Path
 
 from .log import Logger, NULL
 from .sandbox import Sandbox
+from .tamper import is_test
 
 #: Comparisons, swapped for the neighbour a test is most likely to miss: an
 #: off-by-one boundary rather than a negation, where both are available.
@@ -332,14 +332,13 @@ def candidates(sandbox: Sandbox, paths: list[str]) -> list[Mutant]:
     """Mutants available in the Python sources among *paths*.
 
     Test files are excluded: a fault injected into a test proves nothing about
-    whether the tests would catch a fault.
+    whether the tests would catch a fault. Which files those are is
+    :func:`hermes.tamper.is_test`'s answer, the same files the tampering gate
+    guards, so the two can never disagree about which side a file is on.
     """
     found: list[Mutant] = []
     for path in sorted(set(paths)):
-        name = Path(path).name
-        if not path.endswith(".py") or name.startswith("test_") or name.endswith("_test.py"):
-            continue
-        if "tests" in Path(path).parts[:-1]:
+        if not path.endswith(".py") or is_test(path):
             continue
         source = sandbox.read(path)
         if source and _faithful(source):

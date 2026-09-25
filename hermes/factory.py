@@ -102,6 +102,10 @@ class Factory:
         self.state.save(self.root)
         self.board.save()
         workspace.write_context(self.root, self.state, self._board_extra())
+        # Refreshed beside CONTEXT.md rather than at planning time: the guide
+        # quotes the project's build and test commands, and those are only
+        # real once the architect has chosen them.
+        workspace.write_agents(self.root, self.state)
         if self.config.get("github.issues", True):
             # Free while GitHub is disabled or the project has no repository,
             # and free again on a board that did not move.

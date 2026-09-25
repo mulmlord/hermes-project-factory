@@ -204,6 +204,9 @@ def test_loop_reaches_completed(factory):
 
     # The workspace documents itself without Hermes internals.
     assert "tiny-calc" in (factory.root / "SPEC.md").read_text()
+    guide = (factory.root / "AGENTS.md").read_text()
+    assert "## Build and test commands" in guide
+    assert "- Test: `python3 tests/test_calc.py`" in guide
     assert (factory.root / "docs" / "architecture" / "overview.md").is_file()
     assert list((factory.root / "docs" / "decisions").glob("*.md"))
 

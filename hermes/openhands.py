@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .agents import ticket_block
 from .log import Logger, NULL
+from .sandbox import carries_secret, without_credentials
 
 #: Tickets where a full agent loop tends to beat one-shot generation.
 PREFERRED_KINDS = {"refactor"}
@@ -41,14 +42,25 @@ class OpenHands:
         return len(ticket.artifacts) >= 3 or ticket.attempts >= 2
 
     def _env(self) -> dict:
-        """Point OpenHands at the local endpoint. No hosted API keys are set."""
+        """Point OpenHands at the local endpoint, carrying no host credentials.
+
+        The sieve is :func:`~hermes.sandbox.carries_secret` rather than a list
+        of its own: OpenHands is an agent loop with a shell over the same
+        workspace, so whatever the sandbox refuses to tell generated code it
+        must refuse too. The list it kept here named six vendors and let
+        ``HF_TOKEN``, ``NPM_TOKEN`` and ``SSH_AUTH_SOCK`` past.
+
+        The overrides land after the sieve, not before it: ``LLM_API_KEY`` is
+        credential-shaped by name and OpenHands aborts without it.
+        """
         base = self.model.base_url.rstrip("/")
         if self.model.backend == "ollama":
             model, api_base = f"ollama/{self.model.model}", base
         else:
             model = f"openai/{self.model.model}"
             api_base = base if base.endswith("/v1") else base + "/v1"
-        env = dict(os.environ)
+        env = {k: without_credentials(v) for k, v in os.environ.items()
+               if not carries_secret(k)}
         env.update({
             "LLM_MODEL": model,
             "LLM_BASE_URL": api_base,
@@ -60,11 +72,6 @@ class OpenHands:
             "SANDBOX_USER_ID": str(os.getuid()),
             "LOG_ALL_EVENTS": "false",
         })
-        for secret in list(env):
-            if any(k in secret.upper() for k in
-                   ("ANTHROPIC", "OPENAI_API_KEY", "GEMINI", "OPENROUTER", "GH_TOKEN",
-                    "GITHUB_TOKEN", "AWS_")):
-                env.pop(secret, None)
         return env
 
     def run_ticket(self, root: Path, ticket, context: str,

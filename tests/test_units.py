@@ -42,7 +42,7 @@ from hermes.openhands import OpenHands
 from hermes.research import ResearchLog, investigate
 from hermes.resources import Governor
 from hermes import harness, mutate, prompts, schema, tamper
-from hermes.sandbox import Sandbox, SandboxError
+from hermes.sandbox import Sandbox, SandboxError, carries_secret
 from hermes.sources import Librarian, marker, quarantine
 from hermes.state import State, StateError, checkpoint, restore
 from hermes.tickets import Board, split_validation
@@ -1087,14 +1087,161 @@ def test_an_unrelated_start_failure_is_not_blamed_on_the_runtime(tmp_path, monke
     assert sandbox.runtime == "local" and "nope" in sandbox.fallback
 
 
-def test_sandbox_strips_secrets_from_local_env(tmp_path):
-    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
-    import os
-    os.environ["MY_SECRET_TOKEN"] = "sensitive"
-    try:
-        assert "MY_SECRET_TOKEN" not in sandbox._local_env()
-    finally:
-        os.environ.pop("MY_SECRET_TOKEN")
+#: Credential names built the way real ones are: a vendor and a word for the
+#: thing. The point is not the vendors -- it is that a filter naming vendors
+#: is a filter that fails on the next one, so the test generates vendors the
+#: filter has never been told about.
+_VENDORS = ("AWS", "GH", "GITHUB", "GITLAB", "HF", "HUGGINGFACE", "NPM", "PYPI",
+            "VAULT", "AZURE", "GOOGLE", "SLACK", "STRIPE", "DATADOG", "SENTRY",
+            "CLOUDFLARE", "TAILSCALE", "ACME", "MY", "INTERNAL")
+_SHAPES = ("{v}_TOKEN", "{v}_API_KEY", "{v}_KEY", "{v}_SECRET", "{v}_ACCESS_KEY",
+           "{v}_SECRET_ACCESS_KEY", "{v}_PASSWORD", "{v}_CREDENTIALS",
+           "{v}_AUTH_TOKEN", "{v}_SESSION_TOKEN", "{v}_PRIVATE_KEY")
+
+#: Credentials whose names say nothing, which is what makes them the ones a
+#: name filter misses. An agent socket signs as the user; a docker socket is
+#: root on the host; a kubeconfig is a path to cluster credentials.
+_HANDLES = ("SSH_AUTH_SOCK", "DOCKER_HOST", "DOCKER_CERT_PATH", "KUBECONFIG",
+            "GPG_AGENT_INFO", "NETRC")
+
+
+def _credential_names() -> list[str]:
+    names = [shape.format(v=vendor) for vendor in _VENDORS for shape in _SHAPES]
+    return names + list(_HANDLES) + [n.lower() for n in _HANDLES[:3]]
+
+
+def test_no_variable_shaped_like_a_credential_reaches_code_hermes_did_not_write(
+        tmp_path, monkeypatch):
+    """Isolating the agent does not isolate the secret.
+
+    Both paths that hand a host environment to untrusted code -- the local
+    sandbox and the OpenHands runner -- are swept with the same 220-odd
+    generated names, because the two used to filter through lists of their
+    own and the narrower one passed ``HF_TOKEN`` and ``SSH_AUTH_SOCK``
+    straight to an agent loop with a shell. Vendors are generated rather than
+    listed: a filter that enumerates today's vendors is a filter that fails
+    on tomorrow's.
+    """
+    planted = _credential_names()
+    for name in planted:
+        monkeypatch.setenv(name, "sensitive")
+    model = SimpleNamespace(backend="ollama", model="qwen3:30b-a3b",
+                            base_url="http://localhost:11434")
+    environments = {
+        "local sandbox": Sandbox(tmp_path, {"runtime": "local"})._local_env(),
+        "openhands": OpenHands({"enabled": True}, model)._env(),
+    }
+
+    for where, env in environments.items():
+        leaked = sorted(set(planted) & set(env))
+        assert not leaked, f"{where} passed {leaked[:5]} to untrusted code"
+        assert "sensitive" not in set(env.values()), f"{where} leaked a value"
+    # Not merely "drops everything": what a toolchain needs still arrives.
+    assert environments["local sandbox"]["PATH"] == os.environ["PATH"]
+
+
+def test_the_endpoint_placeholder_survives_the_sieve_that_drops_keys(tmp_path):
+    """``LLM_API_KEY`` is credential-shaped and load-bearing at the same time.
+
+    OpenHands aborts under ``--override-with-envs`` when it is unset, so the
+    overrides have to be applied after the filter. Filtering last would leave
+    the runner refusing to start for the sake of a placeholder that says
+    "local".
+    """
+    model = SimpleNamespace(backend="vllm", model="qwen",
+                            base_url="http://127.0.0.1:6767")
+    env = OpenHands({"enabled": True}, model)._env()
+    assert env["LLM_API_KEY"] == "local" and env["LLM_MODEL"] == "openai/qwen"
+    assert carries_secret("LLM_API_KEY")        # it is dropped, then re-set
+
+
+def test_a_password_inside_a_proxy_url_does_not_survive_either(tmp_path, monkeypatch):
+    """The one credential shape no check on the name can catch.
+
+    ``HTTPS_PROXY=http://user:hunter2@proxy:8080`` is a password under a name
+    every filter waves through, and dropping the variable outright would take
+    dependency installs down with it. The userinfo goes; the proxy stays.
+    """
+    monkeypatch.setenv("HTTPS_PROXY", "http://agent:hunter2@proxy.internal:8080")
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
+    env = Sandbox(tmp_path, {"runtime": "local"})._local_env()
+
+    assert env["HTTPS_PROXY"] == "http://proxy.internal:8080"
+    assert env["NO_PROXY"] == "localhost,127.0.0.1"   # untouched, and still needed
+
+
+def test_the_container_is_told_nothing_the_host_knows(tmp_path, monkeypatch):
+    """The container's environment is an allowlist, and this is the whole of it.
+
+    ``docker run`` inherits nothing, so the only way a host credential could
+    reach the container is a ``-e`` added here later. Both boxes are checked:
+    a variable added to one and not the other is a hole only the rarer path
+    has.
+    """
+    for name in _credential_names():
+        monkeypatch.setenv(name, "sensitive")
+    sandbox = _docker_sandbox(tmp_path, monkeypatch)
+    started = []
+    monkeypatch.setattr("hermes.sandbox.subprocess.run", lambda argv, **kw: (
+        started.append(argv) or SimpleNamespace(returncode=0, stdout="", stderr="")))
+    monkeypatch.setattr(sandbox, "_workspace_visible", lambda: True)
+    sandbox.start()
+
+    for argv in (started[0], sandbox._docker_argv("true", None, True)):
+        passed = [argv[i + 1].split("=")[0]
+                  for i, flag in enumerate(argv) if flag == "-e"]
+        assert sorted(passed) == ["HOME", "PATH", "PIP_USER", "PYTHONPATH"]
+        assert not [name for name in passed if carries_secret(name)]
+        assert "--env-file" not in argv and "sensitive" not in " ".join(argv)
+
+
+def test_the_filter_refuses_nothing_a_build_legitimately_reads():
+    """A filter that drops everything would pass every leak test and no build.
+
+    ``KEY`` and ``PASS`` are broad on purpose, so the cost of that breadth is
+    worth pinning: a toolchain that cannot see ``PATH`` or ``CFLAGS`` fails
+    in ways nobody traces back to a security filter.
+    """
+    assert not any(carries_secret(name) for name in (
+        "PATH", "HOME", "LANG", "LC_ALL", "TERM", "TZ", "CC", "CXX", "CFLAGS",
+        "LDFLAGS", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV", "HTTPS_PROXY",
+        "NO_PROXY", "CI", "MAKEFLAGS", "CARGO_HOME", "GOPATH", "JAVA_HOME"))
+
+
+def _whole_environ_readers() -> list[tuple[str, str, str]]:
+    """Every function in Hermes that reads the host environment entire.
+
+    A lookup by name -- ``os.environ.get("HERMES_LEDGER")`` -- asks for one
+    thing it names. Everything else takes the lot, secrets included.
+    """
+    taken = re.compile(r"os\.environ(?!\s*(?:\.(?:get|pop|setdefault)\b|\[))")
+    found = []
+    for path in sorted((Path(__file__).resolve().parent.parent / "hermes").glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            body = ast.unparse(node)
+            if taken.search(body):
+                found.append((path.name, node.name, body))
+    return found
+
+
+def test_nothing_copies_the_host_environment_without_the_sieve():
+    """The guard that outlives the two call sites this branch knows about.
+
+    Both leaks so far began as ``env = dict(os.environ)`` written for a good
+    reason in a module whose author was not thinking about credentials. The
+    property is structural, so it can be checked structurally: whoever takes
+    the whole environment has to say, in the same function, which part of it
+    they refuse to pass on.
+    """
+    readers = _whole_environ_readers()
+    assert {(module, func) for module, func, _ in readers} == {
+        ("sandbox.py", "_local_env"), ("openhands.py", "_env")}
+    for module, func, body in readers:
+        assert "carries_secret" in body, (
+            f"{module}:{func} takes the host environment whole and hands it on "
+            "unfiltered; sieve it with sandbox.carries_secret")
 
 
 def test_protected_paths():

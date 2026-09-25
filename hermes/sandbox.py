@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -26,6 +27,47 @@ _PATH = "/tmp/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:
 
 #: Host paths that must never be visible to generated code.
 FORBIDDEN_MOUNTS = ("~/.ssh", "~/.aws", "~/.config/gh", "~/.gnupg", "~/.kube")
+
+#: Substrings that mark a variable name as a credential, matched against the
+#: upper-cased name so ``github_token`` is caught as readily as ``GITHUB_TOKEN``.
+#: Deliberately broader than the vendors of the day: the next key to appear on
+#: a developer's machine will belong to a service nobody here has heard of, and
+#: it will still be spelled with one of these words.
+SECRET_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASS", "CREDENTIAL", "AUTH",
+                      "NETRC", "API_", "AWS_", "GH_", "GITHUB_", "ANTHROPIC",
+                      "OPENAI")
+
+#: Credentials whose names say nothing about what they are. A docker socket is
+#: root on the host, and a kubeconfig is a path to cluster credentials.
+#: :data:`FORBIDDEN_MOUNTS` hides the files these stand for; without this the
+#: environment hands back the way in.
+SECRET_ENV_NAMES = frozenset({"DOCKER_HOST", "DOCKER_CERT_PATH", "KUBECONFIG",
+                              "GPG_AGENT_INFO"})
+
+#: ``scheme://user:pass@host``. The one credential shape that survives every
+#: check on the name, because the name is usually ``HTTPS_PROXY``.
+_URL_CREDENTIALS = re.compile(r"([a-zA-Z][\w+.-]*://)[^/@\s]*:[^/@\s]*@")
+
+
+def carries_secret(name: str) -> bool:
+    """Whether generated code must not be told *name*.
+
+    One predicate for every path that hands an environment to code Hermes did
+    not write. It used to be two lists -- the sandbox's and the OpenHands
+    runner's -- and the narrower of them passed ``HF_TOKEN`` and
+    ``SSH_AUTH_SOCK`` through to an agent loop with a shell.
+    """
+    upper = name.upper()
+    return upper in SECRET_ENV_NAMES or any(m in upper for m in SECRET_ENV_MARKERS)
+
+
+def without_credentials(value: str) -> str:
+    """Drop the ``user:pass@`` from any URL in *value*, leaving the URL usable.
+
+    A proxy has to stay reachable for dependency installs, so the variable
+    cannot simply be dropped -- but the password in it is a password.
+    """
+    return _URL_CREDENTIALS.sub(r"\1", value)
 
 
 @dataclass
@@ -256,6 +298,13 @@ class Sandbox:
         installed console scripts run from it; docker's default is not.
         tmpfs pages count against ``--memory``, and ``--memory-swap`` equal
         to it means the cap is RAM rather than RAM plus as much swap again.
+
+        ``docker run`` passes no host environment unless a ``-e`` asks it to,
+        so the four below are the whole of the container's environment and
+        none of them is a credential. Isolating the code and then handing it
+        the host's keys would be a box with the door left open; adding a
+        ``-e`` here is the only way that could happen, which is why the list
+        is short enough to read.
         """
         memory = str(self.cfg.get("memory", "8g"))
         flags = [
@@ -280,11 +329,15 @@ class Sandbox:
         ]
 
     def _local_env(self) -> dict:
-        """Strip host secrets before handing the environment to generated code."""
-        blocked = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AWS_", "GH_",
-                   "GITHUB_", "ANTHROPIC", "OPENAI")
-        env = {k: v for k, v in os.environ.items()
-               if not any(b in k.upper() for b in blocked)}
+        """Strip host secrets before handing the environment to generated code.
+
+        A blocklist, where the container gets an allowlist: ``local`` runs
+        real builds on the host, and a toolchain reads more of the environment
+        than anyone can enumerate ahead of it. That makes this the weaker rung
+        by construction, which is the trade ``runtime: local`` already names.
+        """
+        env = {k: without_credentials(v) for k, v in os.environ.items()
+               if not carries_secret(k)}
         env["HOME"] = str(self.root)
         env["HERMES_SANDBOX"] = "local"
         env["PYTHONPATH"] = str(self.root / "src")

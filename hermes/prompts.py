@@ -533,6 +533,87 @@ IMPLEMENT = (
 )
 
 
+#: The most :func:`property_tests` will ever return, kept by the function
+#: itself rather than asked of the caller. A block assembled from whatever a
+#: file happens to define is a block with no natural size, and this one is
+#: added above the sources it was derived from -- an unbounded ask would eat
+#: the code it is an ask about.
+PROPERTY_CHARS = 2600
+
+_PROPERTY_HEAD = (
+    "WRITE AT LEAST ONE PROPERTY TEST. Parsing the code under test found "
+    "these functions to depend only on their arguments:\n"
+)
+
+_PROPERTY_BODY = (
+    "\nExamples you choose prove less than they look like proving: the same "
+    "reasoning wrote the code and picked the inputs, so the two agree by "
+    "construction. A property is checked against inputs neither of you "
+    "chose. Use hypothesis -- `from hypothesis import assume, given, "
+    "settings, strategies as st` -- and list \"hypothesis\" under "
+    "\"dependencies\".\n"
+    "Write one of:\n"
+    "- a round trip: `decode(encode(x)) == x` for every x drawn;\n"
+    "- an invariant: something true of the result whatever the input -- the "
+    "output is ordered and is a permutation of the input, a normalised path "
+    "never escapes its root, a parser returns a value or raises the "
+    "documented error and never anything else;\n"
+    "- an oracle: an obviously correct slow version agrees with the real one.\n"
+    "Rules:\n"
+    "- Decorate every property `@settings(derandomize=True, deadline=None)`. "
+    "This suite is rerun on every later ticket and a test that fails one run "
+    "in twenty is read as a regression of whatever was being worked on.\n"
+    "- Draw only what the function accepts: narrow the strategy, or reject "
+    "with `assume(...)`. Never wrap the call in try/except to make the "
+    "property pass.\n"
+    "- If one of these functions turns out to read a clock, a file or the "
+    "network, it cannot carry a property: say so in the summary and test it "
+    "by example instead.\n"
+    "- The ticket's own acceptance criteria still need example tests. The "
+    "property is in addition to them, never instead of them."
+)
+
+
+def property_tests(subjects: Sequence, trips: Sequence = ()) -> str:
+    """Ask the Tester for a claim about every input, not three it liked.
+
+    Sent only where :mod:`hermes.purity` found a function whose result
+    depends on its arguments and nothing else, because that is the only kind
+    of function a property can be written about: one that reads a clock or a
+    socket inside a ``@given`` loop produces a test that goes red on a
+    Tuesday, and the factory reads a newly red gate as a regression of the
+    ticket it is on.
+
+    *trips* are the pairs whose names promise an inverse. Naming them is
+    worth a line because a round trip is the one property that needs neither
+    an oracle nor an invariant anyone has to think of.
+
+    Returns empty where there is nothing to ask about, so the caller can add
+    the block unconditionally and get no block.
+    """
+    kept = list(subjects)
+    while kept:
+        listed = {subject.name for subject in kept}
+        block = (
+            _PROPERTY_HEAD
+            + "\n".join(f"- {subject.render()}" for subject in kept)
+            + _PROPERTY_BODY
+            + "".join(f"\n- `{first.name}` and `{second.name}` read as an "
+                      "inverse pair: the round trip through both is the "
+                      "property to write first."
+                      for first, second in trips
+                      if {first.name, second.name} <= listed)
+        )
+        if len(block) <= PROPERTY_CHARS:
+            return block
+        # Drop from the end, where relevance already put the least likely
+        # subject, and the round trip naming it goes with it: a trip through
+        # a function the block no longer lists asks for a test against
+        # something the model was never shown.
+        kept.pop()
+    return ""
+
+
 # -- review and triage -------------------------------------------------------
 
 REVIEW = (

@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import prompts
+from . import prompts, purity
 from .agents import (Prompt, change_schema, context_block, escalate,
                      file_protocol, ticket_block)
 from .anchor import locate
@@ -329,24 +329,26 @@ def restore(sandbox: Sandbox, saved: dict[str, str | None]) -> None:
             target.write_text(content)
 
 
-def relevant_files(sandbox: Sandbox, ticket, plan: dict, hints: list[str] | None = None,
-                   limit: int = 6, budget: int = 24000) -> str:
-    """Existing sources the implementer will likely need, under a char budget.
+def relevant_sources(sandbox: Sandbox, ticket, plan: dict,
+                     hints: list[str] | None = None,
+                     limit: int = 6) -> list[tuple[str, str]]:
+    """Existing sources the implementer will likely need, in relevance order.
 
     *hints* are paths the work journal says prior tickets actually wrote. They
     beat the ticket's own artifact list, which is a guess made before the code
     existed and often names files nobody ever created.
 
-    *budget* is what the caller has left after everything that outranks this
-    block; :func:`generate` takes it from the model's context rather than
-    guessing, because the files that do not fit here are read as a guess about
-    what the ticket needs anyway.
+    Returned as ``(path, text)`` rather than as one block because two callers
+    want different things from the same read: the prompt wants them rendered
+    under whatever budget is left, and :mod:`hermes.purity` wants to parse
+    them. Reading twice to serve both would be two trips into the sandbox for
+    one answer.
     """
     wanted: list[str] = list(ticket.artifacts) + list(hints or [])
     for component in plan.get("components") or []:
         if isinstance(component, dict) and component.get("path"):
             wanted.append(component["path"])
-    chunks, used = [], 0
+    chunks: list[tuple[str, str]] = []
     seen: set[str] = set()
     for path in wanted:
         path = str(path).lstrip("/")
@@ -357,14 +359,27 @@ def relevant_files(sandbox: Sandbox, ticket, plan: dict, hints: list[str] | None
             text = sandbox.read(path)
         except SandboxError:
             continue
-        if not text:
-            continue
+        if text:
+            chunks.append((path, text))
+    return chunks
+
+
+def render_sources(chunks: list[tuple[str, str]], budget: int = 24000) -> str:
+    """The sources as one block, headed by path and cut to *budget* characters.
+
+    *budget* is what the caller has left after everything that outranks this
+    block; :func:`generate` takes it from the model's context rather than
+    guessing, because the files that do not fit here are read as a guess about
+    what the ticket needs anyway.
+    """
+    rendered, used = [], 0
+    for path, text in chunks:
         slice_ = text[: max(0, budget - used)]
         if not slice_:
             break
         used += len(slice_)
-        chunks.append(f"--- {path} ---\n{slice_}")
-    return "\n\n".join(chunks) or "(no existing files for this ticket yet)"
+        rendered.append(f"--- {path} ---\n{slice_}")
+    return "\n\n".join(rendered) or "(no existing files for this ticket yet)"
 
 
 def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
@@ -380,6 +395,11 @@ def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
     *files* is how many existing sources the prompt may show it. *whole* names
     the files this attempt must return complete rather than patch, which is
     the ladder's other way of asking a repeated failure differently.
+
+    A test ticket gets one block the others do not: where the code it is about
+    holds a function whose result depends only on its arguments, the Tester is
+    asked for a property over every input rather than three inputs it liked.
+    See :mod:`hermes.purity` for what qualifies and why so little does.
 
     *toolbox* lets the agent read the rest of the workspace before it answers.
     The sources below are a guess at what the ticket needs, made from a list
@@ -428,9 +448,28 @@ def generate(agents, sandbox: Sandbox, state, ticket, tree: str,
     # the failure and the lookup protocol, all of which outrank it: knowing
     # what broke is worth more than a sixth file the ticket may not touch.
     header = "EXISTING FILES RELEVANT TO THIS TICKET:\n"
-    sources.fill(header + relevant_files(sandbox, ticket, state.plan, hints,
-                                         limit=files,
-                                         budget=max(0, sources.room() - len(header))))
+    read = relevant_sources(sandbox, ticket, state.plan, hints, limit=files)
+    # A test ticket may be asked for a property, which costs room the sources
+    # would otherwise have had, so the room is taken away before they are cut
+    # to fit -- and only where there is something to ask about, because a
+    # reserve held for a block that never comes is a file the Tester loses for
+    # nothing.
+    found = purity.subjects(read) if ticket.kind == "test" else []
+    reserve = prompts.PROPERTY_CHARS + Prompt.SEPARATOR if found else 0
+    shown = render_sources(read, max(0, sources.room() - len(header) - reserve))
+    # Whatever the cut dropped is dropped from the ask too: a property
+    # demanded of a function the model was never shown is a generation spent
+    # on a name it has to invent.
+    found = [subject for subject in found if f"def {subject.name}" in shown]
+    block = prompts.property_tests(found, purity.round_trips(found))
+    if block:
+        # Priority 25 puts the ask above the code it came out of: it costs a
+        # page where the sources cost twenty, and the Tester can read a file
+        # back with a lookup where it cannot read back an instruction it was
+        # never sent.
+        prompt.add("properties", block, priority=25)
+        log.info("ticket.properties", subjects=", ".join(s.name for s in found))
+    sources.fill(header + shown)
     extra = {} if temperature is None else {"temperature": temperature}
     return lookup.ask(schema=change_schema(edits=allow_edits), **extra)
 

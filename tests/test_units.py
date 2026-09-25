@@ -31,8 +31,9 @@ from hermes.evolve import (FAMILIES, Bandit, Candidate, Evolution, NoTargetFits,
 from hermes.experiment import (Lab, Run, aggregate, measurements,
                                run_ticket as run_experiment_ticket)
 from hermes.implement import (Change, Ladder, Rung, _protected, _race, apply_change,
-                              execute_ticket, generate, relevant_files,
-                              restore as restore_files, snapshot as snapshot_files)
+                              execute_ticket, generate, relevant_sources,
+                              render_sources, restore as restore_files,
+                              snapshot as snapshot_files)
 from hermes.git_ops import GitHub, Issues
 from hermes.journal import Entry, Journal
 from hermes.log import NULL, Logger, current_scope, scope
@@ -1878,7 +1879,7 @@ def test_an_implementer_reads_a_file_it_was_not_handed(tmp_path):
     sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
     sandbox.write("src/parser.py", "def parse(text, *, strict=False):\n    return {}\n")
     # The ticket names a file nobody has written, which is what the planner
-    # routinely produces, so relevant_files hands the agent nothing.
+    # routinely produces, so relevant_sources hands the agent nothing.
     ticket = _ticket_for(tmp_path, artifacts=["src/cli.py"])
     agent, prompts = _scripted([
         {"lookup": [{"tool": "grep", "pattern": "def parse"}]},
@@ -2157,13 +2158,17 @@ def test_journal_mirrors_to_a_readable_worklog(tmp_path):
     assert "T001" in text and "reads yaml" in text
 
 
-def test_relevant_files_reads_journal_hints(tmp_path):
+def test_relevant_sources_reads_journal_hints(tmp_path):
     """Hints point at files that exist; ticket artifacts are only a guess."""
     sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
     sandbox.write("src/config.py", "VALUE = 1\n")
     ticket = Board(tmp_path).add(title="use the config", artifacts=["src/never_built.py"])
-    text = relevant_files(sandbox, ticket, {}, ["src/config.py"])
-    assert "VALUE = 1" in text
+    read = relevant_sources(sandbox, ticket, {}, ["src/config.py"])
+    assert [path for path, _ in read] == ["src/config.py"]
+    assert "VALUE = 1" in render_sources(read)
+    # The budget cuts the block, never the read: what a file says beyond it is
+    # gone from the prompt but still there for anything that parses the source.
+    assert "VALUE = 1" not in render_sources(read, budget=4)
 
 
 # -- logging -----------------------------------------------------------------
@@ -7232,3 +7237,355 @@ def test_doctor_probes_only_on_request_and_only_a_server_that_answers(
                       "    base_url: http://127.0.0.1:1/v1\n    model: stub\n")
     assert cli.cmd_doctor(SimpleNamespace(config=None, probe=True)) == 0
     assert "probe     skipped" in capsys.readouterr().err
+
+
+# -- property tests ----------------------------------------------------------
+
+#: One module with one of everything the analysis has to tell apart: two
+#: functions that are only their arguments, one that reads a clock, one that
+#: reads the machine's entropy, one that writes a file, one that calls a
+#: method on an object the file never describes, and a private helper.
+MIXED = '''\
+"""A codec and the things around it."""
+import json
+import random
+import time
+
+
+def normalise(path: str) -> str:
+    """Collapse a path without touching the disk."""
+    return "/".join(p for p in path.split("/") if p not in ("", "."))
+
+
+def encode_frame(payload: dict) -> str:
+    return json.dumps(payload, sort_keys=True)
+
+
+def decode_frame(text: str) -> dict:
+    return json.loads(text)
+
+
+def stamped(record: dict) -> dict:
+    record["seen"] = time.time()
+    return record
+
+
+def shuffled(items: list) -> list:
+    random.shuffle(items)
+    return items
+
+
+def save(path: str, text: str) -> bool:
+    open(path, "w").write(text)
+    return True
+
+
+def fetched(store, key: str) -> str:
+    return store.load(key)
+
+
+def _widen(value: int) -> int:
+    return value + 1
+'''
+
+
+def test_only_a_function_that_is_nothing_but_its_arguments_is_offered(tmp_path):
+    """Everything here reads like a pure function and only three are one.
+
+    The rejections are the point. A property wrapped around a clock or the
+    entropy pool is a test that goes red on a Tuesday, and the factory reads a
+    newly red gate as a regression of the ticket it happens to be on -- so it
+    would spend attempts repairing code that was never broken.
+    """
+    from hermes import purity
+
+    found = purity.subjects([("src/codec.py", MIXED)], limit=99)
+
+    assert [s.name for s in found] == ["normalise", "encode_frame", "decode_frame"]
+    assert found[0].doc == "Collapse a path without touching the disk."
+    assert found[1].signature == "(payload: dict) -> str"
+
+
+def test_a_call_into_a_module_is_not_a_call_on_an_unknown_object():
+    """``json.dumps(x)`` and ``store.load(k)`` are the same shape of code.
+
+    Only the file's own import table says which of the two is a module, and
+    without reading it the analysis either loses every function that formats
+    JSON or vouches for every function handed a database.
+    """
+    from hermes import purity
+
+    found = purity.subjects([("src/codec.py", MIXED)], limit=99)
+
+    assert "encode_frame" in [s.name for s in found]     # json.dumps
+    assert "fetched" not in [s.name for s in found]      # store.load
+
+
+def test_impurity_carries_from_a_helper_to_everything_that_calls_it():
+    """A function is only as pure as the last thing it called.
+
+    Within one file that is checkable and so it is checked; across files it is
+    not, which is why the prompt tells the Tester to drop a function that
+    turns out to touch the world.
+    """
+    from hermes import purity
+
+    module = (
+        "import time\n"
+        "\n"
+        "def _stamp():\n"
+        "    return time.time()\n"
+        "\n"
+        "def label(name: str) -> str:\n"
+        "    return f'{name}-{_stamp()}'\n"
+        "\n"
+        "def plain(name: str) -> str:\n"
+        "    return name.strip().lower()\n"
+    )
+
+    assert [s.name for s in purity.subjects([("a.py", module)])] == ["plain"]
+
+
+def test_building_a_list_is_pure_and_filling_the_caller_s_list_is_not():
+    """The same method call, and the receiver decides.
+
+    Accumulating into a local is how most pure functions are written. Doing it
+    to a parameter is a second result the return value never mentions, and the
+    second call in a property sees what the first one left.
+    """
+    from hermes import purity
+
+    module = (
+        "def extended(entries: list, line: str) -> list:\n"
+        "    entries.append(line)\n"
+        "    return entries\n"
+        "\n"
+        "def with_line(entries: list, line: str) -> list:\n"
+        "    combined = list(entries)\n"
+        "    combined.append(line)\n"
+        "    return combined\n"
+        "\n"
+        "def keyed(index: dict, key: str) -> dict:\n"
+        "    index[key] = 1\n"
+        "    return index\n"
+    )
+
+    assert [s.name for s in purity.subjects([("a.py", module)])] == ["with_line"]
+
+
+def test_a_generator_and_a_procedure_are_not_things_a_property_compares():
+    """Both are pure and neither answers the question a property asks."""
+    from hermes import purity
+
+    module = (
+        "def every(items: list):\n"
+        "    for item in items:\n"
+        "        yield item\n"
+        "\n"
+        "def check(items: list) -> None:\n"
+        "    assert items\n"
+        "\n"
+        "def counted(items: list) -> int:\n"
+        "    def tally():\n"
+        "        yield 1\n"
+        "    return sum(tally()) * len(items)\n"
+    )
+
+    # The nested generator belongs to the closure, not to the function around
+    # it, so `counted` is still a function that returns a value.
+    assert [s.name for s in purity.subjects([("a.py", module)])] == ["counted"]
+
+
+def test_a_round_trip_is_named_only_where_both_halves_are_there():
+    """An inverse pair is the one property that needs no invariant invented.
+
+    The shared remainder is what makes it a pair rather than a coincidence of
+    vocabulary: encode/decode of two different things undo nothing between
+    them.
+    """
+    from hermes import purity
+
+    names = ["encode_frame", "decode_frame", "decode_header", "to_json",
+             "from_json", "parse", "unrelated"]
+    pairs = {(a.name, b.name) for a, b in
+             purity.round_trips([purity.Subject("a.py", n) for n in names])}
+
+    assert ("encode_frame", "decode_frame") in pairs
+    assert ("to_json", "from_json") in pairs
+    assert not [p for p in pairs if "decode_header" in p or "parse" in p]
+
+
+def test_nothing_the_factory_offers_as_pure_reaches_out_of_the_process():
+    """The analysis, checked against the factory's own sources by other means.
+
+    The AST rules could agree with themselves and still be wrong -- a
+    traversal that does not descend into a comprehension would vouch for a
+    function whose only side effect is in one. So every function offered here
+    is re-read as text, looking for the world by name, and none of them may
+    contain it.
+    """
+    from hermes import purity
+
+    world = re.compile(
+        r"\b(open|print|input|exec|eval|getenv|sleep|monotonic|urlopen|Popen"
+        r"|mkdtemp)\s*\(|\b(os|sys|time|random|shutil|subprocess|socket|urllib"
+        r"|logging|tempfile|secrets|uuid|datetime|pathlib)\.|\.(write|write_text"
+        r"|read_text|read|mkdir|unlink|rmtree|run|ask|ask_json|complete|info"
+        r"|warn)\s*\(")
+    offered, root = [], Path(__file__).resolve().parent.parent
+    for path in sorted(root.glob("hermes/*.py")):
+        text = path.read_text()
+        lines = text.splitlines()
+        nodes = {node.name: node for node in ast.parse(text).body
+                 if isinstance(node, ast.FunctionDef)}
+        for subject in purity.subjects([(str(path), text)], limit=99):
+            node = nodes[subject.name]
+            body = "\n".join(lines[node.lineno - 1:node.end_lineno])
+            assert not world.search(body), f"{path.name}:{subject.name}"
+            offered.append(f"{path.name}:{subject.name}")
+
+    assert len(offered) > 25                            # it really did find some
+    assert "implement.py:signature_of" in offered       # names its own failures
+    assert "implement.py:relevant_sources" not in offered  # reads the sandbox
+
+
+def test_the_property_block_never_outgrows_the_room_it_is_given():
+    """The ask is added above the code it came out of, so it needs a ceiling.
+
+    A block assembled from whatever a file happens to define has no natural
+    size, and this one is spent before the sources it is about: unbounded, a
+    file of forty long-signatured functions would push out the code the
+    Tester has to read to write anything at all.
+    """
+    from hermes import purity
+
+    rng = random.Random(20260923)
+    found = [purity.Subject("src/" + "d" * rng.randrange(40) + ".py",
+                            f"encode_{'n' * rng.randrange(60)}{i}",
+                            "(" + "a: int, " * rng.randrange(20) + ")",
+                            "w" * rng.randrange(200))
+             for i in range(40)]
+    found.append(purity.Subject("src/x.py", "decode_" + found[0].name[7:]))
+
+    block = prompts.property_tests(found, purity.round_trips(found))
+
+    assert 0 < len(block) <= prompts.PROPERTY_CHARS
+    assert "derandomize=True" in block
+    # A round trip through a function that got dropped is an instruction to
+    # test something the model was never shown.
+    listed = block.split("\nExamples you choose")[0]
+    for pair in re.findall(r"`(\w+)` and `(\w+)` read as an inverse pair", block):
+        assert all(name in listed for name in pair)
+    assert prompts.property_tests([]) == ""
+
+
+def _tester(tmp_path, source: str, context: int | None = None, **kw):
+    """One generation for a ticket about *source*, and the prompt it sent."""
+    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 5})
+    sandbox.write("src/codec.py", source)
+    agent, seen = _scripted([{"summary": "tests", "files": [
+        {"path": "tests/test_codec.py", "content": "def test_x():\n    assert 1\n"}]}],
+        context=context)
+    ticket = _ticket_for(tmp_path, artifacts=["src/codec.py"], **kw)
+    generate({"implementer": agent, "tester": agent}, sandbox, _state(), ticket,
+             tree="src/codec.py")
+    return seen[0]
+
+
+def test_a_test_ticket_is_asked_for_a_property_and_only_about_what_can_carry_one(
+        tmp_path):
+    """The whole point: the Tester is asked for a claim about every input.
+
+    Examples the factory chooses prove least in exactly this configuration,
+    where the same model wrote the code the examples were chosen from. The
+    block names only the functions the parser vouched for, because a property
+    over the others is worse than no property.
+    """
+    prompt = _tester(tmp_path, MIXED, kind="test")
+
+    block = prompt.split("WRITE AT LEAST ONE PROPERTY TEST")[1]
+    assert "encode_frame" in block and "normalise" in block
+    assert "shuffled" not in block and "save" not in block
+    assert "`encode_frame` and `decode_frame` read as an inverse pair" in block
+    assert "derandomize=True" in block
+
+
+def test_an_implementation_ticket_is_not_asked_for_one(tmp_path):
+    """The ask is the Tester's. An implementer given it writes fewer features."""
+    assert "PROPERTY TEST" not in _tester(tmp_path, MIXED, kind="implementation")
+
+
+def test_a_test_ticket_with_nothing_to_quantify_over_is_asked_nothing(tmp_path):
+    """Silence beats a block that names no function: the model fills a gap."""
+    impure = ("import time\n\n"
+              "def stamp(record: dict) -> dict:\n"
+              "    record['seen'] = time.time()\n"
+              "    return record\n")
+
+    assert "PROPERTY TEST" not in _tester(tmp_path, impure, kind="test")
+
+
+class _Installs:
+    """A sandbox that agrees to every install and remembers what was asked."""
+
+    runtime = "docker"
+
+    def __init__(self, root):
+        self.root, self.installed, self.asked = Path(root), [], []
+
+    def install(self, command, *, timeout=None):
+        from hermes.sandbox import Result
+
+        self.asked.append(command)
+        return Result(command, 0, "", "", 0.0)
+
+
+def test_the_library_the_factory_asked_for_is_installed_rather_than_failed(tmp_path):
+    """Hermes now asks a Tester for hypothesis, so a gate must not fail for it.
+
+    An absent library arrives as a pytest import error on exit 1 or 2, never
+    as a shell's 127, and a gate that cannot tell the two apart fails the
+    ticket for the absence of the one dependency Hermes itself requested.
+    """
+    from hermes import verify
+    from hermes.sandbox import Result
+
+    sandbox = _Installs(tmp_path)
+    missing = Result("pytest -q", 2, "E   ModuleNotFoundError: No module named "
+                     "'hypothesis.strategies'", "", 0.1)
+    assert verify._install_missing(sandbox, missing, Verification(), NULL)
+    assert sandbox.asked == ["pip install --quiet hypothesis"]
+
+    # The project's own package is the other thing that import error means,
+    # and the fix for it is not to fetch a package of that name from PyPI.
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'widgets'\n")
+    own, again = _Installs(tmp_path), Result(
+        "pytest -q", 1, "ModuleNotFoundError: No module named 'widgets'", "", 0.1)
+    assert verify._install_missing(own, again, Verification(), NULL)
+    assert own.asked == ["pip install --quiet -e ."]
+
+
+def test_a_property_is_never_demanded_of_a_function_the_prompt_had_to_cut(tmp_path):
+    """The sources are cut to fit the model and the ask is cut with them.
+
+    A property demanded of a function the model was never shown is a
+    generation spent inventing a signature, which is the failure the workspace
+    lookups exist to prevent. So the block is filtered against the text that
+    survived the cut rather than against what was read off the disk, and a
+    small enough context is asked for no property at all.
+    """
+    # The functions worth a property are at the end of a file whose front is
+    # all noise, which is where a budget cut leaves them out.
+    noise = "".join(f"def noisy_{i}(value: int) -> int:\n"
+                    f"    print(value)\n    return value + {i}\n\n\n"
+                    for i in range(170))
+
+    whole = _tester(tmp_path, noise + MIXED, kind="test")
+    cut = _tester(tmp_path, noise + MIXED, context=8192, kind="test")
+
+    block = whole.split("WRITE AT LEAST ONE PROPERTY TEST")[1]
+    assert "encode_frame" in block and "noisy_3" not in block
+    assert "def encode_frame" in whole                  # and it can see it
+
+    assert "def encode_frame" not in cut                # the cut reached it
+    assert "PROPERTY TEST" not in cut

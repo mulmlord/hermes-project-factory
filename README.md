@@ -573,9 +573,33 @@ never asked, so the gate stands down instead. Each write also carries its own
 mtime, because a same-length mutant written within a second of what it
 replaced would otherwise run from stale bytecode and be blamed on the tests.
 
-Mutation testing catches tests that are weak. It cannot catch tests that were
-made weaker, and the implementer is free to edit the tests in the same change
-as the code. Asking it not to has been measured to barely help. So once a
+Mutation testing asks whether the examples are good enough. The other answer
+to the same worry is to stop choosing examples. Before a Tester writes the
+tests for a ticket, Hermes parses the code that ticket is about and looks for
+functions whose answer is their arguments and nothing else — no clock, no
+file, no socket, no writing through a parameter, and no call to anything in
+the same file that failed the check. Where it finds one, the Tester is asked
+for a property over every input rather than three inputs it liked: a round
+trip, an invariant, or a slow obvious version to agree with. Names that
+promise an inverse — `encode_frame` and `decode_frame`, `to_json` and
+`from_json` — are pointed out, because a round trip is the one property that
+needs nothing invented.
+
+The analysis says no far more often than it has to. A function it passes over
+costs a property nobody wrote; one it wrongly vouches for costs a property
+wrapped around a clock, which fails one run in twenty and is read by the loop
+as a regression of whatever ticket is running. It is a filter and not a
+proof — it cannot follow a call into another file — so the ask itself tells
+the Tester to drop any function that turns out to touch the world and test it
+by example instead. Properties are asked for in `hypothesis` and demanded
+`derandomize=True`, and a suite that imports a library nobody installed is
+now installed for rather than failed: an absent import arrives as a pytest
+error, never as a shell's exit 127, and the gate used to read the two
+differently.
+
+Both of those are answers to tests that are weak. Neither catches tests that
+were made weaker, and the implementer is free to edit the tests in the same
+change as the code. Asking it not to has been measured to barely help. So once a
 ticket clears every other gate, and before mutation runs, the tests are
 compared with how they stood at the last *completed* ticket. Findings:
 
@@ -876,6 +900,10 @@ halfway through.
   sites was meant: an ambiguous anchor is refused unless the edit names the
   function or class it belongs to, because a wrong edit that still passes the
   tests is worse than a retry.
+- Property tests are asked for over Python only, and only where the parser
+  can see that a function is nothing but its arguments. It cannot follow a
+  call into another module, so the ask carries an escape clause rather than a
+  guarantee, and a project in another language is simply never asked.
 - Mutation testing measures the suite with a fixed operator table over Python
   only, and five faults per ticket is a sample, not a verdict: it can show you
   that a suite misses a boundary, never that it misses nothing. The screen

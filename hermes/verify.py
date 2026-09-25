@@ -76,6 +76,13 @@ class Verification:
 
 _MISSING_TOOL = re.compile(r"([\w.+-]+): (?:not found|command not found)")
 
+#: A library the tests import but nobody installed arrives as an import error
+#: on a pytest that exited 1 or 2, never as a shell's 127, so the message is
+#: the only signal there is. Without this the factory can ask a Tester for a
+#: ``hypothesis`` property -- :func:`hermes.prompts.property_tests` does --
+#: and then fail the ticket for the absence of the library it asked for.
+_MISSING_MODULE = re.compile(r"No module named '?([\w.]+)'?")
+
 #: Tools a gate may legitimately need. Anything else named by a model-written
 #: command is not fetched from PyPI: that would make typosquatting a supply
 #: chain into the sandbox.
@@ -87,14 +94,20 @@ DEV_TOOLS = frozenset({
 
 def _install_missing(sandbox: Sandbox, result, verification: 'Verification',
                      log: Logger) -> bool:
-    """Exit 127 means a tool is absent, not that the generated code is wrong.
+    """A tool or library that is absent is not the generated code being wrong.
 
     The architect is meant to install its tooling in the setup command and
     routinely forgets, which otherwise fails every gate for the rest of the run.
     """
-    found = _MISSING_TOOL.search(result.stderr + result.stdout)
+    output = result.stderr + result.stdout
+    found = _MISSING_TOOL.search(output)
+    module = _MISSING_MODULE.search(output)
     if found:
         tool = found.group(1)
+    elif module:
+        # A submodule is installed by its distribution: ``hypothesis.strategies``
+        # is one pip install of ``hypothesis``.
+        tool = module.group(1).split(".")[0]
     elif result.exit_code == 127:
         # A pipeline hides 127 behind the exit code of its last stage, so the
         # message above is the reliable signal and this is only the fallback.

@@ -53,9 +53,9 @@ def carries_secret(name: str) -> bool:
     """Whether generated code must not be told *name*.
 
     One predicate for every path that hands an environment to code Hermes did
-    not write. It used to be two lists -- the sandbox's and the OpenHands
-    runner's -- and the narrower of them passed ``HF_TOKEN`` and
-    ``SSH_AUTH_SOCK`` through to an agent loop with a shell.
+    not write. It used to be two lists -- the sandbox's and that of an agent
+    runner Hermes has since dropped -- and the narrower of them passed
+    ``HF_TOKEN`` and ``SSH_AUTH_SOCK`` through to an agent loop with a shell.
     """
     upper = name.upper()
     return upper in SECRET_ENV_NAMES or any(m in upper for m in SECRET_ENV_MARKERS)

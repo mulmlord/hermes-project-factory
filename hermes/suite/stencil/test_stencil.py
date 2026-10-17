@@ -1,7 +1,7 @@
 """Held-out acceptance tests for the stencil task. Never shown to the factory."""
 from types import SimpleNamespace
 
-import pytest
+import testkit
 
 import stencil
 from stencil import Template, TemplateSyntaxError, UndefinedError, render
@@ -76,7 +76,7 @@ def test_nested_loops_have_their_own_loop():
 def test_loop_variable_does_not_leak():
     source = "{% for x in xs %}{{ x }}{% endfor %}{{ x }}"
     assert render(source, xs=[1, 2], x="outer") == "12outer"
-    with pytest.raises(UndefinedError):
+    with testkit.raises(UndefinedError):
         render("{% for x in xs %}{% endfor %}{{ x }}", xs=[1])
 
 
@@ -105,7 +105,7 @@ def test_default():
 def test_undefined_names_raise_when_used():
     for source in ("{{ nope }}", "{{ nope | upper }}", "{% for x in nope %}{% endfor %}",
                    "{{ d.missing }}"):
-        with pytest.raises(UndefinedError):
+        with testkit.raises(UndefinedError):
             render(source, d={})
 
 
@@ -136,7 +136,7 @@ def test_syntax_errors_are_raised_at_construction_with_a_line():
         "{# open": 1,
     }
     for source, line in cases.items():
-        with pytest.raises(TemplateSyntaxError) as caught:
+        with testkit.raises(TemplateSyntaxError) as caught:
             Template(source)
         assert caught.value.line == line, source
 

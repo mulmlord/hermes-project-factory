@@ -9,9 +9,7 @@ import uuid
 from dataclasses import asdict
 from pathlib import Path
 
-import yaml
-
-from . import phases, workspace
+from . import phases, workspace, yamlite
 from .config import (
     Config,
     ConfigError,
@@ -581,6 +579,113 @@ def cmd_improve(args) -> int:
     return 0 if record.passed else 2
 
 
+def cmd_upkeep(args) -> int:
+    """The factory looking after itself, when its schedule says so."""
+    from . import upkeep
+    from .log import Logger
+
+    config = _config(args)
+    root = Path(__file__).resolve().parent.parent
+    if args.schedule is not None or args.contribute is not None:
+        return _upkeep_settings(args, config, root)
+    if args.install_timer:
+        print(f"upkeep    {upkeep.install_timer(root, config.path)}")
+        return 0
+    if args.remove_timer:
+        print(f"upkeep    {upkeep.remove_timer()}")
+        return 0
+    ledger = upkeep.Ledger()
+    schedule = config.get("upkeep.schedule")
+    try:
+        is_due, next_at = upkeep.due(schedule, ledger.last_run)
+    except ConfigError as exc:
+        print(f"upkeep    {exc}", file=sys.stderr)
+        return 1
+    if args.status:
+        return _upkeep_status(config, ledger, schedule, is_due, next_at, root)
+    if not (is_due or args.now):
+        when = ("off: set a schedule with `hermes upkeep --schedule weekly`"
+                if next_at is None else
+                f"not due until {time.strftime('%Y-%m-%d %H:%M', time.localtime(next_at))}")
+        print(f"upkeep    {when}")
+        return 0
+
+    from .agents import build as build_agents
+    from .models import Router
+    from .server import running
+    log = Logger(upkeep.data_dir() / "upkeep.jsonl", quiet=args.quiet)
+    try:
+        with upkeep.exclusive():
+            router = Router(config, log)
+            agents = build_agents(router, log)
+            with running(config, router, log):
+                # A run that cannot reach its model is not a run: nothing is
+                # recorded, so tomorrow's timer tries again instead of waiting
+                # out the whole interval for a server that was merely down.
+                router.preflight()
+                outcome = upkeep.Upkeep(config, root, agents, log, ledger).run()
+    except BlockingIOError:
+        print("upkeep    another upkeep run is in progress", file=sys.stderr)
+        return 1
+    print(outcome.summary())
+    return 0
+
+
+def _upkeep_settings(args, config, root: Path) -> int:
+    """``--schedule`` and ``--contribute``: write them, then match the timer to them."""
+    from . import upkeep
+    assignments = []
+    if args.schedule is not None:
+        try:
+            upkeep.interval(args.schedule)
+        except ConfigError as exc:
+            print(f"upkeep    {exc}", file=sys.stderr)
+            return 2
+        assignments.append(f"upkeep.schedule={args.schedule}")
+    if args.contribute is not None:
+        assignments.append(f"upkeep.contribute={'true' if args.contribute else 'false'}")
+    status = _config_set(argparse.Namespace(config=args.config, assignments=assignments))
+    if status != 0:
+        return status
+    if args.schedule is not None:
+        if upkeep.interval(args.schedule) is None:
+            print(f"upkeep    {upkeep.remove_timer()}")
+        else:
+            print(f"upkeep    {upkeep.install_timer(root, config_write_path(args))}")
+    if args.contribute:
+        from .github import find_token
+        if not find_token(config.get("github", {})):
+            print("upkeep    contributing needs a GitHub token: put one with permission "
+                  "to fork and open pull requests in ~/.config/hermes/github-token "
+                  "(chmod 600)", file=sys.stderr)
+    return 0
+
+
+def _upkeep_status(config, ledger, schedule, is_due, next_at, root: Path) -> int:
+    from . import upkeep
+    from .github import find_token
+    print(f"schedule  {schedule if upkeep.interval(schedule) else 'off'}")
+    last = ledger.last_run
+    print(f"last run  {time.strftime('%Y-%m-%d %H:%M', time.localtime(last)) if last else 'never'}")
+    if next_at is not None:
+        print(f"next      {'due now' if is_due else time.strftime('%Y-%m-%d %H:%M', time.localtime(next_at))}")
+    timer = (upkeep.unit_dir() / "hermes-upkeep.timer").is_file()
+    print(f"timer     {'installed' if timer else 'not installed'}")
+    counts: dict[str, int] = {}
+    for addon in ledger.addons().values():
+        counts[addon.status] = counts.get(addon.status, 0) + 1
+    print("add-ons   " + (", ".join(f"{n} {s}" for s, n in sorted(counts.items())) or "none yet"))
+    contribute = bool(config.get("upkeep.contribute"))
+    print(f"contribute {'yes, to ' + str(config.get('upkeep.upstream')) if contribute else 'no'}"
+          + ("" if not contribute or find_token(config.get("github", {}))
+             else " (no GitHub token found)"))
+    for item in ledger.data.get("contributions", [])[-5:]:
+        print(f"  {time.strftime('%Y-%m-%d', time.localtime(item.get('at', 0)))} "
+              f"{item.get('target', '')}: {item.get('pull', '')}")
+    print(f"improvers {len(upkeep.improvers(root / 'IMPROVERS.md'))} in IMPROVERS.md")
+    return 0
+
+
 def cmd_release(args) -> int:
     from .factory import Factory
     root = _project_root(args)
@@ -703,8 +808,15 @@ def cmd_doctor(args) -> int:
                   f"with docker (has: {', '.join(sorted(known)) or 'none'}); "
                   f"runs will fall back to runc", file=sys.stderr)
     import shutil as _shutil
-    for tool in ("git", "gh", "docker"):
+    for tool in ("git", "docker"):
         print(f"tool      {tool}: {_shutil.which(tool) or 'not found'}")
+    from .github import TOKEN_VARIABLES, find_token
+    print("github    token: " + ("found" if find_token(config.get("github", {})) else
+                                 f"none ({', '.join(TOKEN_VARIABLES)} or github.token_file;"
+                                 " needed only to publish or to contribute upstream)"))
+    if (config.get("openhands") or {}).get("enabled"):
+        print("openhands WARN ignored: Hermes no longer runs third-party agent layers; "
+              "its native implementer handles every ticket", file=sys.stderr)
     return 0 if ok else 1
 
 
@@ -781,9 +893,13 @@ def _config_set(args) -> int:
         if not sep or not key.strip():
             print(f"config    not a KEY=VALUE assignment: {assignment}", file=sys.stderr)
             return 2
-        # Through the YAML parser, so `context=32768` is a number, `x=true` a
+        # Through the YAML reader, so `context=32768` is a number, `x=true` a
         # boolean and `model=qwen2.5` the string it looks like.
-        value = yaml.safe_load(raw) if raw.strip() else ""
+        try:
+            value = yamlite.load(raw) if raw.strip() else ""
+        except yamlite.YAMLError as exc:
+            print(f"config    {key.strip()}: {exc}", file=sys.stderr)
+            return 2
         try:
             text = set_config_value(text, key.strip(), value)
         except ConfigError as exc:
@@ -953,6 +1069,21 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--promote", action="store_true",
                      help="merge the candidate, but only if every gate passes")
     imp.set_defaults(func=cmd_improve)
+
+    keep = sub.add_parser(
+        "upkeep", help="scout for add-ons and optimise the factory, on its schedule")
+    keep.add_argument("--now", action="store_true", help="run even when not yet due")
+    keep.add_argument("--status", action="store_true",
+                      help="the schedule, the last run, add-ons and contributions")
+    keep.add_argument("--schedule", metavar="WHEN",
+                      help="set how often: daily, weekly, biweekly, monthly, "
+                           "quarterly, <n>d or off (installs or removes the timer)")
+    keep.add_argument("--contribute", action=argparse.BooleanOptionalAction, default=None,
+                      help="open pull requests upstream for general improvements")
+    keep.add_argument("--install-timer", action="store_true",
+                      help="(re)write and enable the systemd user timer")
+    keep.add_argument("--remove-timer", action="store_true")
+    keep.set_defaults(func=cmd_upkeep)
 
     release = sub.add_parser("release", help="clean-room validate and release")
     release.add_argument("--github", action="store_true")

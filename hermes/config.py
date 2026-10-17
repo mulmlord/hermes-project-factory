@@ -14,8 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import yaml
-
+from . import yamlite
 from .schema import LEVELS, OFF, SCHEMA
 
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", "host.docker.internal"}
@@ -221,11 +220,11 @@ DEFAULTS: dict[str, Any] = {
         # UNSAFE_PATTERNS expresses. Off by default and advisory when on: an
         # un-tuned checkpoint scores near chance, and a guessed defect that
         # fails a correct ticket costs more than the miss it prevented.
-        # contrib/laya_server.py serves the endpoint this expects.
+        # Hermes ships no server for this endpoint; see hermes.classify.
         "classifier": {
             "enabled": False,
             "base_url": "http://localhost:6768",
-            "model": "laya",
+            "model": "classifier",
             "timeout": 30,
             "threshold": 0.75,   # calibrate the checkpoint before trusting this
             "block": False,      # let a finding fail the gate, not just warn
@@ -237,6 +236,11 @@ DEFAULTS: dict[str, Any] = {
     "git": {"enabled": True, "author": "Hermes Factory <hermes@localhost>"},
     "github": {
         "enabled": False, "private": True, "owner": None, "name": None,
+        # The operator's token, for publishing and for contributing upstream.
+        # Read from HERMES_GITHUB_TOKEN, GITHUB_TOKEN or GH_TOKEN, else from
+        # this file, else from ~/.config/hermes/github-token if that exists.
+        # Never written into a project, a remote URL or a command line.
+        "token_file": "",
         "early": True,        # create the repository once the board exists, so
                               # the projection can watch a running project. The
                               # code is pushed on the first ticket that passes.
@@ -245,7 +249,35 @@ DEFAULTS: dict[str, Any] = {
                               # board spreads over iterations instead of
                               # spending a hundred API calls at once
     },
-    "openhands": {"enabled": False, "command": "openhands"},
+    "upkeep": {
+        # The factory looking after itself, on a schedule its operator chose
+        # when it went live (start.sh asks). Each due run scouts for tools
+        # whose function the factory would benefit from rebuilding natively,
+        # then attempts self-modifications judged by the suite and by a
+        # before/after `hermes eval` on this machine. See hermes.upkeep.
+        "schedule": "off",      # daily | weekly | biweekly | monthly | quarterly
+                                # | <n>d | off
+        "scout": True,          # search the web for add-ons to rebuild
+        "improve": True,        # run the self-optimisation round
+        "attempts": 2,          # self-modifications tried per run: add-ons
+                                # first, then each component in turn
+        # A change that passes on the whole evaluation suite is a general
+        # improvement. Contributing opens a pull request for it upstream,
+        # adds you to IMPROVERS.md in the same pull request, and builds every
+        # candidate on upstream's tip instead of on this checkout.
+        "contribute": False,
+        "upstream": "mulmlord/hermes-project-factory",
+        "base": "main",
+        "promote": False,       # also merge a passing change into this checkout
+                                # (only when not contributing)
+        "tasks": [],            # evaluate on these tasks only; a subset is
+                                # never a general improvement
+        "eval_budget": 30,      # minutes one evaluation task may take
+        "queries": [],          # what the scout searches for; [] uses
+                                # hermes.upkeep.QUERIES
+        "per_query": 5,         # repositories read per search
+        "max_candidates": 12,   # tools judged per run
+    },
     "logging": {"level": "info"},
 }
 
@@ -360,7 +392,10 @@ class Config:
         ]
         for candidate in candidates:
             if candidate.is_file():
-                loaded = yaml.safe_load(candidate.read_text()) or {}
+                try:
+                    loaded = yamlite.load(candidate.read_text()) or {}
+                except yamlite.YAMLError as exc:
+                    raise ConfigError(f"{candidate}: {exc}") from exc
                 if not isinstance(loaded, dict):
                     raise ConfigError(f"{candidate}: top level must be a mapping")
                 return cls(deep_merge(DEFAULTS, loaded), candidate)
@@ -412,7 +447,7 @@ class Config:
         return seen
 
     def dump(self) -> str:
-        return yaml.safe_dump(self.data, sort_keys=False)
+        return yamlite.dump(self.data)
 
 
 SAMPLE_CONFIG = """\
@@ -571,9 +606,25 @@ verification:
     block: true          # false reports the findings and passes
     timeout: 120         # seconds one test collection may take
 
+upkeep:                  # the factory looking after itself, on a schedule
+  schedule: off          # daily | weekly | biweekly | monthly | quarterly | <n>d
+                         # | off. start.sh asks when the factory goes live
+  scout: true            # search for tools whose function the factory would
+                         # gain from, to rebuild natively instead of installing
+  improve: true          # attempt self-modifications, each judged by the suite
+                         # and a before/after `hermes eval` on this machine
+  attempts: 2            # per run: scouted add-ons first, then components in turn
+  contribute: false      # open a pull request upstream for a change that improves
+                         # the whole eval suite, crediting you in IMPROVERS.md.
+                         # Needs a GitHub token (see github.token_file)
+  upstream: mulmlord/hermes-project-factory
+  eval_budget: 30        # minutes one evaluation task may take
+
 github:
   enabled: false
   private: true
+  token_file: ""         # a file holding your token, when it is not in the
+                         # environment; ~/.config/hermes/github-token by default
   early: true            # create the repository when planning produces a board,
                          # so the issues track a project that is still running.
                          # The code is pushed on the first ticket that passes.
@@ -602,10 +653,10 @@ _KEY_LINE = re.compile(r"^(?P<indent> *)(?P<key>[A-Za-z0-9_.\-]+):(?P<rest>(?: .
 def format_scalar(value: Any) -> str:
     """Render *value* as the YAML scalar that parses back to it.
 
-    Quoting is left to PyYAML, which knows that ``yes`` and ``16384`` need it
-    to stay strings and that a path does not.
+    Quoting is left to :mod:`hermes.yamlite`, which knows that ``yes`` and
+    ``16384`` need it to stay strings and that a path does not.
     """
-    return yaml.safe_dump(value, default_flow_style=True, width=10 ** 6).splitlines()[0]
+    return yamlite.flow(value)
 
 
 def _block_bounds(lines: list[str], start: int, indent: int) -> int:
@@ -689,8 +740,8 @@ def set_config_value(text: str, dotted: str, value: Any) -> str:
 
     out = "\n".join(lines) + "\n"
     try:
-        node: Any = yaml.safe_load(out)
-    except yaml.YAMLError as exc:
+        node: Any = yamlite.load(out)
+    except yamlite.YAMLError as exc:
         raise ConfigError(f"setting {dotted} would not parse: {exc}") from exc
     for part in parts:
         if not isinstance(node, dict) or part not in node:

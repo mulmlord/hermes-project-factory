@@ -32,8 +32,13 @@ from .verify import Gate, SOURCE_SUFFIXES, Verification, run_commands
 SUITE_DIR = Path(__file__).with_name("suite")
 
 #: Where the held-out tests are dropped inside the scored copy. Not a dot
-#: directory, so pytest names the tests after it rather than after nothing.
+#: directory, so the runner names the tests after it rather than after nothing.
 HOLDOUT_DIR = "hermes_holdout"
+
+#: The test runner the held-out tests run under, copied in beside them. It is
+#: Hermes' own, so scoring a project installs nothing into its sandbox and
+#: needs no network, and no plugin or setting the project ships can reach it.
+RUNNER = Path(__file__).with_name("testkit.py")
 
 @dataclass
 class Task:
@@ -115,7 +120,7 @@ class Holdout:
 def expected_tests(folder: Path) -> dict[tuple[str, str], int]:
     """Cases per held-out test function, read from the source.
 
-    The denominator comes from here rather than from what pytest reports,
+    The denominator comes from here rather than from what the runner reports,
     because a project that fails to import collects nothing, and a rate
     measured against what was collected would score that project 0/0.
     Only module-level functions count, and a parametrize whose cases are not
@@ -166,10 +171,10 @@ def score(task: Task, root: Path, sandbox_cfg: dict, setup: str = "") -> Holdout
 
     The export is what a release would ship, so a file the factory wrote and
     never committed does not count. The run is the generated project's code,
-    so it happens in a fresh sandbox, and pytest is told to ignore every
-    ``conftest.py``, the project's own pytest configuration and any plugin
-    the project installed: those are the three ways a project can change
-    what a test run reports without changing what its code does.
+    so it happens in a fresh sandbox, under :mod:`hermes.testkit` copied in
+    beside the tests and told to load no ``conftest.py``: the runner is ours
+    and reads no settings file, so a project cannot change what a test run
+    reports without changing what its code does.
     """
     from .release import export
     from .sandbox import Sandbox
@@ -189,24 +194,18 @@ def score(task: Task, root: Path, sandbox_cfg: dict, setup: str = "") -> Holdout
         files = sorted(folder.glob("test_*.py"))
         for path in files:
             shutil.copy2(path, target / path.name)
-        (target / "pytest.ini").write_text("[pytest]\n")
+        shutil.copy2(RUNNER, target / RUNNER.name)
         box = Sandbox(staging, dict(sandbox_cfg))
         # The host's interpreter when the box is the host, since a bare
-        # ``python`` there may be one without pytest.
+        # ``python`` there may not be the one running the factory.
         python = "python" if box.runtime == "docker" else shlex.quote(sys.executable)
         with box:
             if setup.strip():
                 box.install(setup)
-            if not box.run(f"{python} -m pytest --version").ok:
-                if box.runtime != "docker" or not box.install(
-                        "pip install --quiet pytest").ok:
-                    return Holdout(0, total, "pytest is not available to run "
-                                             "the held-out tests")
             report = f"{HOLDOUT_DIR}/junit.xml"
             run = box.run(
-                f"PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 {python} -m pytest -q "
-                f"-p no:cacheprovider --noconftest -c {HOLDOUT_DIR}/pytest.ini "
-                f"--rootdir . --junitxml {report} "
+                f"{python} {HOLDOUT_DIR}/{RUNNER.name} -q --noconftest "
+                f"--junitxml {report} "
                 + " ".join(f"{HOLDOUT_DIR}/{p.name}" for p in files),
                 timeout=600)
         junit = staging / report
@@ -303,7 +302,7 @@ def importable(root: Path) -> list[str]:
 def test_functions(root: Path) -> int:
     """Test functions an export defines, counted from its source.
 
-    From the source and not from a pytest run, because the rung below this one
+    From the source and not from a test run, because the rung below this one
     is whether the tests pass: a project that wrote no tests would otherwise
     report the same green suite as one that wrote them and passed, and writing
     none is the cheapest way for the factory to look finished.

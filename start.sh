@@ -7,6 +7,12 @@
 # which port and with how much context, writes those answers into your config,
 # writes the systemd user unit that serves them, and brings the server up.
 #
+# It is also where the factory goes live, so it asks the one question about
+# the factory itself: how often it should look after itself -- search the web
+# for tools whose function it could rebuild natively, and run a
+# self-optimisation round on this machine -- and whether an improvement your
+# hardware finds may be offered upstream as a pull request that credits you.
+#
 # Run it again whenever those answers change — every question is pre-filled
 # with what your config says now, so it doubles as an editor for them. With
 # --config it asks nothing at all and starts exactly what the config already
@@ -15,8 +21,7 @@
 # Usage: ./start.sh [--config] [--config-file PATH]
 #                   [--model REPO] [--model-path DIR] [--models-dir DIR]
 #                   [--port N] [--context N] [--gpu-util F]
-#                   [--classifier] [--no-classifier]
-#                   [--classifier-model REPO] [--classifier-port N]
+#                   [--upkeep WHEN] [--contribute] [--no-contribute]
 #                   [--boot] [--no-wait] [--stop]
 #
 #   --config           ask nothing: serve what the config already names
@@ -27,10 +32,10 @@
 #   --port N           port vLLM listens on
 #   --context N        context length served, and the config's `context`
 #   --gpu-util F       fraction of VRAM vLLM may use
-#   --classifier       also run the security-gate classifier
-#   --no-classifier    do not run it, and turn it off in the config
-#   --classifier-model REPO  checkpoint it serves
-#   --classifier-port N      port it listens on
+#   --upkeep WHEN      how often the factory improves itself: weekly,
+#                      biweekly, monthly, <n>d or off
+#   --contribute       offer general improvements upstream as pull requests
+#   --no-contribute    keep them on this machine
 #   --boot             also run the server at boot, not just during a run
 #   --no-wait          do not wait for the weights to finish loading
 #   --stop             stop the server instead of starting it
@@ -43,17 +48,15 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$REPO/.venv"
 VLLM_VENV="$REPO/.venv-vllm"
-LAYA_VENV="$REPO/.venv-laya"
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/hermes/config.yaml"
 UNIT_NAME="hermes-vllm.service"
-CLASSIFIER_UNIT="hermes-classifier.service"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 FROM_CONFIG=0
 BOOT=0
 WAIT=1
 STOP=0
-CLASSIFIER=-1          # -1: whatever the config says; 0/1: --no-classifier/--classifier
+CONTRIBUTE=-1          # -1: ask, or whatever the config says; 0/1: the flags
 
 # Answers. Empty means "not given on the command line", which is what makes a
 # question worth asking.
@@ -63,8 +66,7 @@ MODELS_DIR=""
 PORT=""
 CONTEXT=""
 GPU_UTIL=""
-CLASSIFIER_REPO=""
-CLASSIFIER_PORT=""
+UPKEEP=""
 
 # A 7B AWQ coder: ~5 GiB of weights, which is what actually fits beside a
 # desktop session on an 8 GiB card. vLLM keeps the whole model resident in
@@ -106,14 +108,13 @@ while [ $# -gt 0 ]; do
     --context|--max-model-len)
                        CONTEXT="${2:?--context needs a number}"; shift ;;
     --gpu-util)        GPU_UTIL="${2:?--gpu-util needs a fraction}"; shift ;;
-    --classifier)      CLASSIFIER=1 ;;
-    --no-classifier)   CLASSIFIER=0 ;;
-    --classifier-model) CLASSIFIER=1; CLASSIFIER_REPO="${2:?--classifier-model needs a repository}"; shift ;;
-    --classifier-port) CLASSIFIER=1; CLASSIFIER_PORT="${2:?--classifier-port needs a number}"; shift ;;
+    --upkeep)          UPKEEP="${2:?--upkeep needs a schedule}"; shift ;;
+    --contribute)      CONTRIBUTE=1 ;;
+    --no-contribute)   CONTRIBUTE=0 ;;
     --boot)            BOOT=1 ;;
     --no-wait)         WAIT=0 ;;
     --stop)            STOP=1 ;;
-    -h|--help)         sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)         sed -n '3,44p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)                 die "unknown option: $1 (try --help)" ;;
   esac
   shift
@@ -126,12 +127,10 @@ done
 # The counterpart to the whole script, because the one thing you want after
 # "start it and keep it resident" is a way to hand the VRAM back.
 if [ "$STOP" -eq 1 ]; then
-  for unit in "$UNIT_NAME" "$CLASSIFIER_UNIT"; do
-    if [ -f "$UNIT_DIR/$unit" ] && systemctl --user is-active --quiet "$unit"; then
-      note "stopping $unit"
-      systemctl --user stop "$unit" || warn "could not stop $unit"
-    fi
-  done
+  if [ -f "$UNIT_DIR/$UNIT_NAME" ] && systemctl --user is-active --quiet "$UNIT_NAME"; then
+    note "stopping $UNIT_NAME"
+    systemctl --user stop "$UNIT_NAME" || warn "could not stop $UNIT_NAME"
+  fi
   exit 0
 fi
 
@@ -150,7 +149,7 @@ from hermes.config import DEFAULTS, Config
 path = Path(sys.argv[1])
 config = Config.load(path) if path.is_file() else Config(copy.deepcopy(DEFAULTS))
 model = config.get("models", {}).get("default", {})
-classifier = config.get("security.classifier", {})
+schedule = config.get("upkeep.schedule")
 
 
 def emit(name, value):
@@ -165,9 +164,8 @@ emit("CFG_MODEL_PATH", config.get("server.model_path") or "")
 emit("CFG_GPU_UTIL", config.get("server.gpu_util") or 0.90)
 emit("CFG_UNIT", config.get("server.unit") or "hermes-vllm.service")
 emit("CFG_WAIT", config.get("server.wait") or 600)
-emit("CFG_CLASSIFIER", int(bool(classifier.get("enabled"))))
-emit("CFG_CLASSIFIER_PORT", urlparse(classifier.get("base_url", "")).port or 6768)
-emit("CFG_CLASSIFIER_MODEL", classifier.get("checkpoint") or "convaiinnovations/laya")
+emit("CFG_UPKEEP", "off" if schedule in (None, False, "") else schedule)
+emit("CFG_CONTRIBUTE", int(bool(config.get("upkeep.contribute"))))
 PY
 )" || die "could not read $CONFIG"
 
@@ -185,7 +183,6 @@ if [ "$FROM_CONFIG" -eq 1 ]; then
   PORT="${PORT:-$CFG_PORT}"
   CONTEXT="${CONTEXT:-$CFG_CONTEXT}"
   GPU_UTIL="${GPU_UTIL:-$CFG_GPU_UTIL}"
-  [ "$CLASSIFIER" -eq -1 ] && CLASSIFIER="$CFG_CLASSIFIER"
 fi
 
 # -- asking ------------------------------------------------------------------
@@ -220,6 +217,7 @@ is_port()     { case "$1" in ''|*[!0-9]*) return 1;; esac; [ "$1" -ge 1 ] && [ "
 is_context()  { case "$1" in ''|*[!0-9]*) return 1;; esac; [ "$1" -ge 512 ]; }
 is_fraction() { printf '%s' "$1" | grep -Eq '^(0?\.[0-9]+|1(\.0+)?)$'; }
 yes_no()      { case "$1" in [Yy]|[Yy][Ee][Ss]) return 0;; *) return 1;; esac; }
+is_schedule() { "$VENV/bin/python" -c 'import sys; from hermes.upkeep import interval; interval(sys.argv[1])' "$1" 2>/dev/null; }
 
 expand() { printf '%s\n' "${1/#\~/$HOME}"; }
 
@@ -283,16 +281,36 @@ if [ "$FROM_CONFIG" -eq 0 ]; then
   CONTEXT="$(ask_valid "context length to serve" "${CONTEXT:-$CFG_CONTEXT}" is_context)"
   GPU_UTIL="$(ask_valid "fraction of VRAM vLLM may use" "${GPU_UTIL:-$CFG_GPU_UTIL}" is_fraction)"
 
-  if [ -x "$LAYA_VENV/bin/python" ] && [ "$CLASSIFIER" -eq -1 ]; then
-    [ "$CFG_CLASSIFIER" -eq 1 ] && default=y || default=n
-    yes_no "$(ask "also run the security-gate classifier? (y/n)" "$default")" \
-      && CLASSIFIER=1 || CLASSIFIER=0
+  # Going live: the one question about the factory rather than the server.
+  # Asked here because this is the only script that asks anything; the factory
+  # itself never may (specification section 2.2), and a schedule is a decision
+  # about your machine's time, which is yours to make.
+  if [ -z "$UPKEEP" ] && interactive; then
+    printf '\n'
+    note "How often should the factory look after itself?"
+    note "  Each time, it searches the web for tools whose function it would gain"
+    note "  from and rebuilds that function natively -- it never installs them --"
+    note "  then runs a self-optimisation round on this machine, judged by its"
+    note "  own test suite and a before/after 'hermes eval' on your GPU."
+    note "  weekly, biweekly, monthly, a number of days such as 10d, or off."
+    [ "$CFG_UPKEEP" = "off" ] && default=weekly || default="$CFG_UPKEEP"
+    UPKEEP="$(ask_valid "upkeep schedule" "$default" is_schedule)"
+  fi
+  UPKEEP="${UPKEEP:-$CFG_UPKEEP}"
+  if [ "$UPKEEP" != "off" ] && [ "$CONTRIBUTE" -eq -1 ] && interactive; then
+    note "When a run finds an improvement that holds on the whole evaluation suite,"
+    note "the factory can open a pull request for it upstream, under your GitHub"
+    note "account, and add you to IMPROVERS.md for the hardware you contributed."
+    note "Maintainers review it like any other change. Needs a GitHub token in"
+    note "  ${XDG_CONFIG_HOME:-$HOME/.config}/hermes/github-token"
+    # Yes the first time the factory goes live; afterwards, what you said last.
+    if [ "$CFG_UPKEEP" = "off" ] || [ "$CFG_CONTRIBUTE" -eq 1 ]; then default=y; else default=n; fi
+    yes_no "$(ask "open pull requests for improvements your hardware finds? (y/n)" "$default")" \
+      && CONTRIBUTE=1 || CONTRIBUTE=0
   fi
 fi
 
 MODELS_DIR="${MODELS_DIR:-$DEFAULT_MODELS_DIR}"
-CLASSIFIER_PORT="${CLASSIFIER_PORT:-$CFG_CLASSIFIER_PORT}"
-CLASSIFIER_REPO="${CLASSIFIER_REPO:-$CFG_CLASSIFIER_MODEL}"
 
 # -- weights -----------------------------------------------------------------
 
@@ -301,12 +319,15 @@ if [ -z "$MODEL_PATH" ]; then
   if [ -f "$MODEL_PATH/config.json" ]; then
     note "$MODEL_REPO is already in $MODEL_PATH"
   else
-    # hf draws a per-file progress bar with real byte counts, so it is left to
-    # speak for itself rather than being wrapped in a spinner.
+    # Hermes' own downloader (hermes/weights.py): it reports real byte counts,
+    # resumes an interrupted transfer and checks every large file's SHA-256,
+    # so it is left to speak for itself rather than being wrapped in a spinner.
+    # A gated repository needs HF_TOKEN in the environment.
     note "downloading $MODEL_REPO into $MODEL_PATH (progress below)"
     mkdir -p "$MODEL_PATH" || die "cannot write to $MODEL_PATH"
-    "$VLLM_VENV/bin/hf" download "$MODEL_REPO" --local-dir "$MODEL_PATH" \
-      || die "could not download $MODEL_REPO. Check the name, or pass --model-path."
+    "$VENV/bin/python" -m hermes.weights "$MODEL_REPO" "$MODEL_PATH" \
+      || die "could not download $MODEL_REPO. Check the name, or pass --model-path.
+    Run the same command again to resume an interrupted download."
   fi
 fi
 MODEL_PATH="$(cd "$MODEL_PATH" 2>/dev/null && pwd)" \
@@ -406,17 +427,15 @@ write_unit "$SERVE_FLAGS"
 if [ "$FROM_CONFIG" -eq 0 ]; then
   note "updating $CONFIG"
   mkdir -p "$(dirname "$CONFIG")"
-  # The classifier keys are written only when this run decided something about
-  # it — a flag, or an answer to the question. Left at -1 they are not touched,
-  # because a classifier you run yourself somewhere else is enabled in this
-  # file by hand, and starting a model server is no reason to switch it off.
-  CLASSIFIER_SETTINGS=()
-  if [ "$CLASSIFIER" -ne -1 ]; then
-    CLASSIFIER_SETTINGS=(
-      --set "security.classifier.enabled=$([ "$CLASSIFIER" -eq 1 ] && echo true || echo false)"
-      --set "security.classifier.base_url=http://localhost:$CLASSIFIER_PORT"
-    )
-  fi
+  # The upkeep keys are written only when this run decided something about
+  # them -- a flag, or an answer. Left alone they are not touched, because a
+  # schedule set with `hermes upkeep --schedule` is yours as much as one set
+  # here, and restarting a model server is no reason to change it.
+  UPKEEP_SETTINGS=()
+  [ -n "$UPKEEP" ] && [ "$UPKEEP" != "$CFG_UPKEEP" ] \
+    && UPKEEP_SETTINGS+=(--set "upkeep.schedule=$UPKEEP")
+  [ "$CONTRIBUTE" -ne -1 ] \
+    && UPKEEP_SETTINGS+=(--set "upkeep.contribute=$([ "$CONTRIBUTE" -eq 1 ] && echo true || echo false)")
   "$VENV/bin/hermes" -c "$CONFIG" config \
     --set "models.default.backend=vllm" \
     --set "models.default.base_url=http://localhost:$PORT/v1" \
@@ -425,52 +444,9 @@ if [ "$FROM_CONFIG" -eq 0 ]; then
     --set "server.unit=$UNIT_NAME" \
     --set "server.model_path=$MODEL_PATH" \
     --set "server.gpu_util=$GPU_UTIL" \
-    "${CLASSIFIER_SETTINGS[@]}" \
+    "${UPKEEP_SETTINGS[@]}" \
     >/dev/null \
     || die "could not update $CONFIG"
-fi
-
-# -- the classifier ----------------------------------------------------------
-
-# A second opinion on the security gate, on CPU deliberately: the coding model
-# has the GPU for the whole run and vLLM pins it, so a 400M encoder competing
-# for the same VRAM would cost more than the gate it serves is worth.
-if [ "$CLASSIFIER" -eq 1 ]; then
-  if [ ! -x "$LAYA_VENV/bin/python" ]; then
-    warn "no classifier environment at $LAYA_VENV; run ./install.sh --classifier"
-  else
-    note "writing the $CLASSIFIER_UNIT user unit"
-    mkdir -p "$UNIT_DIR"
-    cat > "$UNIT_DIR/$CLASSIFIER_UNIT" <<EOF
-[Unit]
-Description=Hermes Project Factory security classifier (port $CLASSIFIER_PORT)
-After=network-online.target
-
-[Service]
-Type=exec
-# The SDK deadlocks against TensorFlow's abseil init if both get imported.
-Environment=USE_TF=0
-ExecStart=$LAYA_VENV/bin/python $REPO/contrib/laya_server.py \\
-    --model $CLASSIFIER_REPO \\
-    --host 127.0.0.1 --port $CLASSIFIER_PORT \\
-    --device cpu
-Restart=always
-RestartSec=10
-TimeoutStartSec=600
-
-[Install]
-WantedBy=default.target
-EOF
-    systemctl --user daemon-reload || warn "could not reload the user systemd manager"
-    if systemctl --user enable --now "$CLASSIFIER_UNIT" 2>/dev/null; then
-      note "the classifier is running on port $CLASSIFIER_PORT"
-    else
-      warn "could not start $CLASSIFIER_UNIT; see: systemctl --user status $CLASSIFIER_UNIT"
-    fi
-    warn "$CLASSIFIER_REPO scores near chance unless it has been fine-tuned on"
-    warn "labelled vulnerability data: leave security.classifier.block false"
-    warn "until you have measured the checkpoint you are serving."
-  fi
 fi
 
 # -- starting ----------------------------------------------------------------
@@ -605,6 +581,28 @@ PROBE=""
 "$VENV/bin/hermes" -c "$CONFIG" doctor $PROBE \
   || warn "doctor found problems above. Hermes will not fall back to a cloud API."
 
+# -- upkeep ------------------------------------------------------------------
+
+# The timer is matched to the schedule on every start, so --config brings a
+# machine that lost its units (a new home directory, a reinstall) back to what
+# the config says without asking anything.
+UPKEEP="${UPKEEP:-$CFG_UPKEEP}"
+[ "$FROM_CONFIG" -eq 1 ] && UPKEEP="$CFG_UPKEEP"     # --config writes nothing
+if [ "$UPKEEP" = "off" ]; then
+  [ -f "$UNIT_DIR/hermes-upkeep.timer" ] && "$VENV/bin/hermes" -c "$CONFIG" upkeep --remove-timer
+else
+  "$VENV/bin/hermes" -c "$CONFIG" upkeep --install-timer \
+    || warn "could not install the upkeep timer; run: hermes upkeep --install-timer"
+  WANT_CONTRIBUTE="$CONTRIBUTE"
+  [ "$WANT_CONTRIBUTE" -eq -1 ] && WANT_CONTRIBUTE="$CFG_CONTRIBUTE"
+  if [ "$WANT_CONTRIBUTE" -eq 1 ]; then
+    "$VENV/bin/python" -c 'import sys; from hermes.github import find_token; sys.exit(0 if find_token() else 1)' \
+      || warn "contributing needs a GitHub token able to fork and open pull requests in
+    ${XDG_CONFIG_HOME:-$HOME/.config}/hermes/github-token (chmod 600). Until then
+    improvements are measured and kept on a local branch."
+  fi
+fi
+
 cat <<EOF
 
 ==> serving $MODEL_NAME on http://localhost:$PORT/v1, $CONTEXT tokens of context.
@@ -616,6 +614,8 @@ cat <<EOF
 The server is left running. Hermes only ever stops a server it started
 itself, so this one stays up between runs; set 'stop_after_run: false' under
 'server' if you want that of Hermes' own too.
+
+Upkeep: $UPKEEP. See what it has done with: hermes upkeep --status
 
 Start a project from any directory:
 

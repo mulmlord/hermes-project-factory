@@ -1,18 +1,19 @@
 """Git automation and optional GitHub publishing.
 
 Credentials are never written into a generated project: GitHub work goes
-through the ``gh`` CLI, which holds its own auth on the host.
+through :mod:`hermes.github`, which reads the operator's token on the host and
+hands it to nothing but GitHub's API and a single ``git push``.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import re
 import shutil
 import subprocess
 import time
 from pathlib import Path
 
+from . import github as api
 from .log import Logger, NULL
 from .tickets import FINISHED
 
@@ -105,40 +106,37 @@ class Repo:
 
 
 class GitHub:
-    """Thin wrapper over the ``gh`` CLI. Every method is a no-op when disabled."""
+    """Publishing through GitHub's REST API. Every method is a no-op when disabled."""
 
-    def __init__(self, cfg: dict, log: Logger = NULL):
+    def __init__(self, cfg: dict, log: Logger = NULL, client: api.Client | None = None):
         self.cfg = cfg or {}
         self.log = log
         self.enabled = bool(self.cfg.get("enabled"))
-        self.available = bool(shutil.which("gh"))
-
-    def _gh(self, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
-        return subprocess.run(["gh", *args], cwd=cwd, capture_output=True, text=True)
+        self.token = api.find_token(self.cfg)
+        self.web = str(self.cfg.get("web_url") or api.WEB)
+        self.client = client or api.Client(self.token, str(self.cfg.get("api_url") or api.API))
+        self._ready: bool | None = None
 
     def ready(self) -> bool:
         if not self.enabled:
             return False
-        if not self.available:
-            self.log.warn("github.gh_missing")
+        if self._ready is not None:
+            return self._ready
+        if not self.client.token:
+            self.log.warn("github.no_token",
+                          hint="set HERMES_GITHUB_TOKEN or github.token_file")
+            self._ready = False
             return False
-        if self._gh("auth", "status").returncode != 0:
-            self.log.warn("github.not_authenticated")
-            return False
-        return True
-
-    def _slug(self, name: str) -> str:
-        owner = self.cfg.get("owner")
-        return f"{owner}/{name}" if owner else name
-
-    def _url(self, slug: str, root: Path) -> str | None:
-        view = self._gh("repo", "view", slug, "--json", "url", cwd=root)
-        if view.returncode != 0:
-            return None
         try:
-            return json.loads(view.stdout or "{}").get("url")
-        except json.JSONDecodeError:
-            return None
+            self.client.login()
+            self._ready = True
+        except api.GitHubError as exc:
+            self.log.warn("github.not_authenticated", error=str(exc)[:200])
+            self._ready = False
+        return self._ready
+
+    def _slug(self, name: str) -> api.Slug:
+        return api.Slug(self.cfg.get("owner") or self.client.login(), name)
 
     def create(self, root: Path, name: str, description: str) -> str | None:
         """Create the repository and wire up the remote, pushing nothing.
@@ -153,19 +151,18 @@ class GitHub:
         if not self.ready():
             return None
         slug = self._slug(name)
-        url = self._url(slug, root)
-        if url is not None:
-            self._ensure_remote(root, url)
-            return url
-        visibility = "--private" if self.cfg.get("private", True) else "--public"
-        proc = self._gh("repo", "create", slug, visibility, "--source", ".",
-                        "--remote", "origin", "--description", description[:250],
-                        cwd=root)
-        if proc.returncode != 0:
-            self.log.warn("github.create_failed", error=proc.stderr.strip()[:300])
+        try:
+            existing = self.client.repository(slug)
+            if existing is None:
+                existing = self.client.create_repository(
+                    slug.name, private=bool(self.cfg.get("private", True)),
+                    description=description, org=slug.owner)
+                self.log.info("github.created", repo=str(slug), pushed=False)
+        except api.GitHubError as exc:
+            self.log.warn("github.create_failed", error=str(exc)[:300])
             return None
-        url = self._url(slug, root)
-        self.log.info("github.created", repo=slug, url=url, pushed=False)
+        url = str(existing.get("html_url") or f"{self.web}/{slug}")
+        self._ensure_remote(root, url)
         return url
 
     def _ensure_remote(self, root: Path, url: str) -> None:
@@ -177,8 +174,9 @@ class GitHub:
                        capture_output=True, text=True)
 
     def push(self, root: Path) -> bool:
-        proc = subprocess.run(["git", "push", "-u", "origin", "HEAD"], cwd=root,
-                              capture_output=True, text=True)
+        if not self.ready():
+            return False
+        proc = api.push(root, "origin", "HEAD", self.token, web=self.web, extra=("-u",))
         if proc.returncode != 0:
             self.log.warn("github.push_failed", error=proc.stderr.strip()[:300])
             return False
@@ -199,13 +197,16 @@ class GitHub:
     def release(self, root: Path, tag: str, title: str, notes: str) -> str | None:
         if not self.ready():
             return None
-        subprocess.run(["git", "push", "--tags"], cwd=root, capture_output=True)
-        proc = self._gh("release", "create", tag, "--title", title, "--notes", notes[:60000],
-                        cwd=root)
-        if proc.returncode != 0:
-            self.log.warn("github.release_failed", error=proc.stderr.strip()[:200])
+        slug = api.remote_slug(root)
+        if slug is None:
+            self.log.warn("github.release_failed", error="origin is not a GitHub remote")
             return None
-        return proc.stdout.strip()
+        api.push(root, "origin", f"refs/tags/{tag}", self.token, web=self.web)
+        try:
+            return self.client.release(slug, tag, title, notes)
+        except api.GitHubError as exc:
+            self.log.warn("github.release_failed", error=str(exc)[:200])
+            return None
 
 
 ONE_WAY = (
@@ -261,6 +262,7 @@ class Issues:
         self.known: dict[str, dict] = self._load()
         self._ready = False
         self._checked = 0.0
+        self._remote: api.Slug | None = None
 
     def _load(self) -> dict:
         if not self.path.is_file():
@@ -344,37 +346,44 @@ class Issues:
         self.known[ticket.id] = {"number": number, "digest": digest, "closed": closed}
         return True, True
 
+    def _repository(self) -> api.Slug | None:
+        if self._remote is None:
+            self._remote = api.remote_slug(self.root)
+        return self._remote
+
     def _open(self, title: str, body: str) -> int | None:
-        proc = self.github._gh("issue", "create", "--title", title, "--body", body,
-                               cwd=self.root)
-        if proc.returncode != 0:
+        slug = self._repository()
+        if slug is None:
             self.log.warn("github.issue_create_failed", title=title[:60],
-                          error=proc.stderr.strip()[:200])
+                          error="origin is not a GitHub remote")
             return None
-        number = _issue_number(proc.stdout)
+        try:
+            number = self.github.client.open_issue(slug, title, body)
+        except api.GitHubError as exc:
+            self.log.warn("github.issue_create_failed", title=title[:60],
+                          error=str(exc)[:200])
+            return None
         self.log.info("github.issue_opened", number=number, title=title[:60])
         return number
 
     def _edit(self, number: int, title: str, body: str, closed: bool,
               was_closed: bool) -> bool:
-        proc = self.github._gh("issue", "edit", str(number), "--title", title,
-                               "--body", body, cwd=self.root)
-        if proc.returncode != 0:
+        slug = self._repository()
+        if slug is None:
+            return False
+        fields = {"title": title, "body": body}
+        if closed != was_closed:
+            fields["state"] = "closed" if closed else "open"
+        try:
+            self.github.client.edit_issue(slug, number, **fields)
+        except api.GitHubError as exc:
             self.log.warn("github.issue_edit_failed", number=number,
-                          error=proc.stderr.strip()[:200])
+                          error=str(exc)[:200])
             return False
         if closed != was_closed:
-            self.github._gh("issue", "close" if closed else "reopen", str(number),
-                            cwd=self.root)
             self.log.info("github.issue_state", number=number,
                           state="closed" if closed else "reopened")
         return True
-
-
-def _issue_number(stdout: str) -> int | None:
-    """``gh issue create`` prints the URL of what it made."""
-    match = re.search(r"/issues/(\d+)", stdout or "")
-    return int(match.group(1)) if match else None
 
 
 def _split_author(author: str) -> tuple[str, str]:

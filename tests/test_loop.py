@@ -6,9 +6,7 @@ clean-room release -- runs deterministically without inference.
 """
 import json
 
-import pytest
-
-from hermes import workspace
+from hermes import testkit, workspace
 from hermes.config import Config
 from hermes.factory import Factory
 from hermes.journal import Journal
@@ -169,7 +167,7 @@ class StubRouter:
         return {}
 
 
-@pytest.fixture
+@testkit.fixture
 def factory(tmp_path, monkeypatch):
     root = tmp_path / "proj"
     root.mkdir()
@@ -319,22 +317,19 @@ def test_the_board_is_published_while_there_is_still_something_to_watch(factory,
 
 
 def test_a_project_without_github_publishes_nothing(factory, monkeypatch):
-    """Off must mean the gh CLI is never invoked at all, not merely never pushed.
+    """Off must mean GitHub is never reached at all, not merely never pushed to.
 
-    Asserted at the process boundary on purpose: stubbing the publishing
-    methods themselves would stub out the guard that is under test.
+    Asserted at the process boundary on purpose -- every API request and every
+    push -- because stubbing the publishing methods themselves would stub out
+    the guard that is under test.
     """
-    import subprocess
-
-    from hermes.git_ops import GitHub
+    from hermes import github
 
     calls = []
-
-    def never(self, *args, cwd=None):
-        calls.append(args)
-        return subprocess.CompletedProcess(args, 1, "", "")
-
-    monkeypatch.setattr(GitHub, "_gh", never)
+    monkeypatch.setattr(github.Client, "request",
+                        lambda self, *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(github, "push", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setenv("HERMES_GITHUB_TOKEN", "a token that must go unused")
     assert factory.run(max_iterations=40).phase == "COMPLETED"
     assert not calls
 

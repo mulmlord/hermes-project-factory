@@ -3,7 +3,7 @@ import csv
 from datetime import date
 from decimal import Decimal
 
-import pytest
+import testkit
 
 import tally
 from tally import Ledger, LedgerError, Money, Transaction
@@ -42,9 +42,9 @@ def test_money_rounds_half_even_and_prints():
 
 
 def test_money_rejects_floats_and_garbage():
-    with pytest.raises(TypeError):
+    with testkit.raises(TypeError):
         Money(1.5)
-    with pytest.raises(LedgerError):
+    with testkit.raises(LedgerError):
         Money("twelve")
 
 
@@ -58,7 +58,7 @@ def test_money_arithmetic_and_ordering():
 
 def test_money_is_hashable_and_immutable():
     assert len({Money("1"), Money("1.00"), Money("1", "EUR")}) == 2
-    with pytest.raises(Exception):
+    with testkit.raises(Exception):
         Money("1").amount = Decimal("2")
 
 
@@ -66,7 +66,7 @@ def test_mixing_currencies_raises():
     for operation in (lambda: Money("1") + Money("1", "EUR"),
                       lambda: Money("1") - Money("1", "EUR"),
                       lambda: Money("1") < Money("1", "EUR")):
-        with pytest.raises(LedgerError):
+        with testkit.raises(LedgerError):
             operation()
 
 
@@ -77,7 +77,7 @@ def test_opening_accounts():
     assert ledger.accounts() == ["Assets", "Assets:Bank"]
     for name, kind in (("Assets:Bank", "asset"), ("X", "wealth"),
                        ("Assets::Bank", "asset"), (":Bank", "asset")):
-        with pytest.raises(LedgerError):
+        with testkit.raises(LedgerError):
             ledger.open(name, kind)
 
 
@@ -91,7 +91,7 @@ def test_post_assigns_ids_and_keeps_postings():
                               ("Equity:Opening", usd("-1000")))
 
 
-@pytest.mark.parametrize("postings", [
+@testkit.mark.parametrize("postings", [
     [("Assets:Bank", Money("10"))],
     [("Assets:Bank", Money("10")), ("Income:Salary", Money("-9.99"))],
     [("Assets:Bank", Money("10")), ("Nowhere", Money("-10"))],
@@ -99,7 +99,7 @@ def test_post_assigns_ids_and_keeps_postings():
 ])
 def test_invalid_transactions_leave_the_ledger_unchanged(postings):
     ledger = books()
-    with pytest.raises(LedgerError):
+    with testkit.raises(LedgerError):
         ledger.post(date(2026, 3, 1), "bad", postings)
     assert len(ledger.transactions()) == 4
     assert ledger.balance("Assets:Bank") == usd("2300")
@@ -136,7 +136,7 @@ def test_balance_as_of_and_unknown_accounts():
     ledger = books()
     assert ledger.balance("Assets:Bank", as_of=date(2026, 1, 5)) == usd("3500")
     assert ledger.balance("Assets:Cash") == usd("0")
-    with pytest.raises(LedgerError):
+    with testkit.raises(LedgerError):
         ledger.balance("Nowhere")
 
 
@@ -208,7 +208,7 @@ def test_csv_import_is_all_or_nothing(tmp_path):
         "8,2026-01-02,bad,Assets:Bank,5.00,USD\n"
         "8,2026-01-02,bad,Equity:Opening,-4.00,USD\n")
     ledger = books()
-    with pytest.raises(LedgerError):
+    with testkit.raises(LedgerError):
         import_csv(ledger, path)
     assert len(ledger.transactions()) == 4
 

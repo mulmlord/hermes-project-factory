@@ -3,11 +3,13 @@
 # Uninstall the Hermes Project Factory.
 #
 # Undoes ./install.sh and ./start.sh: stops and removes the vLLM model server
-# unit, the factory and vLLM virtualenvs, the `hpf` and `hermes` commands, the
-# editable-install leftovers in this repository, and the optional OpenHands
-# agent layer. It leaves the sandbox image and the downloaded model weights
-# alone unless you ask for them: the image is a stock one other containers
-# may share, and the weights are gigabytes you would have to fetch again.
+# unit and the upkeep timer, the factory and vLLM virtualenvs, the `hpf` and
+# `hermes` commands, and the editable-install leftovers in this repository --
+# plus the OpenHands and classifier environments an older install.sh may have
+# left, which the factory no longer uses. It leaves the sandbox image and the
+# downloaded model weights alone unless you ask for them: the image is a stock
+# one other containers may share, and the weights are gigabytes you would have
+# to fetch again.
 #
 # Your config is kept, because the model routing in it is yours, but the
 # endpoint of the server being removed is retired in place so the file stops
@@ -17,16 +19,15 @@
 # It never touches generated projects. Those are ordinary directories you own.
 #
 # Usage: ./uninstall.sh [--config] [--docker-image] [--models] [--all]
-#                       [--keep-openhands] [--keep-server]
+#                       [--keep-server]
 #                       [--system] [--bin DIR] [--venv DIR] [--dry-run]
 #
 #   --config           delete ~/.config/hermes/config.yaml instead of
 #                      retiring the endpoint inside it, and delete what the
-#                      factory learned about its own retries
+#                      factory learned about its own retries and its upkeep
 #   --docker-image     also delete the pre-pulled sandbox image
 #   --models           also delete the downloaded model weights
 #   --all              --config and --docker-image together (not --models)
-#   --keep-openhands   leave the OpenHands agent layer installed
 #   --keep-server      leave the vLLM server unit and environment installed
 #   --system           unlink from /usr/local/bin instead of ~/.local/bin (sudo)
 #   --bin DIR          unlink the commands from DIR
@@ -36,9 +37,11 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$REPO/.venv"
+VLLM_VENV="$REPO/.venv-vllm"
+# Installed by earlier versions, for software the factory has since replaced
+# with its own code. Removed whenever they are found.
 OH_VENV="$REPO/.venv-openhands"
 LAYA_VENV="$REPO/.venv-laya"
-VLLM_VENV="$REPO/.venv-vllm"
 BIN_DIR="$HOME/.local/bin"
 UNIT_NAME="hermes-vllm.service"
 CLASSIFIER_UNIT="hermes-classifier.service"
@@ -47,7 +50,6 @@ MODELS_DIR="${HERMES_MODELS_DIR:-$HOME/.local/share/hermes/models}"
 CONFIG=0
 IMAGE=0
 MODELS=0
-OPENHANDS=1
 SERVER=1
 DRY=0
 
@@ -61,13 +63,13 @@ while [ $# -gt 0 ]; do
     --docker-image)   IMAGE=1 ;;
     --models)         MODELS=1 ;;
     --all)            CONFIG=1; IMAGE=1 ;;
-    --keep-openhands) OPENHANDS=0 ;;
+    --keep-openhands) ;;   # accepted from older scripts; there is nothing to keep
     --keep-server)    SERVER=0 ;;
     --system)         BIN_DIR="/usr/local/bin" ;;
     --bin)            BIN_DIR="${2:?--bin needs a directory}"; shift ;;
     --venv)           VENV="${2:?--venv needs a directory}"; shift ;;
     --dry-run)        DRY=1 ;;
-    -h|--help)        sed -n '3,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)        sed -n '3,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)                die "unknown option: $1 (try --help)" ;;
   esac
   shift
@@ -171,12 +173,30 @@ for egg in "$REPO"/*.egg-info; do
   [ -d "$egg" ] && remove "$egg"
 done
 
-# -- security classifier -----------------------------------------------------
+# -- upkeep timer ------------------------------------------------------------
 
-# Only ever installed by `install.sh --classifier`, so on most machines this
-# finds nothing and says so once.
+# Stopped before the environment its ExecStart names is deleted, for the same
+# reason the server is.
+for unit in hermes-upkeep.timer hermes-upkeep.service; do
+  [ -f "$UNIT_DIR/$unit" ] || continue
+  note "stopping and removing $unit"
+  if [ "$DRY" -eq 1 ]; then
+    note "would run: systemctl --user disable --now $unit"
+  else
+    systemctl --user disable --now "$unit" 2>/dev/null || true
+  fi
+  remove "$UNIT_DIR/$unit"
+done
+[ "$DRY" -eq 0 ] && systemctl --user daemon-reload 2>/dev/null || true
+
+# -- what older versions installed --------------------------------------------
+
+# The security classifier and the OpenHands agent layer were third-party
+# software that install.sh used to put beside the factory. The factory no
+# longer runs either, so whatever an earlier install left is removed here
+# rather than left to rot on disk.
 if [ -f "$UNIT_DIR/$CLASSIFIER_UNIT" ]; then
-  note "stopping and removing $CLASSIFIER_UNIT"
+  note "stopping and removing $CLASSIFIER_UNIT (no longer used)"
   if [ "$DRY" -eq 1 ]; then
     note "would run: systemctl --user disable --now $CLASSIFIER_UNIT"
   else
@@ -186,32 +206,17 @@ if [ -f "$UNIT_DIR/$CLASSIFIER_UNIT" ]; then
   remove "$UNIT_DIR/$CLASSIFIER_UNIT"
   [ "$DRY" -eq 0 ] && systemctl --user daemon-reload 2>/dev/null || true
 fi
-
-if [ -f "$LAYA_VENV/pyvenv.cfg" ]; then
-  note "removing the security classifier environment"
-  remove "$LAYA_VENV"
-fi
-
-# -- openhands ---------------------------------------------------------------
-
-# install.sh installs it one of two ways, so uninstall has to undo both. The uv
-# tool is shared with anything else on this machine that uses it, hence the
-# note: removing it is what was asked for, but it is worth saying out loud.
-if [ "$OPENHANDS" -eq 1 ]; then
-  if [ -f "$OH_VENV/pyvenv.cfg" ]; then
-    note "removing the OpenHands agent layer"
-    unlink_command openhands
-    remove "$OH_VENV"
-  elif command -v uv >/dev/null 2>&1 && uv tool list 2>/dev/null | grep -q '^openhands '; then
-    note "removing the OpenHands agent layer installed by uv"
-    if [ "$DRY" -eq 1 ]; then
-      note "would run: uv tool uninstall openhands"
-    else
-      uv tool uninstall -q openhands || warn "uv could not uninstall openhands"
-    fi
-  elif command -v openhands >/dev/null 2>&1; then
-    warn "openhands at $(command -v openhands) was not installed by install.sh; leaving it"
+for legacy in "$LAYA_VENV" "$OH_VENV"; do
+  if [ -f "$legacy/pyvenv.cfg" ]; then
+    note "removing $legacy (no longer used)"
+    [ "$legacy" = "$OH_VENV" ] && unlink_command openhands
+    remove "$legacy"
   fi
+done
+if command -v openhands >/dev/null 2>&1; then
+  note "an openhands command is still on PATH at $(command -v openhands); Hermes"
+  note "no longer uses it. If an earlier install.sh put it there with uv, remove it"
+  note "with: uv tool uninstall openhands"
 fi
 
 # -- configuration -----------------------------------------------------------
@@ -300,6 +305,17 @@ if [ -f "$LEDGER_FILE" ]; then
     fi
   else
     note "keeping what the factory learned at $LEDGER_FILE (--config removes it)"
+  fi
+fi
+
+# What upkeep remembers -- when it last ran, the add-ons it found, the pull
+# requests it opened -- goes the same way as the ledger, for the same reason.
+UPKEEP_DIR="${HERMES_UPKEEP_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/hermes/upkeep}"
+if [ -d "$UPKEEP_DIR" ]; then
+  if [ "$CONFIG" -eq 1 ]; then
+    remove "$UPKEEP_DIR"
+  else
+    note "keeping upkeep's history at $UPKEEP_DIR (--config removes it)"
   fi
 fi
 

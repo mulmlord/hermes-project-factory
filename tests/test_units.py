@@ -14,13 +14,12 @@ import sys
 import threading
 import time
 
-import pytest
-
 from pathlib import Path
 from types import SimpleNamespace
 
 from conftest import needs_docker
 
+from hermes import testkit, upkeep
 from hermes.agents import (Prompt, build as build_agents, change_schema, context_block,
                            escalate, file_protocol, ticket_block)
 from hermes.config import Config, ConfigError, DEFAULTS, deep_merge, is_local_url
@@ -39,7 +38,6 @@ from hermes.journal import Entry, Journal
 from hermes.log import NULL, Logger, current_scope, scope
 from hermes.models import (ModelError, PromptTooLarge, Router, extract_json,
                           strip_reasoning)
-from hermes.openhands import OpenHands
 from hermes.research import ResearchLog, investigate
 from hermes.resources import Governor
 from hermes import harness, mutate, prompts, schema, tamper
@@ -68,7 +66,7 @@ def test_remote_model_is_rejected(tmp_path):
     path = tmp_path / "hermes.yaml"
     path.write_text("models:\n  default:\n    backend: openai\n"
                     "    base_url: https://api.openai.com/v1\n    model: gpt-4\n")
-    with pytest.raises(ConfigError, match="not a local endpoint"):
+    with testkit.raises(ConfigError, match="not a local endpoint"):
         Config.load(path).model_for("coding")
 
 
@@ -100,7 +98,7 @@ def test_structured_output_still_reads_the_spelling_it_had_before_schemas(tmp_pa
     assert level("schema") == "schema"
     assert level("json") == "json"
     assert level("off") == "off"
-    with pytest.raises(ConfigError, match="structured_output"):
+    with testkit.raises(ConfigError, match="structured_output"):
         level("yes-please")
 
 
@@ -168,10 +166,10 @@ def test_setting_a_value_keeps_every_comment_and_every_other_option():
     load-and-re-dump would hand back a correct file with all of that stripped
     out, so the edit is made in the text.
     """
-    import yaml
+    from hermes import yamlite
     from hermes.config import SAMPLE_CONFIG, set_config_value
 
-    before = yaml.safe_load(SAMPLE_CONFIG)
+    before = yamlite.load(SAMPLE_CONFIG)
     text = SAMPLE_CONFIG
     for key, value in [("models.default.base_url", "http://localhost:6900/v1"),
                        ("models.default.model", "my-coder-7b"),
@@ -180,7 +178,7 @@ def test_setting_a_value_keeps_every_comment_and_every_other_option():
                        ("server.gpu_util", 0.75)]:
         text = set_config_value(text, key, value)
 
-    after = yaml.safe_load(text)
+    after = yamlite.load(text)
     assert after["models"]["default"]["base_url"] == "http://localhost:6900/v1"
     assert after["models"]["default"]["context"] == 32768
     assert after["server"]["model_path"] == "/srv/weights/My-Coder-7B"
@@ -205,7 +203,7 @@ def test_setting_a_value_keeps_every_comment_and_every_other_option():
 
 def test_setting_a_value_creates_the_keys_a_config_predates():
     """An option added after the config was written is set, not refused."""
-    import yaml
+    from hermes import yamlite
     from hermes.config import set_config_value
 
     text = "models:\n  default:\n    model: x    # the one being served\n"
@@ -213,7 +211,7 @@ def test_setting_a_value_creates_the_keys_a_config_predates():
     text = set_config_value(text, "security.classifier.enabled", True)
     text = set_config_value(text, "models.default.context", 8192)
 
-    loaded = yaml.safe_load(text)
+    loaded = yamlite.load(text)
     assert loaded["server"] == {"model_path": "/srv/w"}
     assert loaded["security"] == {"classifier": {"enabled": True}}
     assert loaded["models"]["default"] == {"model": "x", "context": 8192}
@@ -227,7 +225,7 @@ def test_a_value_that_would_not_read_back_is_refused():
     landed in the wrong block, must fail loudly here rather than produce a
     file that reads plausibly and means something else.
     """
-    import yaml
+    from hermes import yamlite
     from hermes.config import ConfigError, set_config_value
 
     # The values most likely to be mangled: ones YAML would otherwise read as
@@ -235,9 +233,9 @@ def test_a_value_that_would_not_read_back_is_refused():
     for value in ("16384", "yes", "no", "null", "", "on"):
         text = set_config_value("models:\n  default:\n    model: x\n",
                                 "models.default.model", value)
-        assert yaml.safe_load(text)["models"]["default"]["model"] == value
+        assert yamlite.load(text)["models"]["default"]["model"] == value
 
-    with pytest.raises(ConfigError):
+    with testkit.raises(ConfigError):
         # A list is not a mapping: there is no key to descend into.
         set_config_value("routing:\n  - research\n", "routing.research", "fast")
 
@@ -248,7 +246,7 @@ def test_config_set_writes_the_user_config_it_claims_to(tmp_path, monkeypatch, c
     The file it picks matters as much as the edit: writing into whatever
     directory the script ran from would leave a config nothing ever reads.
     """
-    import yaml
+    from hermes import yamlite
     from hermes.cli import config_write_path, main
 
     home = tmp_path / "config"
@@ -260,7 +258,7 @@ def test_config_set_writes_the_user_config_it_claims_to(tmp_path, monkeypatch, c
     assert config_write_path(SimpleNamespace(config=None)) == target
     assert main(["config", "--set", "models.default.model=served",
                  "--set", "models.default.context=4096"]) == 0
-    written = yaml.safe_load(target.read_text())
+    written = yamlite.load(target.read_text())
     assert written["models"]["default"]["model"] == "served"
     assert written["models"]["default"]["context"] == 4096
 
@@ -270,8 +268,8 @@ def test_config_set_writes_the_user_config_it_claims_to(tmp_path, monkeypatch, c
     local.write_text("models:\n  default:\n    model: local\n")
     assert config_write_path(SimpleNamespace(config=None)) == local
     assert main(["config", "--set", "models.default.model=other"]) == 0
-    assert yaml.safe_load(local.read_text())["models"]["default"]["model"] == "other"
-    assert yaml.safe_load(target.read_text())["models"]["default"]["model"] == "served"
+    assert yamlite.load(local.read_text())["models"]["default"]["model"] == "other"
+    assert yamlite.load(target.read_text())["models"]["default"]["model"] == "served"
 
     # An assignment that is not one is a usage error, not a half-written file.
     assert main(["config", "--set", "models.default.model"]) == 2
@@ -308,45 +306,6 @@ def test_the_scripts_split_installing_from_starting():
             node = node[part]
 
 
-# -- openhands ---------------------------------------------------------------
-
-def test_openhands_delegation_stays_headless_and_local(tmp_path, monkeypatch):
-    """The invocation must match the CLI Hermes actually shells out to.
-
-    Two of these assertions are load-bearing rather than cosmetic: there is no
-    --directory flag, so passing one aborts the run, and without
-    --override-with-envs the LLM_* variables are ignored and OpenHands falls
-    back to a hosted endpoint, which Hermes is not allowed to reach.
-    """
-    model = SimpleNamespace(backend="ollama", model="qwen3:30b-a3b",
-                            base_url="http://localhost:11434")
-    agent = OpenHands({"enabled": True, "command": "openhands"}, model)
-    ticket = SimpleNamespace(id="T001", title="tidy", kind="refactor",
-                             objective="o", context="c", acceptance=[],
-                             validation=[], artifacts=[])
-    seen = {}
-
-    def fake_run(argv, **kw):
-        seen["argv"] = argv
-        seen["env"] = kw.get("env", {})
-        seen["cwd"] = kw.get("cwd")
-        return SimpleNamespace(returncode=0, stdout="done", stderr="")
-
-    monkeypatch.setattr("hermes.openhands.subprocess.run", fake_run)
-    assert agent.run_ticket(tmp_path, ticket, "CONTEXT")["ok"]
-
-    assert "--headless" in seen["argv"]
-    assert "--override-with-envs" in seen["argv"]
-    assert "-t" in seen["argv"]
-    assert "--directory" not in seen["argv"]
-    assert seen["cwd"] == tmp_path  # the working directory is the cwd, not a flag
-
-    env = seen["env"]
-    assert env["LLM_MODEL"] == "ollama/qwen3:30b-a3b"
-    assert is_local_url(env["LLM_BASE_URL"])
-    assert not [k for k in env if "ANTHROPIC" in k.upper() or "OPENAI_API_KEY" in k]
-
-
 # -- model output parsing ----------------------------------------------------
 
 def test_extract_json_survives_reasoning_and_fences():
@@ -359,7 +318,7 @@ def test_extract_json_finds_bare_object_in_prose():
 
 
 def test_extract_json_raises_when_absent():
-    with pytest.raises(ValueError):
+    with testkit.raises(ValueError):
         extract_json("no structured output at all")
 
 
@@ -367,7 +326,7 @@ def test_strip_reasoning():
     assert strip_reasoning("<think>a</think>b") == "b"
 
 
-@pytest.fixture
+@testkit.fixture
 def refusing_server():
     """A loopback OpenAI-compatible server that answers 400 on demand.
 
@@ -547,11 +506,12 @@ SHAPES = [
     (prompts.readme('"purpose": ""'), prompts.readme_schema(["purpose"])),
     (prompts.ARCHITECTURE_DOC, prompts.ARCHITECTURE_SHAPE),
     (file_protocol(edits=True), change_schema(edits=True)),
+    (upkeep.scout_prompt(["planner", "prompts"]), upkeep.ADDONS),
     (file_protocol(edits=False), change_schema(edits=False)),
 ]
 
 
-@pytest.mark.parametrize("text,shape", SHAPES, ids=range(len(SHAPES)))
+@testkit.mark.parametrize("text,shape", SHAPES, ids=range(len(SHAPES)))
 def test_every_shape_describes_the_prompt_it_is_sent_with(text, shape):
     """A schema that has drifted from its prompt is worse than none at all.
 
@@ -563,7 +523,7 @@ def test_every_shape_describes_the_prompt_it_is_sent_with(text, shape):
         assert f'"{key}"' in text, f"{key!r} is in the shape but not in the prompt"
 
 
-@pytest.mark.parametrize("text,shape", SHAPES, ids=range(len(SHAPES)))
+@testkit.mark.parametrize("text,shape", SHAPES, ids=range(len(SHAPES)))
 def test_every_shape_is_satisfied_by_an_empty_object(text, shape):
     """Required means "the caller cannot work without it", not "please".
 
@@ -573,7 +533,7 @@ def test_every_shape_is_satisfied_by_an_empty_object(text, shape):
     assert len(schema.check(shape, {}, limit=99)) == len(shape.get("required", []))
 
 
-@pytest.mark.parametrize("text,shape", SHAPES, ids=range(len(SHAPES)))
+@testkit.mark.parametrize("text,shape", SHAPES, ids=range(len(SHAPES)))
 def test_no_shape_asks_for_a_verdict_before_the_evidence_for_it(text, shape):
     """A decoder writes keys in order, so the order is the order of thought.
 
@@ -695,7 +655,7 @@ def test_a_context_overflow_is_not_read_as_a_missing_feature(refusing_server, tm
     refusing_server["refusal"] = "context"
     router = _router_for(refusing_server, tmp_path)
 
-    with pytest.raises(ModelError, match="maximum context length"):
+    with testkit.raises(ModelError, match="maximum context length"):
         router.complete_json("coding", "sys", "prompt")
     assert router.backend("coding").level == "schema"
     assert len(refusing_server["requests"]) == 1  # no retry that fails the same way
@@ -706,7 +666,7 @@ def test_a_server_fault_is_not_mistaken_for_a_missing_feature(monkeypatch):
     backend = router.backend("coding")
     monkeypatch.setattr(backend, "complete", lambda *a, **k: (_ for _ in ()).throw(
         ModelError("http://localhost:11434: HTTP 500 out of memory")))
-    with pytest.raises(ModelError, match="500"):
+    with testkit.raises(ModelError, match="500"):
         router.complete_json("coding", "sys", "prompt")
     assert backend.level == "schema"
 
@@ -759,7 +719,7 @@ def test_an_oversized_prompt_is_refused_here_not_by_the_server(refusing_server, 
     """Nothing leaves the machine, and the message says what to change."""
     router = _router_for(refusing_server, tmp_path)
     oversized = "x" * (router.allowance("coding").prompt_chars + 1000)
-    with pytest.raises(PromptTooLarge, match="models.<role>.context"):
+    with testkit.raises(PromptTooLarge, match="models.<role>.context"):
         router.complete("coding", "sys", oversized)
     assert refusing_server["requests"] == []
 
@@ -806,7 +766,7 @@ def test_a_prompt_whose_required_blocks_do_not_fit_names_them():
     prompt = _prompt(100)
     prompt.add("context", "C" * 80, required=True)
     prompt.add("protocol", "P" * 80, required=True)
-    with pytest.raises(PromptTooLarge, match="protocol 80c"):
+    with testkit.raises(PromptTooLarge, match="protocol 80c"):
         prompt.render()
 
 
@@ -884,7 +844,7 @@ def test_two_asks_about_one_project_share_the_prefix_the_server_caches(tmp_path)
 
 def test_illegal_transition_rejected():
     state = State(idea="x")
-    with pytest.raises(StateError):
+    with testkit.raises(StateError):
         state.transition("RELEASE")
 
 
@@ -973,7 +933,7 @@ def test_board_renders_markdown(tmp_path):
 
 def test_sandbox_blocks_escapes(tmp_path):
     sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 10})
-    with pytest.raises(SandboxError):
+    with testkit.raises(SandboxError):
         sandbox.write("../escape.txt", "x")
     sandbox.write("src/ok.txt", "x")
     assert (tmp_path / "src" / "ok.txt").read_text() == "x"
@@ -1115,10 +1075,9 @@ def test_no_variable_shaped_like_a_credential_reaches_code_hermes_did_not_write(
         tmp_path, monkeypatch):
     """Isolating the agent does not isolate the secret.
 
-    Both paths that hand a host environment to untrusted code -- the local
-    sandbox and the OpenHands runner -- are swept with the same 220-odd
-    generated names, because the two used to filter through lists of their
-    own and the narrower one passed ``HF_TOKEN`` and ``SSH_AUTH_SOCK``
+    The path that hands a host environment to untrusted code -- the local
+    sandbox -- is swept with 220-odd generated names, because filters kept
+    as lists of their own once passed ``HF_TOKEN`` and ``SSH_AUTH_SOCK``
     straight to an agent loop with a shell. Vendors are generated rather than
     listed: a filter that enumerates today's vendors is a filter that fails
     on tomorrow's.
@@ -1126,11 +1085,8 @@ def test_no_variable_shaped_like_a_credential_reaches_code_hermes_did_not_write(
     planted = _credential_names()
     for name in planted:
         monkeypatch.setenv(name, "sensitive")
-    model = SimpleNamespace(backend="ollama", model="qwen3:30b-a3b",
-                            base_url="http://localhost:11434")
     environments = {
         "local sandbox": Sandbox(tmp_path, {"runtime": "local"})._local_env(),
-        "openhands": OpenHands({"enabled": True}, model)._env(),
     }
 
     for where, env in environments.items():
@@ -1139,21 +1095,6 @@ def test_no_variable_shaped_like_a_credential_reaches_code_hermes_did_not_write(
         assert "sensitive" not in set(env.values()), f"{where} leaked a value"
     # Not merely "drops everything": what a toolchain needs still arrives.
     assert environments["local sandbox"]["PATH"] == os.environ["PATH"]
-
-
-def test_the_endpoint_placeholder_survives_the_sieve_that_drops_keys(tmp_path):
-    """``LLM_API_KEY`` is credential-shaped and load-bearing at the same time.
-
-    OpenHands aborts under ``--override-with-envs`` when it is unset, so the
-    overrides have to be applied after the filter. Filtering last would leave
-    the runner refusing to start for the sake of a placeholder that says
-    "local".
-    """
-    model = SimpleNamespace(backend="vllm", model="qwen",
-                            base_url="http://127.0.0.1:6767")
-    env = OpenHands({"enabled": True}, model)._env()
-    assert env["LLM_API_KEY"] == "local" and env["LLM_MODEL"] == "openai/qwen"
-    assert carries_secret("LLM_API_KEY")        # it is dropped, then re-set
 
 
 def test_a_password_inside_a_proxy_url_does_not_survive_either(tmp_path, monkeypatch):
@@ -1237,8 +1178,12 @@ def test_nothing_copies_the_host_environment_without_the_sieve():
     they refuse to pass on.
     """
     readers = _whole_environ_readers()
+    # The rest hand an environment to git on the host or to an evaluation of
+    # a self-modification: each still sieves, so that the one credential git
+    # is given is the token, and an evaluation is given none.
     assert {(module, func) for module, func, _ in readers} == {
-        ("sandbox.py", "_local_env"), ("openhands.py", "_env")}
+        ("sandbox.py", "_local_env"), ("github.py", "push"),
+        ("upkeep.py", "_git_env"), ("upkeep.py", "evaluation_env")}
     for module, func, body in readers:
         assert "carries_secret" in body, (
             f"{module}:{func} takes the host environment whole and hands it on "
@@ -2411,7 +2356,7 @@ def _serving(bind: str, reachable_as: str):
             server.server_close()
 
 
-@pytest.fixture
+@testkit.fixture
 def served():
     """A real HTTP server on loopback, so a fetch is an actual fetch.
 
@@ -2803,7 +2748,7 @@ def test_untrusted_text_and_a_toolbox_cannot_be_offered_together(tmp_path):
     prompt.add("material", "whatever the page said", trust=UNTRUSTED)
 
     assert prompt.untrusted == ("material",)
-    with pytest.raises(Quarantined, match="untrusted"):
+    with testkit.raises(Quarantined, match="untrusted"):
         Lookup(agent, prompt, Toolbox(sandbox))
     # Without tools the same prompt is fine: that is how research reads pages.
     assert Lookup(agent, prompt, Toolbox(sandbox, budget=0)).toolbox is None
@@ -2885,7 +2830,7 @@ def test_the_gate_still_refuses_a_command_with_no_classifier_running(tmp_path):
 # every one of those, so it is exercised here for real.
 
 
-@pytest.fixture
+@testkit.fixture
 def bridge_served():
     """The page set, at an address a bridge-network container can reach.
 
@@ -3217,38 +3162,49 @@ def test_an_experiment_ticket_is_completed_by_the_measurement_not_by_the_verdict
 
 # -- github issue sync -------------------------------------------------------
 
-class _Gh:
-    """Stands in for the gh CLI, recording what it was asked to do."""
+class _FakeGitHub:
+    """Stands in for GitHub's REST API, recording what it was asked to do."""
+
+    token = "test-token"
 
     def __init__(self, exists=False):
         self.calls: list[list[str]] = []
         self.opened = 0
         self.exists = exists      # whether the remote repository is there yet
 
-    def __call__(self, *args, cwd=None):
-        self.calls.append(list(args))
-        if args[:2] == ("issue", "create"):
-            self.opened += 1
-            return subprocess.CompletedProcess(
-                args, 0, f"https://github.com/o/r/issues/{self.opened}\n", "")
-        if args[:2] == ("repo", "view"):
-            if not self.exists:
-                return subprocess.CompletedProcess(args, 1, "", "not found")
-            return subprocess.CompletedProcess(
-                args, 0, '{"url": "https://github.com/o/r"}', "")
-        if args[:2] == ("repo", "create"):
-            self.exists = True
-        return subprocess.CompletedProcess(args, 0, "", "")
+    def login(self):
+        return "o"
+
+    def repository(self, slug):
+        self.calls.append(["repo view", str(slug)])
+        return {"html_url": "https://github.com/o/r"} if self.exists else None
+
+    def create_repository(self, name, *, private=True, description="", org=None):
+        self.calls.append(["repo create", name, "private" if private else "public"])
+        self.exists = True
+        return {"html_url": "https://github.com/o/r"}
+
+    def open_issue(self, slug, title, body, labels=None):
+        self.opened += 1
+        self.calls.append(["issue create", str(slug), title, body])
+        return self.opened
+
+    def edit_issue(self, slug, number, **fields):
+        self.calls.append(["issue edit", str(number), fields.get("title", ""),
+                           fields.get("body", "")])
+        if "state" in fields:
+            self.calls.append(["issue close" if fields["state"] == "closed"
+                               else "issue reopen", str(number)])
+        return {}
 
     def verbs(self) -> list[str]:
-        return [" ".join(call[:2]) for call in self.calls]
+        return [call[0] for call in self.calls]
 
 
-@pytest.fixture
+@testkit.fixture
 def gh(monkeypatch):
-    fake = _Gh()
-    monkeypatch.setattr(GitHub, "_gh",
-                        lambda self, *args, cwd=None: fake(*args, cwd=cwd))
+    fake = _FakeGitHub()
+    monkeypatch.setattr("hermes.git_ops.api.Client", lambda *args, **kwargs: fake)
     return fake
 
 
@@ -3256,19 +3212,15 @@ def _published(root):
     """A project that has a repository, which is what sync waits for."""
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "remote", "add", "origin",
-                    "https://example.invalid/o/r.git"], cwd=root, check=True)
+                    "https://github.com/o/r.git"], cwd=root, check=True)
 
 
 def _sync(root, batch=20, enabled=True):
-    github = GitHub({"enabled": enabled}, NULL)
-    github.available = True          # gh need not be installed to test the logic
-    return Issues(github, root, NULL, batch)
+    return Issues(GitHub({"enabled": enabled}, NULL), root, NULL, batch)
 
 
 def _github(**cfg):
-    github = GitHub({"enabled": True, **cfg}, NULL)
-    github.available = True          # gh need not be installed to test the logic
-    return github
+    return GitHub({"enabled": True, **cfg}, NULL)
 
 
 def test_creating_the_repository_publishes_no_code(tmp_path, gh):
@@ -3277,22 +3229,17 @@ def test_creating_the_repository_publishes_no_code(tmp_path, gh):
     url = _github().create(tmp_path, "proj", "a description")
 
     assert url == "https://github.com/o/r"
-    assert "repo create" in gh.verbs()
-    flat = [arg for call in gh.calls for arg in call]
-    assert "--push" not in flat and "--private" in flat
+    assert ["repo create", "proj", "private"] in gh.calls
+    assert "push" not in " ".join(gh.verbs())
     assert gh.exists
 
 
-def test_an_existing_repository_is_adopted_rather_than_recreated(tmp_path):
+def test_an_existing_repository_is_adopted_rather_than_recreated(tmp_path, monkeypatch):
     """Resuming a project must not try to create the repository a second time."""
-    fake = _Gh(exists=True)
-    original = GitHub._gh
-    GitHub._gh = lambda self, *args, cwd=None: fake(*args, cwd=cwd)
-    try:
-        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-        url = _github().create(tmp_path, "proj", "d")
-    finally:
-        GitHub._gh = original
+    fake = _FakeGitHub(exists=True)
+    monkeypatch.setattr("hermes.git_ops.api.Client", lambda *args, **kwargs: fake)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    url = _github().create(tmp_path, "proj", "d")
 
     assert url == "https://github.com/o/r"
     assert "repo create" not in fake.verbs()
@@ -3312,6 +3259,7 @@ def test_each_ticket_becomes_an_issue(tmp_path, gh):
 
     assert sync.sync(board.tickets.values()) == 2
     assert gh.verbs().count("issue create") == 2
+    assert {call[1] for call in gh.calls} == {"o/r"}   # the origin's repository
     assert set(sync.known) == set(board.tickets)
     assert (tmp_path / ".hermes" / "state" / "github_issues.json").is_file()
     # Every issue carries the statement that it is not an input.
@@ -3510,7 +3458,7 @@ def test_the_classifier_refuses_a_service_that_is_not_local():
     config = Config(deep_merge(DEFAULTS, {"security": {"classifier": {
         "enabled": True, "base_url": "https://classify.example.com"}}}))
 
-    with pytest.raises(ConfigError, match="local"):
+    with testkit.raises(ConfigError, match="local"):
         Classifier.from_config(config)
 
 
@@ -3690,7 +3638,7 @@ def test_the_workspace_is_left_exactly_as_it_was_found(tmp_path):
         raise KeyboardInterrupt("the operator gave up mid-survey")
 
     sandbox.run = explode
-    with pytest.raises(KeyboardInterrupt):
+    with testkit.raises(KeyboardInterrupt):
         mutate.survey(sandbox, ["calc.py"], plan["commands"]["test"])
     assert sandbox.read("calc.py") == DECISION
 
@@ -3933,7 +3881,7 @@ def _found(after: str, kind: str = "implementation") -> list[str]:
     return [f.describe() for f in tamper.compare(_surface(), _surface(after), kind)]
 
 
-@pytest.mark.parametrize("name", WEAKENINGS)
+@testkit.mark.parametrize("name", WEAKENINGS)
 def test_every_way_of_asking_the_suite_less_is_found(name):
     """One finding per edit: a deleted test is not also reported per assert."""
     old, new, expected = WEAKENINGS[name]
@@ -3942,7 +3890,7 @@ def test_every_way_of_asking_the_suite_less_is_found(name):
     assert not tamper.compare(_surface(), _surface(SUITE.replace(old, new)))[0].hard
 
 
-@pytest.mark.parametrize("name", KEPT)
+@testkit.mark.parametrize("name", KEPT)
 def test_a_check_that_moved_is_still_a_check(name):
     """Compared as syntax over the whole suite, so layout and location do not count."""
     old, new = KEPT[name]
@@ -3963,7 +3911,7 @@ def test_nothing_is_weakened_where_there_was_nothing():
     assert tamper.compare(tamper.Surface(collected=[]), _surface(collected=[])) == []
 
 
-@pytest.mark.parametrize("after,flagged", [
+@testkit.mark.parametrize("after,flagged", [
     ("@pytest.fixture\ndef calc():\n    return 1\n\n\n@pytest.fixture\ndef other():\n"
      "    return 2\n", False),
     ("@pytest.fixture\ndef calc():\n    return 2\n", True),
@@ -4012,7 +3960,7 @@ def test_a_smaller_suite_is_refused_outright_only_where_nothing_needs_one():
     assert lost.hard, "a suite that cannot be counted cannot be shown to be whole"
 
 
-@pytest.mark.parametrize("command,collects", [
+@testkit.mark.parametrize("command,collects", [
     ("pytest -q", True),
     ("python3 -m pytest -q tests", True),
     ("PYTHONPATH=src python -m pytest", True),
@@ -4111,39 +4059,53 @@ def test_an_untouched_suite_passes_and_says_what_it_compared(tmp_path):
     assert "not a single pytest run" in gate.detail     # and what it could not
 
 
-def _pytest_project(tmp_path):
-    """SUITE under the real pytest running these tests, so the ids are real ids."""
-    sandbox = Sandbox(tmp_path, {"runtime": "local", "timeout": 120})
-    sandbox.write("src/calc.py", DECISION)
-    sandbox.write("tests/test_calc.py", SUITE)
-    command = f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider"
-    baseline = tamper.capture(sandbox, tamper.collect_command(command))
-    return sandbox, baseline
+@contextlib.contextmanager
+def _pytest_project(root):
+    """SUITE under a real pytest, so the ids are real ids.
+
+    pytest is a generated project's dependency, not the factory's. It is
+    installed where a generated project installs it -- inside that project's
+    sandbox -- and never into the interpreter running this suite, so the test
+    needs a container.
+    """
+    if not shutil.which("docker"):
+        needs_docker("docker is not installed")
+    sandbox = Sandbox(root, {"runtime": "docker", "timeout": 300,
+                             "image": "python:3.11-slim"})
+    with sandbox:
+        if sandbox.runtime != "docker":
+            needs_docker(f"docker did not run a container: {sandbox.fallback}")
+        installed = sandbox.install("pip install --quiet pytest")
+        assert installed.ok, installed.summary(300)
+        sandbox.write("src/calc.py", DECISION)
+        sandbox.write("tests/test_calc.py", SUITE)
+        command = "python -m pytest -q -p no:cacheprovider"
+        yield sandbox, tamper.capture(sandbox, tamper.collect_command(command))
 
 
-def test_a_setting_that_deselects_a_test_is_caught_by_the_count(tmp_path):
+def test_a_setting_that_deselects_a_test_is_caught_by_the_count(shared_tmp):
     """The one edit no syntax shows: the test is intact and never runs.
 
     A reason from the screen excuses the settings change, which is only a
     fact about a file; it cannot excuse the suite getting smaller, which is
     the effect.
     """
-    sandbox, baseline = _pytest_project(tmp_path)
-    assert baseline.collected == ["tests/test_calc.py::test_over",
-                                  "tests/test_calc.py::TestErrors::test_none"], baseline.note
-    sandbox.write("pytest.ini", "[pytest]\naddopts = -k 'not over'\n")
-    ticket = Board(tmp_path).add(title="tune the boundary", status="active")
+    with _pytest_project(shared_tmp) as (sandbox, baseline):
+        assert baseline.collected == ["tests/test_calc.py::test_over",
+                                      "tests/test_calc.py::TestErrors::test_none"], baseline.note
+        sandbox.write("pytest.ini", "[pytest]\naddopts = -k 'not over'\n")
+        ticket = Board(shared_tmp).add(title="tune the boundary", status="active")
 
-    gate = tampering_gate(sandbox, ticket, baseline, {}, agents=_tamper_screen(False))
+        gate = tampering_gate(sandbox, ticket, baseline, {}, agents=_tamper_screen(False))
 
-    assert not gate.passed
-    assert "1 fewer test is collected (1, was 2)" in gate.detail
-    assert "tests/test_calc.py::test_over" in gate.detail
-    assert "judged not to weaken" in gate.detail      # the settings edit, excused
+        assert not gate.passed
+        assert "1 fewer test is collected (1, was 2)" in gate.detail
+        assert "tests/test_calc.py::test_over" in gate.detail
+        assert "judged not to weaken" in gate.detail      # the settings edit, excused
 
-    ticket.kind = "refactor"          # a kind that may merge tests may be believed
-    assert tampering_gate(sandbox, ticket, baseline, {},
-                          agents=_tamper_screen(False)).passed
+        ticket.kind = "refactor"          # a kind that may merge tests may be believed
+        assert tampering_gate(sandbox, ticket, baseline, {},
+                              agents=_tamper_screen(False)).passed
 
 
 def test_a_suite_made_green_by_removing_its_check_fails_the_ticket(tmp_path):
@@ -4399,7 +4361,7 @@ def test_evolution_stops_rather_than_evolve_code_it_cannot_see(tmp_path):
 
     assert best.generation == 0 and best.score == 10  # the baseline, kept
     assert not prompts  # and not one proposal asked for against an unseen file
-    with pytest.raises(NoTargetFits):
+    with testkit.raises(NoTargetFits):
         engine.propose(1, "micro", best)
 
 
@@ -4701,7 +4663,7 @@ def test_eval_counts_first_attempt_completions(tmp_path):
                             [{"seconds": 12.0, "chars_out": 100}], 30.0, 100.0)
     assert trial.completed and trial.tickets_completed == 3
     assert trial.tickets_abandoned == 1
-    assert trial.first_pass == pytest.approx(2 / 3)
+    assert trial.first_pass == testkit.approx(2 / 3)
     assert trial.inference_seconds == 12.0 and trial.sandbox_seconds == 30.0
     assert trial.model_calls == 1
 
@@ -4810,7 +4772,7 @@ def test_the_suite_carries_library_tasks_with_held_out_tests():
         assert sum(harness.expected_tests(harness.SUITE_DIR / task.name).values()) >= 20
 
 
-@pytest.mark.parametrize("task", LIBRARIES, ids=lambda t: t.name)
+@testkit.mark.parametrize("task", LIBRARIES, ids=lambda t: t.name)
 def test_a_reference_solution_passes_every_held_out_test(task, tmp_path):
     """The instrument is calibrated: a library that meets the document scores
     full marks, so a lower score is the factory's, never the tests'."""
@@ -4822,7 +4784,7 @@ def test_a_reference_solution_passes_every_held_out_test(task, tmp_path):
     assert held.passed == held.total
 
 
-@pytest.mark.parametrize("task", LIBRARIES, ids=lambda t: t.name)
+@testkit.mark.parametrize("task", LIBRARIES, ids=lambda t: t.name)
 def test_an_empty_workspace_scores_nothing(task, tmp_path):
     """The denominator is the source's, so a library that never imports is
     0 of N rather than 0 of 0."""
@@ -4895,7 +4857,7 @@ def test_expected_tests_refuses_a_parametrize_it_cannot_count(tmp_path):
     (tmp_path / "test_y.py").write_text(
         "import pytest\nCASES = [1]\n"
         "@pytest.mark.parametrize('a', CASES)\ndef test_y(a):\n    pass\n")
-    with pytest.raises(ValueError):
+    with testkit.raises(ValueError):
         harness.expected_tests(tmp_path)
 
 
@@ -4932,13 +4894,17 @@ def _workspace(root: Path) -> dict:
     (root / "widget").mkdir(parents=True)
     (root / "widget" / "__init__.py").write_text("def add(a, b):\n    return a + b\n")
     (root / "tests").mkdir()
+    # unittest rather than pytest: the ladder runs whatever test command the
+    # plan declared, and the interpreter running this suite has no pytest.
     (root / "tests" / "test_widget.py").write_text(
-        "from widget import add\n\n\ndef test_add_sums_its_arguments():\n"
-        "    assert add(1, 1) == 2\n")
+        "import unittest\n\nfrom widget import add\n\n\n"
+        "class AddTest(unittest.TestCase):\n"
+        "    def test_add_sums_its_arguments(self):\n"
+        "        self.assertEqual(add(1, 1), 2)\n")
     (root / "bench.py").write_text("print('SCORE: 0.25')\n")
     return {"setup": "true",
             "build": f"{PROJECT_PYTHON} -c 'import widget'",
-            "test": f"{PROJECT_PYTHON} -m pytest -q tests",
+            "test": f"{PROJECT_PYTHON} -m unittest discover -s tests",
             "benchmark": f"{PROJECT_PYTHON} bench.py"}
 
 
@@ -5108,6 +5074,7 @@ def test_a_change_to_what_judges_it_is_refused_unevaluated():
     assert "judges it" in admissible(["hermes/harness.py"])
     assert "judges it" in admissible(["hermes/suite/tally/test_tally.py"])
     assert "judges it" in admissible(["hermes/improve.py"])
+    assert "judges it" in admissible(["hermes/testkit.py"])   # the runner reads it
     assert "judges it" in admissible(["pyproject.toml"])
     assert admissible(["hermes/planning.py"]) == ""
     assert "no files" in admissible([])
@@ -5622,7 +5589,7 @@ def test_prose_validation_becomes_an_acceptance_criterion():
 
 # -- hpf entry point ---------------------------------------------------------
 
-@pytest.fixture
+@testkit.fixture
 def captured_main(monkeypatch):
     """Record the argv hpf hands to the main CLI instead of running a factory."""
     seen: dict = {}
@@ -7014,7 +6981,7 @@ def test_learning_stays_off_when_the_configuration_says_so(tmp_path):
 
 # -- doctor --probe ------------------------------------------------------------
 
-@pytest.fixture
+@testkit.fixture
 def probed_server():
     """A loopback server whose every answer the test decides.
 

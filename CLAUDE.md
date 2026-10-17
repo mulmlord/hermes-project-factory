@@ -73,6 +73,16 @@ The factory must protect the host machine from generated code.
 
 Generated code must not be able to arbitrarily modify the Hermes installation or host filesystem.
 
+### 2.4 No third-party software
+
+Hermes and vLLM are the only software the factory installs or depends on.
+
+When third-party software would be beneficial, it must not be added. Its function is reverse-engineered — from documentation and observable behaviour, never by copying its code — and implemented natively inside Hermes, under the same gates as any other change.
+
+Docker, git and Python itself remain host prerequisites for now, because removing them without a native replacement would break isolation or version control. They are the first items on the reverse-engineering backlog, to be replaced once the factory has proved itself on real projects, as the first step toward a fully dependency-free factory.
+
+This rule applies to Hermes itself. A generated project's own toolchain is chosen by that project's architect and installed inside that project's sandbox.
+
 ---
 
 # 3. High-Level Architecture
@@ -462,6 +472,8 @@ OpenHands must not introduce a requirement for hosted model APIs.
 Its model configuration must point to locally installed models/inference endpoints.
 
 If OpenHands is unavailable, Hermes must continue using its native agent implementation.
+
+**Status (§2.4):** OpenHands is no longer installed or invoked. The capabilities listed above are to be provided by Hermes' native agent, by reimplementing OpenHands' function rather than integrating it.
 
 ---
 
@@ -1153,6 +1165,8 @@ Do not introduce a dependency solely because an LLM recommends it.
 
 Agents must justify major dependencies.
 
+For Hermes itself the rule is stricter: §2.4 allows no third-party dependency beyond vLLM, and a useful tool's function is reimplemented instead.
+
 ---
 
 # 33. Quality Gates
@@ -1294,7 +1308,7 @@ Feynman research workflow:
 
 ### Phase 7
 
-OpenHands integration:
+OpenHands integration (superseded by §2.4: reimplement its function natively):
 
 - optional OpenHands runner
 - local-model configuration
@@ -1409,3 +1423,18 @@ Repeat
 ```
 
 until the project reaches objectively verifiable completion.
+
+---
+
+# 39. Scheduled Upkeep and Community Improvement
+
+When the factory goes live, its operator chooses how often it looks after itself: weekly, biweekly, monthly, or another interval, or not at all. This is asked once, at setup, never during autonomous work (§2.2).
+
+On that schedule the factory:
+
+1. crawls the web for add-ons — tools whose function would measurably benefit the factory — and records the function to rebuild, never the code (§2.4);
+2. starts a factory optimisation run on itself: self-modifications, including rebuilt add-on functions, judged by the Hermes test suite and by a measured before/after evaluation on the operator's hardware (§35).
+
+When a run on a user's clone finds a general improvement — one that holds on the whole evaluation suite — the factory automatically opens a pull request upstream, and that pull request adds the user to the list of improvers, because they contributed their hardware to the project.
+
+Contribution is opt-in at setup, uses the operator's own credentials, and never sends the operator's unpushed work. Upstream maintainers review every such pull request; nothing merges itself.

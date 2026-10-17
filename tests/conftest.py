@@ -4,7 +4,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-import pytest
+from hermes import testkit
 
 
 def needs_docker(reason: str) -> None:
@@ -17,11 +17,11 @@ def needs_docker(reason: str) -> None:
     failure and the run has to say the daemon went away.
     """
     if os.environ.get("HERMES_REQUIRE_DOCKER"):
-        pytest.fail(f"HERMES_REQUIRE_DOCKER is set but {reason}")
-    pytest.skip(reason)
+        testkit.fail(f"HERMES_REQUIRE_DOCKER is set but {reason}")
+    testkit.skip(reason)
 
 
-@pytest.fixture
+@testkit.fixture
 def shared_tmp():
     """A temp dir the docker engine can actually bind-mount.
 
@@ -36,7 +36,7 @@ def shared_tmp():
         shutil.rmtree(path, ignore_errors=True)
 
 
-@pytest.fixture(autouse=True, scope="session")
+@testkit.fixture(autouse=True, scope="session")
 def _ledger_elsewhere():
     """Keep the suite out of the developer's own ledger.
 

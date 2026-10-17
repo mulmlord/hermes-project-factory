@@ -16,7 +16,7 @@ from __future__ import annotations
 from . import prompts, tamper, workspace
 from .evolve import Evolution, objective_from_spec
 from .experiment import run_ticket as run_experiment_ticket
-from .implement import Change, execute_ticket
+from .implement import execute_ticket
 from .log import scope
 from .planning import _ingest, architect, generate_tickets, intake as specify
 from .research import investigate, topics_for
@@ -174,8 +174,6 @@ def implementation(factory) -> None:
             # An experiment is not implemented and reviewed, it is run and
             # measured, so it takes its own path to the same verdict shape.
             outcome = _run_experiment(factory, ticket)
-        elif factory.openhands.should_handle(ticket) and _run_openhands(factory, ticket):
-            return
         else:
             tampering = factory.config.get("verification.tampering") or {}
             outcome = execute_ticket(
@@ -237,45 +235,6 @@ def _run_experiment(factory, ticket) -> dict:
     factory.log.info("ticket.experiment", experiment=record.id,
                      verdict=record.verdict, measured=len(record.measurements))
     return outcome
-
-
-def _run_openhands(factory, ticket) -> bool:
-    factory.board.move(ticket.id, "active", "delegated to OpenHands")
-    factory.board.save()
-    # Taken before the agent runs: it holds a shell over the workspace for the
-    # whole ticket, which is more room to edit a test than the native
-    # implementer ever has.
-    tampering = factory.config.get("verification.tampering") or {}
-    baseline = factory.tests_baseline() if tampering.get("enabled", True) else None
-    result = factory.openhands.run_ticket(factory.root, ticket, factory.context())
-    if not result["ok"]:
-        factory.board.move(ticket.id, "ready", "OpenHands failed; native agent will retry")
-        factory.board.save()
-        return False
-    from .verify import verify_ticket
-    verification = verify_ticket(factory.sandbox, ticket, factory.state.plan, [],
-                                 factory.log, classifier=factory.classifier,
-                                 agents=factory.agents, baseline=baseline,
-                                 tampering=tampering)
-    if verification.passed:
-        factory.board.move(ticket.id, "completed", "OpenHands + gates passed")
-        sha = factory.commit(f"{_commit_kind(ticket.kind)}: {ticket.title}\n\n"
-                             f"Ticket {ticket.id}, implemented via OpenHands.",
-                             kind=_commit_kind(ticket.kind))
-        tamper.forget(factory.root)
-        # OpenHands edits the workspace itself, so the commit is the only
-        # record of which files it actually touched.
-        factory.journal.record(
-            ticket,
-            {"status": "completed", "verification": verification,
-             "change": Change(summary="implemented by the OpenHands agent",
-                              written=factory.repo.files_in())},
-            commit=sha or "")
-        factory.save(f"ticket-{ticket.id}")
-        return True
-    factory.board.move(ticket.id, "ready", "OpenHands output failed gates")
-    factory.board.save()
-    return False
 
 
 def validation(factory) -> None:

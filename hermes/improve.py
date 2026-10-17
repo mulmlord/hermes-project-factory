@@ -21,30 +21,42 @@ into the worktree before the suite runs, so the tests that pass judgement are
 always ours. Without that rule the cheapest way to pass is to delete the
 tests, and a loop that can do that will eventually do it.
 
+*A change that installs something is not an improvement either.* The factory
+reimplements the function of third-party software instead of depending on it,
+so a candidate that imports a module outside the standard library, names a
+hosted model API, or matches the security scan's patterns is refused by
+:func:`policy` before a single test runs. A scheduled run feeds the proposer
+descriptions scraped off the web, which makes this the gate that a page
+written to steer the model has to get past first.
+
 *An unmeasured change is not an improvement.* Section 35 permits promotion
 only on demonstrated benefit, so the benefit gate refuses by default and must
 be shown a before/after evaluation to open. A host with no local model cannot
 produce one, and on such a host nothing is promotable -- which is the correct
 outcome, not a limitation to work around.
 
-Promotion is operator-invoked (``hermes improve``) and never runs inside the
-autonomous project loop: a factory building someone's project has no business
-rewriting itself halfway through.
+Promotion is operator-invoked (``hermes improve``) or scheduled by the
+operator (:mod:`hermes.upkeep`), and never runs inside the autonomous project
+loop: a factory building someone's project has no business rewriting itself
+halfway through.
 """
 from __future__ import annotations
 
+import ast
 import json
+import re
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .agents import Prompt
 from .log import Logger, NULL
 from .schema import STRING, arr, obj
-from .verify import Gate
+from .verify import UNSAFE_PATTERNS, Gate
 
 #: The shape of a self-modification proposal. It stays here with the prompt
 #: that asks for it, on the protected side of the line this module draws:
@@ -62,7 +74,11 @@ PROPOSAL = obj(
 #: the repository root.
 PROTECTED = (
     "tests",              # the suite that says pass or fail
+    "hermes/testkit.py",  # the runner that reads it, and the held-out tests
     "hermes/improve.py",  # this gate
+    "hermes/upkeep.py",   # what decides a change is general and contributes it
+    "hermes/github.py",   # what holds the operator's token
+    "hermes/sandbox.py",  # the boundary around code nobody has read
     "hermes/harness.py",  # the measurement the benefit gate reads
     "hermes/suite",       # the held-out tests that measurement runs
     "conftest.py",
@@ -115,6 +131,94 @@ def admissible(paths) -> str:
     if outside:
         return "changes files outside the hermes package: " + ", ".join(outside)
     return ""
+
+
+#: Hosted inference APIs. Section 2.1 forbids every one of them, and a
+#: self-modification is the one author in a position to add a call to one.
+HOSTED = re.compile(
+    r"api\.openai\.com|api\.anthropic\.com|generativelanguage\.googleapis\.com"
+    r"|openrouter\.ai|api\.mistral\.ai|api\.cohere\.(?:ai|com)|api\.groq\.com"
+    r"|api\.together\.(?:ai|xyz)|api\.deepseek\.com|api-inference\.huggingface\.co")
+
+
+#: Every module a Hermes file may import: the standard library and Hermes.
+OWN = frozenset(sys.stdlib_module_names) | {"hermes", "__future__"}
+
+
+def third_party(source: str) -> list[str]:
+    """Modules *source* imports that are neither the standard library nor Hermes."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []                    # the suite will say what is wrong with it
+    found = set()
+    for node in ast.walk(tree):
+        names = []
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names = [node.module]
+        for name in names:
+            top = name.split(".")[0]
+            if top not in OWN:
+                found.add(top)
+    return sorted(found)
+
+
+def added_lines(worktree: Path, base: str, files: list[str]) -> dict[str, str]:
+    """What a candidate wrote that *base* did not have, per file.
+
+    Only these lines are the candidate's. The rest of a file is code the
+    project already accepted -- including, in hermes/verify.py, the very
+    patterns being searched for -- and refusing a candidate for it would
+    refuse every change to that file.
+    """
+    out: dict[str, str] = {}
+    for relative in files:
+        if not _tracked(worktree, base, relative):
+            try:                     # a new file: every line of it is the candidate's
+                out[relative] = (Path(worktree) / relative).read_text(errors="replace")
+            except OSError:
+                out[relative] = ""
+            continue
+        proc = subprocess.run(["git", "diff", "--no-color", "-U0", base, "--", relative],
+                              cwd=worktree, capture_output=True, text=True)
+        out[relative] = "\n".join(line[1:] for line in proc.stdout.splitlines()
+                                   if line.startswith("+") and not line.startswith("+++"))
+    return out
+
+
+def _tracked(worktree: Path, base: str, relative: str) -> bool:
+    return subprocess.run(["git", "cat-file", "-e", f"{base}:{relative}"], cwd=worktree,
+                          capture_output=True).returncode == 0
+
+
+def policy(worktree: Path, files: list[str], base: str = "HEAD") -> Gate:
+    """The rules a self-modification is held to before it is run at all.
+
+    Read from the written files rather than asked of the model, because the
+    model is the author being checked.
+    """
+    problems = []
+    added = added_lines(worktree, base, files)
+    for relative in files:
+        path = Path(worktree) / relative
+        if path.suffix == ".py":
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                text = ""
+            for module in third_party(text):
+                problems.append(f"{relative} imports {module}: reimplement its "
+                                "function instead of depending on it")
+        new = added.get(relative, "")
+        for match in HOSTED.finditer(new):
+            problems.append(f"{relative} names a hosted model API ({match.group(0)})")
+        for pattern, description in UNSAFE_PATTERNS:
+            if re.search(pattern, new):
+                problems.append(f"{relative}: {description}")
+    return Gate("policy", not problems, "; ".join(problems)[:600] or
+                "standard library only, no hosted API, no unsafe pattern")
 
 
 def measured_gain(before: Path, after: Path) -> tuple[bool, str]:
@@ -203,13 +307,21 @@ class Improvement:
     """Propose, evaluate and promote a change to Hermes itself."""
 
     def __init__(self, root: Path, agents: dict | None = None, log: Logger = NULL,
-                 python: str | None = None, timeout: int = 1800):
+                 python: str | None = None, timeout: int = 1800, *,
+                 base: str = "HEAD", base_tree: Path | None = None):
         self.root = Path(root).resolve()
         self.agents = agents or {}
         self.log = log
         self.python = python or sys.executable
         self.timeout = timeout
         self.scratch = self.root / ".hermes-improve"
+        #: The commit a candidate branches from, and a checkout of it. The
+        #: live tree by default; a scheduled run that means to contribute
+        #: upstream branches from upstream's tip instead, so that what it
+        #: measures and what it offers are a change to the same code, and
+        #: the operator's own checkout is never touched.
+        self.base = base
+        self.base_tree = Path(base_tree).resolve() if base_tree else self.root
 
     # -- git ---------------------------------------------------------------
     def _git(self, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -225,7 +337,7 @@ class Improvement:
         self.scratch.mkdir(parents=True, exist_ok=True)
         path = self.scratch / branch.replace("/", "-")
         self.discard(branch)
-        proc = self._git("worktree", "add", "-q", "-b", branch, str(path), "HEAD")
+        proc = self._git("worktree", "add", "-q", "-b", branch, str(path), self.base)
         if proc.returncode != 0:
             raise RuntimeError(f"git worktree: {proc.stderr.strip()[:300]}")
         return path
@@ -276,7 +388,7 @@ class Improvement:
         for relative in PROTECTED:
             if relative in (".git", ".github"):
                 continue
-            source = self.root / relative
+            source = self.base_tree / relative
             target = worktree / relative
             if source.is_dir():
                 shutil.rmtree(target, ignore_errors=True)
@@ -294,8 +406,7 @@ class Improvement:
             return Gate("imports-candidate", False,
                         f"the suite would test {resolved} instead of the "
                         "candidate, so its result would be meaningless")
-        proc = self._run([self.python, "-m", "pytest", "-q", "-p",
-                          "no:cacheprovider"], worktree)
+        proc = self._run([self.python, "-m", "hermes.testkit", "-q"], worktree)
         if proc is None:
             return Gate("suite", False, f"timed out after {self.timeout}s")
         detail = (proc.stdout or proc.stderr).strip().splitlines()
@@ -340,11 +451,20 @@ class Improvement:
 
     # -- the loop ----------------------------------------------------------
     def attempt(self, target: str, proposal: dict | None = None,
-                before: Path | None = None, after: Path | None = None) -> Attempt:
-        """Build a candidate for *target* and judge it. Promotes nothing."""
+                before: Path | None = None, after: Path | None = None, *,
+                measure: Callable[[Path], Path | None] | None = None,
+                brief: str = "") -> Attempt:
+        """Build a candidate for *target* and judge it. Promotes nothing.
+
+        *measure*, given the candidate's worktree, evaluates it and returns
+        the results file to hand the benefit gate as *after*. It is called
+        only once the candidate has passed the policy and the suite, because
+        an evaluation is hours of a GPU and a failing candidate is not worth
+        any of them.
+        """
         if target not in TARGETS:
             return Attempt(target=target, refusal=f"unknown target {target!r}")
-        proposal = proposal if proposal is not None else self.propose(target)
+        proposal = proposal if proposal is not None else self.propose(target, brief)
         record = Attempt(target=target,
                          rationale=str(proposal.get("rationale", ""))[:500])
 
@@ -375,7 +495,14 @@ class Improvement:
                 record.branch = ""
                 return record
             self.restore_trusted(worktree)
-            record.gates = [self.suite(worktree), self.benefit(before, after)]
+            ruled = policy(worktree, record.files, self.base)
+            if not ruled.passed:
+                record.gates = [ruled]
+            else:
+                suite = self.suite(worktree)
+                if suite.passed and after is None and measure is not None:
+                    after = measure(worktree)
+                record.gates = [ruled, suite, self.benefit(before, after)]
             if record.passed:
                 self._git("add", "-A", cwd=worktree)
                 self._git("commit", "-q", "-m",
@@ -387,18 +514,29 @@ class Improvement:
                       files=len(record.files))
         return record
 
-    def propose(self, target: str) -> dict:
-        """Ask the implementer for a change to one of Hermes' own components."""
+    def propose(self, target: str, brief: str = "") -> dict:
+        """Ask the implementer for a change to one of Hermes' own components.
+
+        *brief* replaces the open question with a specific one: a function to
+        rebuild inside the component, described in words. It is the only form
+        in which anything found on the web reaches this prompt.
+        """
         agent = self.agents.get("implementer")
         if agent is None:
             return {}
         prompt = Prompt(agent, log=self.log)
+        ask = (f"Add this capability to it: {brief}\n\n" if brief else
+               "Propose one concrete, self-contained improvement. ")
         prompt.add("task",
                    f"You are improving Hermes itself: the {target} component.\n\n"
-                   "Propose one concrete, self-contained improvement. It must keep "
-                   "every existing test passing, change only the files shown, and be "
-                   "justified by something measurable -- fewer model calls, a higher "
-                   "first-attempt gate pass rate, less wall clock. Do not change "
+                   + ask +
+                   "It must keep every existing test passing, change only the files "
+                   "shown, and be justified by something measurable -- fewer model "
+                   "calls, a higher first-attempt gate pass rate, less wall clock. "
+                   "Use the Python standard library only: Hermes never installs "
+                   "third-party software, it rebuilds the function it needs, and a "
+                   "change that imports anything else is refused unevaluated. Write "
+                   "your own code; never reproduce another project's. Do not change "
                    "tests, the evaluation harness, or packaging: those judge your "
                    "change and are rejected on sight.\n\n"
                    "Return JSON: {\"rationale\": str, \"files\": [{\"path\": str, "
@@ -409,8 +547,8 @@ class Improvement:
         # one taking the budget and the rest arriving as stubs.
         share = sources.room() // max(1, len(TARGETS[target]))
         sources.fill("\n\n".join(
-            f"--- {relative} ---\n{(self.root / relative).read_text()[:share]}"
-            for relative in TARGETS[target] if (self.root / relative).is_file()))
+            f"--- {relative} ---\n{(self.base_tree / relative).read_text()[:share]}"
+            for relative in TARGETS[target] if (self.base_tree / relative).is_file()))
         answer = agent.ask_json(prompt.render(), schema=PROPOSAL)
         return answer if isinstance(answer, dict) else {}
 

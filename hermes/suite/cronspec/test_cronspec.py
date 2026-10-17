@@ -3,7 +3,7 @@ import subprocess
 import sys
 from datetime import datetime
 
-import pytest
+import testkit
 
 import cronspec
 from cronspec import Cron, CronError, parse
@@ -65,7 +65,7 @@ def test_cron_error_is_a_value_error():
     assert cronspec.CronError is CronError
 
 
-@pytest.mark.parametrize("expression, field", [
+@testkit.mark.parametrize("expression, field", [
     ("60 * * * *", "minute"),
     ("* 24 * * *", "hour"),
     ("* * 0 * *", "day of month"),
@@ -77,14 +77,14 @@ def test_cron_error_is_a_value_error():
     ("* * 1,,2 * *", "day of month"),
 ])
 def test_malformed_fields_are_named(expression, field):
-    with pytest.raises(CronError) as caught:
+    with testkit.raises(CronError) as caught:
         parse(expression)
     assert field in str(caught.value)
 
 
-@pytest.mark.parametrize("expression", ["* * * *", "* * * * * *", "", "@often"])
+@testkit.mark.parametrize("expression", ["* * * *", "* * * * * *", "", "@often"])
 def test_malformed_expressions(expression):
-    with pytest.raises(CronError):
+    with testkit.raises(CronError):
         parse(expression)
 
 
@@ -140,7 +140,7 @@ def test_upcoming_in_order():
 
 
 def test_impossible_schedule_raises():
-    with pytest.raises(CronError):
+    with testkit.raises(CronError):
         parse("0 0 30 2 *").next(datetime(2026, 1, 1))
 
 

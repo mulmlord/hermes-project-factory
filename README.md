@@ -8,6 +8,14 @@ Every model call goes to a model already installed on your machine. There is
 no path to a hosted API anywhere in the codebase, and a non-local endpoint is
 rejected at configuration time.
 
+Hermes and the vLLM model server are the only software it installs. Hermes
+has no dependencies: where it once installed a tool, it now carries its own
+copy of that tool's function — see [Dependencies](#dependencies). On a
+schedule you choose, it also looks after itself: it scouts the web for tools
+worth rebuilding, runs a self-optimisation round on your hardware, and offers
+what it finds upstream as a pull request that credits you — see
+[Upkeep](#upkeep).
+
 ```console
 $ ./install.sh && ./start.sh
 $ mkdir -p ~/projects/json-diff && cd ~/projects/json-diff
@@ -164,22 +172,68 @@ text box a human can steer it from.
   and has no CPU offload, so an 8 GiB card means a 7B 4-bit model, not a 30B
   one. The default is a 7B AWQ coder at roughly 5 GiB.
 - Docker, strongly recommended. Without it Hermes falls back to local
-  subprocess execution, which is a much weaker isolation guarantee.
+  subprocess execution, which is a much weaker isolation guarantee. Docker is
+  third-party software the factory still relies on, for now: see
+  [Dependencies](#dependencies).
 - A project directory the Docker engine can actually bind-mount. Under Docker
   Desktop on WSL a path such as `/tmp/project` mounts as an empty directory,
   because that path also exists inside the engine's own VM. Hermes checks this
   at startup and refuses to run blind, falling back to local execution with a
   warning; keep projects under your home directory to avoid it.
-- `git`, and `gh` if you want GitHub publishing
-- Optionally the OpenHands agent layer. Its CLI pins CPython 3.12, so
-  `install.sh` gives it an environment of its own rather than sharing Hermes';
-  `uv` provisions that interpreter for you if you have it.
-- `uv` is also how vLLM gets a supported interpreter, since it has no wheels
-  for the newest CPython releases yet.
+- `git`
+- A GitHub token, only if you want GitHub publishing or want your upkeep runs
+  to contribute upstream (see [Upkeep](#upkeep)). Hermes speaks GitHub's REST
+  API itself; the `gh` CLI is not needed.
+- For vLLM, a CPython it publishes wheels for. `install.sh` prefers
+  `python3.12`, then older releases, because vLLM trails the newest CPython by
+  a release or two.
 
-Hermes itself needs one third-party package: PyYAML. vLLM and OpenHands each
-get an environment of their own, so neither drags torch nor a hosted-provider
-SDK into the factory's virtualenv.
+Hermes itself needs no third-party package at all, and installing it
+downloads nothing. vLLM gets an environment of its own, so torch and the CUDA
+runtime stay out of the factory's virtualenv.
+
+## Dependencies
+
+Hermes installs two pieces of software: itself and vLLM. Everything else it
+once installed, it now does itself.
+
+| It used | It now has | What was copied |
+|---|---|---|
+| PyYAML | `hermes/yamlite.py` | the YAML its configs use, with PyYAML's YAML 1.1 scalar rules, so an existing config reads exactly as it did |
+| pytest | `hermes/testkit.py` | collection, fixtures and their scopes, `tmp_path`, `monkeypatch`, `capsys`, `raises`, `parametrize`, skip/xfail, `approx`, exit codes, JUnit XML |
+| setuptools | `build_backend/hermes_backend.py` | PEP 517 wheels and sdists, PEP 660 editable installs |
+| the `gh` CLI | `hermes/github.py` | repositories, forks, issues, pull requests, releases, and pushes that keep the token off the command line |
+| `hf download` | `hermes/weights.py` | listing a repository, resumable downloads, SHA-256 checks |
+| uv | nothing | `install.sh` picks a system interpreter for vLLM |
+| OpenHands | nothing yet | Hermes' own implementer takes every ticket |
+| a classifier SDK and torch | nothing yet | the security gate keeps its patterns; the classifier endpoint is a contract anything local can answer |
+
+The rule from here on is that third-party software which would help is not
+added. Its function is reverse-engineered, from its documentation and its
+observable behaviour and never from its code, and implemented inside Hermes
+under the same gates as any other change. [Upkeep](#upkeep) is how the factory
+goes looking for such tools by itself. The rule and the backlog of what is
+still to be rebuilt are tracked in [issue #63](https://github.com/mulmlord/hermes-project-factory/issues/63).
+
+Some third-party software is kept for now, because removing it without a
+replacement would break the factory rather than free it:
+
+- **vLLM**, the model server. Hermes speaks its OpenAI-compatible HTTP API,
+  so any local server that speaks it too is a drop-in, but an inference engine
+  is a project of its own.
+- **Docker**, the sandbox. A native one needs unprivileged user namespaces,
+  which stock Ubuntu 24.04 blocks with AppArmor, and running generated code
+  without isolation is not an option.
+- **git**, for commits, rollback and the self-improvement worktrees.
+- Python and its standard library, and the two official GitHub Actions the CI
+  workflow uses to check out the code and pick an interpreter.
+
+Once the factory has proved itself on real projects, these are the next
+candidates for a fully dependency-free factory.
+
+Generated projects are a different matter. A project's architect still picks
+that project's toolchain — pytest, for most Python projects — and it is
+installed inside that project's sandbox, never into Hermes.
 
 ## Install
 
@@ -192,18 +246,22 @@ $ ./install.sh
 $ ./start.sh
 ```
 
-`install.sh` builds a virtualenv for the factory, installs it, links `hpf` and
-`hermes` into `~/.local/bin`, pre-pulls the sandbox image, and builds the
-neighbouring environments for vLLM and the optional OpenHands agent layer. It
-asks nothing, starts nothing, downloads no weights and writes no config, so it
-is safe to run unattended.
+`install.sh` builds a virtualenv for the factory, installs it offline (`pip
+install --no-index`: there is nothing to fetch, not even a build backend — the
+one that packages Hermes lives in `build_backend/`), links `hpf` and `hermes`
+into `~/.local/bin`, pre-pulls the sandbox image, and builds the neighbouring
+environment for vLLM. It asks nothing, starts nothing, downloads no weights and
+writes no config, so it is safe to run unattended.
 
 `start.sh` is where the decisions are. It asks which model to serve — a
 Hugging Face repository to download and where to keep the weights, or a
 directory of weights you already have — on which port, with how much context
 and how much of the VRAM, writes those answers into your config, writes the
 `hermes-vllm.service` unit that serves them, starts it and finishes by running
-`hermes doctor`. Every question is pre-filled with what your config says now,
+`hermes doctor`. It is also where the factory goes live, so it asks the one
+question about the factory itself: how often it should look after itself, and
+whether improvements your hardware finds may go upstream (see
+[Upkeep](#upkeep)). Every question is pre-filled with what your config says now,
 so running it again edits your setup instead of starting over.
 
 ```console
@@ -229,8 +287,8 @@ over-large `context` is the usual reason a server installs cleanly and then
 fails on the first long prompt.
 
 The slow steps report progress. Where the underlying tool already prints real
-byte counts — `uv` and `hf download`, which together account for most of the
-wait — that output is left to speak for itself; the silent steps get a
+byte counts — pip installing vLLM, and Hermes' own weights downloader, which
+together account for most of the wait — that output is left to speak for itself; the silent steps get a
 spinner with elapsed time, and the wait for vLLM to load the weights gets a
 bar against its timeout. Piped to a file it degrades to one line per step
 instead of a megabyte of carriage returns.
@@ -240,13 +298,10 @@ Hermes itself rather than a package.
 
 | `install.sh` | Effect |
 |---|---|
-| `--dev` | also install the test dependencies |
 | `--system` | link into `/usr/local/bin` instead of `~/.local/bin` |
 | `--bin DIR`, `--venv DIR` | choose where the commands and the virtualenv go |
 | `--no-docker-image` | skip pre-pulling the sandbox image |
-| `--no-openhands` | skip the optional OpenHands agent layer |
 | `--no-vllm` | skip the vLLM environment; you serve models yourself |
-| `--classifier` | also install the security-gate classifier (torch) |
 
 | `start.sh` | Effect |
 |---|---|
@@ -258,7 +313,8 @@ Hermes itself rather than a package.
 | `--port N` | port vLLM listens on (default `6767`) |
 | `--context N` | context served, and the config's `context` (default `16384`) |
 | `--gpu-util F` | fraction of VRAM vLLM may use (default `0.90`) |
-| `--classifier`, `--no-classifier` | also run the security-gate classifier |
+| `--upkeep WHEN` | how often the factory looks after itself: `weekly`, `biweekly`, `monthly`, `<n>d` or `off` |
+| `--contribute`, `--no-contribute` | whether a general improvement goes upstream as a pull request |
 | `--boot` | also run the server at boot, not just during a run |
 | `--no-wait` | do not wait for the weights to finish loading |
 | `--stop` | stop the server instead of starting it |
@@ -337,6 +393,15 @@ user unit.
 A user unit, not a system one, so nothing runs as root and the weights stay
 readable by you alone.
 
+The weights are downloaded by Hermes itself, `python -m hermes.weights REPO
+DIR`, rather than by a Hugging Face client installed beside vLLM. It lists the
+repository through the Hub's public API, resumes an interrupted file from
+where it stopped, checks every LFS file against the SHA-256 the Hub publishes
+for it, refuses a listed path that would land outside the target directory,
+and sends `HF_TOKEN` (needed only for a gated repository) to the Hub and never
+to the storage host a download redirects to. `HF_ENDPOINT` points it at a
+mirror.
+
 Serving is offline: the unit sets `HF_HUB_OFFLINE=1` and points vLLM at a
 directory on disk, so the server never reaches the network once the weights
 are downloaded. The name vLLM answers to is the weights directory's name, and
@@ -393,9 +458,11 @@ whenever it has waited for the server to come up.
 $ ./uninstall.sh
 ```
 
-It stops and removes the `hermes-vllm.service` unit, the virtualenvs for the
-factory, vLLM and OpenHands, the `hpf` and `hermes` links, and the
-editable-install leftovers in this repository. It keeps the sandbox image,
+It stops and removes the `hermes-vllm.service` unit and the upkeep timer, the
+virtualenvs for the factory and vLLM, the `hpf` and `hermes` links, and the
+editable-install leftovers in this repository. The OpenHands and classifier
+environments an earlier `install.sh` may have built are removed too, since
+the factory no longer uses either. It keeps the sandbox image,
 because `python:3.11-slim` is a stock image other containers may share, and it
 keeps the downloaded weights, because those are gigabytes you would have to
 fetch again. A link on your PATH that points
@@ -414,11 +481,10 @@ than a local vLLM is left untouched.
 
 | Flag | Effect |
 |---|---|
-| `--config` | delete `~/.config/hermes/config.yaml` instead of retiring the endpoint in it |
+| `--config` | delete `~/.config/hermes/config.yaml` instead of retiring the endpoint in it, and the ledger and upkeep history with it |
 | `--docker-image` | also delete the pre-pulled sandbox image |
 | `--models` | also delete the downloaded model weights |
 | `--all` | `--config` and `--docker-image`, but not `--models` |
-| `--keep-openhands` | leave the OpenHands agent layer installed |
 | `--keep-server` | leave the vLLM unit and environment installed |
 | `--system`, `--bin DIR`, `--venv DIR` | mirror the install flags |
 | `--dry-run` | report what would be removed, remove nothing |
@@ -663,13 +729,15 @@ security:
     block: false         # let a finding fail the gate, not merely warn
 ```
 
-`contrib/laya_server.py` is a reference adapter serving that endpoint over
-[Laya](https://huggingface.co/convaiinnovations/laya). It is a separate
-process on purpose: the classifier wants torch and Hermes wants no
-dependency beyond PyYAML. Note that an un-tuned checkpoint scores near chance
-on a task it was not trained for — this is worth turning on once you have
-fine-tuned one on labelled vulnerability data and measured its false positive
-rate against your own code, and `block` is worth setting only after that.
+Hermes ships no server for that endpoint. It used to ship an adapter over a
+third-party classifier SDK, which brought torch with it; under the
+[dependency rule](#dependencies) that adapter is gone, and a native classifier
+is on the reverse-engineering backlog. The wire contract is documented in
+`hermes/classify.py`, and anything local that answers it can be pointed at.
+Note that an un-tuned checkpoint scores near chance on a task it was not
+trained for — this is worth turning on once you have fine-tuned one on
+labelled vulnerability data and measured its false positive rate against your
+own code, and `block` is worth setting only after that.
 
 ## Commands
 
@@ -691,6 +759,9 @@ rate against your own code, and `block` is worth setting only after that.
 | `hermes evolve -g 30` | run evolutionary optimisation |
 | `hermes eval` | build a fixed suite of ideas and report what the factory cost |
 | `hermes improve --target planner` | improve Hermes itself, under gates |
+| `hermes upkeep` | scout for add-ons and run a self-optimisation round, if the schedule says one is due |
+| `hermes upkeep --schedule weekly` | set how often (`--contribute` to offer improvements upstream) |
+| `hermes upkeep --status` | the schedule, the last run, add-ons found and pull requests opened |
 | `hermes release --github` | clean-room validate, tag, and publish |
 | `hermes checkpoint` | list, create or restore a checkpoint |
 | `hermes doctor` | verify models, sandbox and tooling |
@@ -770,9 +841,15 @@ rather than declaring success.
 ## Development
 
 ```console
-$ ./install.sh --dev
-$ .venv/bin/pytest -q
+$ python3 -m hermes.testkit -q
 ```
+
+The suite runs under `hermes/testkit.py`, Hermes' own test runner: fixtures,
+`tmp_path`, `monkeypatch`, `capsys`, `raises`, `parametrize`, skip and xfail,
+pytest's exit codes and a JUnit report, from the standard library. Nothing has
+to be installed first, not even Hermes, and a bare `assert` that fails prints
+the values it compared. `-k`, `-x`, `-v`, `-rs` and `--junitxml` work as they
+do in pytest.
 
 The suite includes an end-to-end run of the entire state machine against a
 stub model, so the loop's ability to reach `COMPLETED` unaided is checked on
@@ -799,9 +876,11 @@ document that pins the package, its modules and its public API, the workspace
 starts empty, and the result is scored by tests the factory never sees. Those
 live in `hermes/suite/`. When the run ends, however it ends, the committed
 tree is exported to a fresh sandbox, the held-out tests are dropped beside
-it, and pytest runs with the project's `conftest.py` files, pytest
-configuration and plugins all ignored, because those are the ways a project
-can change what a run reports without changing what its code does. The score
+it with Hermes' own test runner, and the runner loads none of the project's
+`conftest.py` files and reads no settings file of any kind, because those are
+the ways a project can change what a run reports without changing what its
+code does. Nothing is installed into the sandbox to score it, so scoring needs
+no network. The score
 is tests passed out of tests declared in the source. A library that fails to
 import is 0 of 35, not 0 of 0. A reference solution for each task, under
 `tests/reference/`, scores full marks on every commit, so a lower score
@@ -871,10 +950,16 @@ enforced here rather than asked for in a prompt:
 - The candidate is built as a git worktree on its own branch. The checkout
   Hermes is running from is never switched, so a candidate cannot rewrite the
   source of the process that is evaluating it.
-- A change touching the test suite, the evaluation harness or the promotion
-  gate itself is refused before it is evaluated, and the trusted copies are
+- A change touching the test suite, the test runner, the evaluation harness,
+  the promotion gate, upkeep, the GitHub client that holds your token or the
+  sandbox is refused before it is evaluated, and the trusted copies are
   restored into the worktree before the suite runs. The cheapest way to pass
   a suite is to delete it, and a loop able to do that eventually will.
+- A change that imports anything outside the standard library, names a hosted
+  model API, or adds a line the security scan's patterns match is refused by
+  the `policy` gate before a single test runs. The factory rebuilds the
+  function of third-party software instead of depending on it, and this is
+  where that rule is enforced on the factory itself.
 - Promotion needs the Hermes suite to pass *and* a measured benefit — `hermes
   eval` on each side, handed over as `--before` and `--after`. Without that
   evidence the gate refuses, so on a machine with no local model nothing is
@@ -887,7 +972,78 @@ Benchmark infrastructure is deliberately absent from the target list: it
 lives in the harness, which is protected, so the factory cannot rewrite the
 instrument it is judged by. None of this runs inside the autonomous project
 loop — a factory building someone's project has no business rewriting itself
-halfway through.
+halfway through. It runs when you invoke it, or on the schedule you gave
+[upkeep](#upkeep).
+
+## Upkeep
+
+When the factory goes live, you decide how often it looks after itself.
+`start.sh` asks; `hermes upkeep --schedule` changes it later.
+
+```console
+$ hermes upkeep --schedule weekly      # or biweekly, monthly, 10d, off
+$ hermes upkeep --contribute           # offer general improvements upstream
+$ hermes upkeep --status
+```
+
+A systemd user timer, `hermes-upkeep.timer`, wakes once a day and `hermes
+upkeep` decides from the schedule whether a run is due, so changing the
+schedule never rewrites a unit, and `Persistent=true` catches up on a day the
+machine was off. As a user unit it runs while you are logged in. For a
+machine you leave logged out, enable lingering, which `./start.sh --boot` does.
+Without systemd, `hermes upkeep` from a daily cron entry does the same.
+
+Each run does three things, unattended:
+
+1. **Scout.** It searches public GitHub repositories for tools that do what a
+   factory component does (`upkeep.queries`; the defaults are in
+   `hermes/upkeep.py`), keeping projects pushed to in the last year, not
+   archived, most-starred first. Their names, descriptions, licences and star
+   counts go to the research model, fenced as untrusted data. For each one the
+   model says which single function would be worth having, in its own words,
+   for which component, with the gain it expects and how a test would tell. A
+   tool whose function would measurably help becomes an *add-on*. Nothing is
+   installed or cloned, and nothing beyond the description is read.
+2. **Optimise.** It makes `upkeep.attempts` self-modifications: waiting add-ons
+   first, then each component in turn. An add-on attempt asks the implementer
+   to rebuild that function inside its component, from the model's
+   description alone, with the standard library. Every attempt goes through
+   the gates in [Improving the factory](#improving-the-factory) and is
+   measured with `hermes eval` before and after, on your GPU. The baseline is
+   reused for as long as the code and the configured models are unchanged.
+3. **Contribute.** A change that passes every gate on the *whole* evaluation
+   suite is a general improvement: a change to Hermes' code, measured on the
+   shared suite, rather than a setting tuned to one machine. With
+   `upkeep.contribute: true`, Hermes opens a pull request for it upstream
+   under your GitHub account, and the same pull request adds you to
+   [`IMPROVERS.md`](IMPROVERS.md), the list of people whose hardware found an
+   improvement. Maintainers review it like any other change, and nothing
+   merges itself.
+
+When contributing, candidates are built on upstream's tip, fetched into
+`refs/hermes/upstream` and checked out beside your tree, so the change offered
+is a change to upstream's code, measured on it. Your own checkout is never
+touched, and commits you have not pushed never travel with it. The pull
+request describes the machine by GPU model and memory, core count, RAM and the
+model served, and never by hostname, user name or path. Without
+`contribute`, candidates are built on your checkout. A passing one is merged
+into it when `upkeep.promote` is true (with the suite run again afterwards);
+otherwise its branch is kept for you to look at. A gain measured on a subset of
+the suite (`upkeep.tasks`) is never treated as general.
+
+Contributing needs a token that can fork and open pull requests — a classic
+token with the `public_repo` scope — in `~/.config/hermes/github-token`
+(`chmod 600`), or `github.token_file`, or `HERMES_GITHUB_TOKEN`. A systemd unit
+sees none of your shell's environment, so the file is what a scheduled run
+finds. The token never reaches code a candidate wrote: every suite run and
+every evaluation gets an environment it has been sieved out of, and the token
+reaches `git` only through its environment, never its command line.
+
+A run that cannot reach its model records nothing, so the next day's timer
+tries again rather than waiting out the whole interval. Runs never overlap.
+What upkeep remembers — when it ran, the add-ons it found, the evaluations and
+the pull requests — lives in `~/.local/state/hermes/upkeep/`, outside every
+checkout.
 
 ## Limitations
 
@@ -922,12 +1078,24 @@ halfway through.
   whose hot file is larger than that gets no optimisation rather than a
   half-informed one; the log names the file and the room it missed by, and the
   answer is a bigger `context` or a benchmark that concentrates on less code.
-- OpenHands is installed by default but stays dormant until you set
-  `openhands.enabled: true`; without it Hermes uses its own implementer. The
-  delegation path is checked against a live install: the invocation and the
-  `LLM_*` variables are what OpenHands 1.21 accepts, and a run reaches only the
-  endpoint Hermes names. What a full multi-file ticket costs there, against a
-  real local model, is still unmeasured.
+- The OpenHands agent layer is gone, under the [dependency
+  rule](#dependencies); every ticket goes to Hermes' own implementer, and an
+  `openhands:` section left in a config is ignored (`hermes doctor` says so).
+  What OpenHands did that the native implementer does not — a terminal loop
+  over the workspace — is on the reverse-engineering backlog, not rebuilt yet.
+- Upkeep has run end to end only against stub models and a stand-in GitHub:
+  the worktrees, the policy gate, the suite, the credit and the pull request
+  are real in the test, the measurement and the API are not. How often a
+  local model turns a scouted description into a change that survives the
+  gates is unmeasured. A run costs two full `hermes eval` passes per attempt
+  on your GPU, which is the point of scheduling it rather than running it
+  inline. The candidate's own code drives its evaluation on the host, with
+  your container engine and without your token: the policy gate, the
+  protected files and the review a pull request gets are what stand between
+  a hostile page and your machine, and you should weigh that before turning
+  scouting on.
+- `hermes.weights` is tested against a local stand-in for the Hub's API, not
+  against huggingface.co itself.
 - `hermes eval` has only ever been run against the stub model in the test
   suite. Its bookkeeping, budgets and the honesty checks above are tested, but
   no suite run against a real local model has been recorded, so the tasks

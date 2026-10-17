@@ -19,8 +19,11 @@ adds text to a report, unless an operator who has tuned a checkpoint sets
 ``security.classifier.block``. Cheap model flags, expensive model adjudicates.
 
 The service is spoken to over HTTP for the same reason the inference backends
-are: a classifier wants torch and Hermes does not. ``contrib/laya_server.py``
-is a reference adapter over the ``laya`` SDK. It answers::
+are: a classifier is a model, and models run beside Hermes rather than inside
+it. Hermes ships no server for it. The adapter it used to ship wrapped a
+third-party classifier SDK and torch, which the factory no longer installs;
+a native one is on the reverse-engineering backlog. Anything local that
+answers this contract can be pointed at::
 
     POST /classify
     {"question": "...", "options": ["safe", ...],
@@ -155,7 +158,7 @@ class Guess:
 class ClassifierConfig:
     enabled: bool = False
     base_url: str = "http://localhost:6768"
-    model: str = "laya"
+    model: str = "classifier"
     timeout: int = 30
     #: Below this the answer is noise. Calibration is what makes a threshold
     #: mean anything, so a checkpoint that ships over-confident must have its

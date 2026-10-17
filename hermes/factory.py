@@ -28,7 +28,6 @@ from .ledger import open_ledger
 from .journal import Journal
 from .log import Logger, current_scope, for_workspace, scope
 from .models import Router
-from .openhands import OpenHands
 from .phases import PHASES
 from .planning import decompose
 from .research import investigate
@@ -61,8 +60,6 @@ class Factory:
         self.github = GitHub(self.config.get("github", {}), self.log)
         self.issues = Issues(self.github, self.root, self.log,
                              int(self.config.get("github.issue_batch", 20)))
-        self.openhands = OpenHands(self.config.get("openhands", {}),
-                                   self.config.model_for("coding"), self.log)
         self.ladder = Ladder.from_config(self.config)
         #: What past projects learned about which retry works. See
         #: :mod:`hermes.ledger`.

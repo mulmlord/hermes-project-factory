@@ -4,8 +4,8 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
-# The vLLM and OpenHands layers get environments of their own beside the
-# factory's, so the `.venv/` pattern above does not cover them.
+# The vLLM server gets an environment of its own beside the factory's, so the
+# `.venv/` pattern above does not cover it.
 .venv-*/
 build/
 dist/
@@ -13,8 +13,10 @@ projects/
 # Worktrees holding candidate self-modifications, one per attempt. Only a
 # promoted change survives, and it survives as a commit rather than as this.
 .hermes-improve/
+# Indexes and caches that editor-side tools write into a checkout.
 .headroom/
 .serena/
+.tokensave/
 .claude/.headroom_wrap_*
 # Per-machine editor/agent settings. Anything meant to be shared belongs in
 # .claude/settings.json, which is tracked.

@@ -3,25 +3,17 @@ name = "hermes-factory"
 version = "0.1.0"
 description = "Autonomous software project factory driven by locally hosted models"
 requires-python = ">=3.10"
-dependencies = ["PyYAML>=6.0"]
+# None, on purpose. Hermes runs on the standard library; the model server it
+# talks to (vLLM) lives in an environment of its own. See README "Dependencies".
+dependencies = []
 
 [project.scripts]
 hermes = "hermes.cli:main"
 hpf = "hermes.cli:hpf"
 
-[project.optional-dependencies]
-dev = ["pytest>=7.0"]
-
+# The build backend is in this repository too, so `pip install .` downloads
+# nothing: no setuptools, no wheel package.
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools.packages.find]
-include = ["hermes*"]
-
-[tool.setuptools.package-data]
-# The eval suite's requirements documents and held-out tests (hermes/harness.py).
-hermes = ["suite/*/*"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+requires = []
+build-backend = "hermes_backend"
+backend-path = ["build_backend"]

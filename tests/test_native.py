@@ -8,6 +8,7 @@ written against the original.
 """
 import contextlib
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -374,6 +375,35 @@ def test_the_project_declares_no_dependencies():
                 top = name.split(".")[0]
                 assert top in sys.stdlib_module_names or top in ("hermes", "__future__"), \
                     f"{path.name} imports {name}"
+
+
+def test_the_workflow_runs_the_suite_this_repository_ships():
+    """The dependency rule over the one file that has no imports to walk.
+
+    When the suite moved off pytest, the extra it had been installed from went
+    with it -- the test above is what holds that -- while the workflow went on
+    asking pip for ``.[dev]`` and then calling ``pytest``. pip reports a
+    missing extra as a warning rather than an error, so the break surfaced a
+    step later as a missing command, on main, in the only file in the
+    repository no import walk reaches. So the same property is asserted over
+    what CI runs: it installs nothing, and every module it names exists here.
+    """
+    workflow = yamlite.load((REPO / ".github/workflows/tests.yml").read_text())
+    commands = [step["run"] for job in workflow["jobs"].values()
+                for step in job["steps"] if "run" in step]
+    assert commands, "the workflow runs nothing"
+
+    named = []
+    for command in commands:
+        assert "pip install" not in command, command
+        tokens = command.split()
+        assert tokens[0] != "pytest", command
+        if "-m" in tokens:
+            named.append(tokens[tokens.index("-m") + 1])
+
+    assert "hermes.testkit" in named, commands
+    for module in named:
+        assert importlib.util.find_spec(module), module
 
 
 # -- weights download ----------------------------------------------------------------
